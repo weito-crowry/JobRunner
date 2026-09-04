@@ -1,6 +1,6 @@
 # 07. External / Human Executor 詳細設計
 
-- Status: Draft v0.4
+- Status: Draft v0.5
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `02`, `03`, `08`, `09`, `10`, `11`, `12`
@@ -21,6 +21,7 @@
 jobs:
   classify:
     executor: external_llm
+    validator: domain.validate_classification
     with:
       text: ${{ inputs.text }}
     external:
@@ -28,17 +29,18 @@ jobs:
       on-lease-expiry: requeue
 ```
 
-Default lease=60分、expiry=`requeue`。
+Validatorはoptional。Default lease=60分、expiry=`requeue`。
 
 ## 3. External activation
 
 1 transaction:
 
 1. final Input/continue-on-error確定
-2. new Attempt
-3. External Task
-4. Job=`waiting_external`
-5. Event
+2. validator ID/version snapshot確認
+3. new Attempt
+4. External Task
+5. Job=`waiting_external`
+6. Event
 
 One Task / Attempt。
 
@@ -72,15 +74,26 @@ Atomic exactly-one claim。
 `requeue`:
 
 - same Attempt
-- Lease expired
-- Task available
+- current Lease -> expired
+- Task -> available
+- new Attempt無し
 
 `fail`:
 
+- Lease -> expired
+- Task terminal
 - Attempt failure `external_lease_expired`
 - Retry policy
 
 Pause中もlease clockは進む。
+
+### 5.1 expiry detection
+
+外部clientの次回claim/submitを待たない。`03`のRuntime Maintenance Loopが`expires_at`をdeadlineとして検出し、期限到来時にcurrent Leaseをconditional transactionで処理する。
+
+Runtime restart時はoverdue LeaseをRecoveryで先に処理する。
+
+Expired/released/invalidated Lease submit reject。
 
 ## 6. `task_submit`
 
@@ -95,40 +108,61 @@ claim_next optional
 request_id optional
 ```
 
-Resultはobjectに限定しない。scalar/list/object/nullを許可し、optional JSON Schema / `success_if` を適用する。
+Result validation order:
 
-### 6.1 Output persistence
+1. JSON-compatible/canonical
+2. optional `outputs.schema`
+3. optional Custom Validator
+4. optional `success_if`
+5. SecretGuard（ExternalにSecret注入は無いがmetadata/result共通guard）
+6. PayloadStore
 
-Resultは`02/08`のPayloadStoreへ保存する。
+### 6.1 Custom Validator
 
-- <= threshold: SQLite inline
-- > threshold: filesystem blob
-- sizeによるhidden failure無し
+Validator Registryは親Runtime bootstrapで再構築済み。
 
-SecretはExternal Jobへ注入されない。
+External submit処理内でtrusted lightweight Validator callableを実行する。Validatorへ渡す:
 
-### 6.2 Artifact
+```text
+result value
+persistent Job Input
+```
 
-`task_submit.artifacts` は `storage_kind=external` の参照登録だけ。URI/metadataを受け、Coreは実体fetch/uploadしない。
+Secret value/Runtime Handleは渡さない。
 
-MVP external task protocolからmanaged ArtifactStoreへbinary uploadする機能は持たない。
+- valid=true -> 続行
+- valid=false -> Attempt failure。Validator code/message/retryable/detailsをstructured failureへ
+- exception -> `validator_exception`, retryable=false
 
-### 6.3 Atomic submit
+Validation failureでもsubmitされたTask/Leaseは当該Attemptについてterminalにし、Retry policyが必要ならnew Attempt + new Taskを作る。Invalid resultを同じLeaseで再submitさせない。
 
-1 transaction相当のService operationで:
+重いvalidationはValidatorに入れずnormal internal Jobへ分離する。
+
+### 6.2 Output persistence
+
+<= threshold SQLite、> threshold filesystem blob。Hidden size failure無し。
+
+### 6.3 Artifact
+
+`task_submit.artifacts` は `storage_kind=external` の参照登録だけ。Coreはfetch/uploadしない。
+
+### 6.4 Atomic submit
+
+Logical operation:
 
 - current Lease validation
-- result validation / PayloadStore準備
-- external Artifact metadata
+- result/schema/validator/success_if
+- PayloadStore prepare
+- Artifact metadata
 - Attempt/Job terminal
 - Lease release / Task complete
 - Event / idempotency result
 
-Payload blobのfilesystem/DB crash consistencyは`08`。
+Blob crash consistencyは`08`。
 
 ## 7. `claim_next`
 
-Submit成功後、別transactionで通常`task_claim`と同じselection/authorizationを使用。Next claim failureでsubmitをrollbackしない。
+Submit terminal処理成功後、別transactionで通常`task_claim`と同selection/authorizationを使用。Next claim失敗でsubmitをrollbackしない。
 
 ## 8. Pause / Cancel / Recovery
 
@@ -136,7 +170,7 @@ Pause:
 
 - new claim禁止
 - existing Lease submit受理
-- lease expiry継続
+- Maintenance Loopによるlease expiry継続
 
 Cancel:
 
@@ -161,7 +195,7 @@ jobs:
       summary: ${{ needs.analyze.outputs }}
 ```
 
-Humanは`action/uses/runs-on/success_if/external/timeout-minutes/secrets`禁止。
+Humanは`action/validator/uses/runs-on/success_if/external/timeout-minutes/secrets`禁止。
 
 Activation: new Attempt + one pending Review + Job=`waiting_review`。
 
@@ -174,9 +208,9 @@ approve|reject
 Approve -> success。
 Reject -> failure `human_rejected`, retryable=false default。
 
-Human lease/timeout無し。Concurrent submitはfirst-wins。
+Human lease/timeout無し。Concurrent submit first-wins。
 
-Reviewの標準Job OutputはMVPでは `null` とする。Review metadataは`wf_review_info`から取得し、Job Outputへ自動混入しない。
+標準Job Outputは `null`。Review metadataは`wf_review_info`。
 
 ## 10. Human Pause / Cancel / Retry
 
@@ -188,19 +222,22 @@ Reject後Retryはnew Attempt + new pending Review。
 
 ## 11. Idempotency / Authorization
 
-`task_claim/task_submit/review_submit` はoptional `request_id`。共通scope/TTLは`08/11`。
+`task_claim/task_submit/review_submit` optional request_id。Scope/TTLは`08/11`。
 
 All read/write Authorization。
 
 ## 12. 受入条件
 
-1. arbitrary JSON External result
-2. large result transparent spill
-3. external Artifact reference only
-4. concurrent claim exactly one
-5. claim/claim_next同順序
-6. lease requeue/fail
-7. pause/cancel/recovery
-8. Human output null + review info separation
-9. Human first-wins/retry
-10. idempotency/authorization
+1. External arbitrary JSON result
+2. External Custom Validator valid/invalid/exception/retryable
+3. large result spill
+4. External Artifact reference only
+5. concurrent claim exactly one
+6. claim/claim_next same ordering
+7. lease expiry without client traffic
+8. paused lease expiry
+9. lease requeue/fail
+10. stale/cancel submit reject
+11. Recovery overdue lease
+12. Human output null / first-wins / retry
+13. idempotency/authorization
