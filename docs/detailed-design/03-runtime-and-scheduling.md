@@ -1,9 +1,9 @@
 # 03. Runtime / Scheduling 詳細設計
 
-- Status: Draft v0.6
+- Status: Draft v0.7
 - 対象: MVP
 - 上位仕様: `docs/design.md`
-- 関連: `01`, `02`, `05`, `08`, `09`, `10`
+- 関連: `01`, `02`, `04`, `05`, `08`, `09`, `10`
 
 ## 1. 基本原則
 
@@ -20,16 +20,24 @@
 
 ## 2. Runtime起動
 
-1. Config/data root/Storage解決
-2. Migration
-3. Action Registry / Validator Registry bootstrap
-4. Workflow Resolver
-5. Runner Pool validation
-6. runtime_instance_id発行
-7. non-terminal Recovery
-8. Runner Supervisor
-9. Maintenance Loop
-10. Scheduling開始
+Parent Processの正規起動順:
+
+1. Core config / data root / Integration Bootstrap entrypointを解決
+2. `Integration Bootstrap(role=parent)` を実行
+3. Action/Validator Registry、AuthorizationProvider、SecretsProvider、optional Storage factoryを構築
+4. SQLite / PayloadStore / ArtifactStoreを初期化
+5. Migration
+6. Workflow Resolver初期化
+7. Runner Pool config validation
+8. `runtime_instance_id`発行
+9. non-terminal Recovery
+10. Runner Pool Supervisor起動（各Runnerは`04`の`role=runner` bootstrap）
+11. Maintenance Loop起動
+12. Scheduling受付開始
+
+Bootstrap失敗、Provider構築失敗、Storage初期化失敗、Migration失敗、Pool config不正のいずれでもScheduling受付を開始しない。
+
+Action Runner子Processは`04`の`role=action_runner` bootstrapを使い、Parent memory上のcallable/provider instanceをpickle継承しない。
 
 ## 3. Workflow Run start
 
@@ -87,7 +95,7 @@ Jobに`paused` status無し。
 4. condition dependency set terminal
 5. `if`評価
 
-`if` helper/false semanticsは`02`。
+`if` helper/false semanticsは`02`、Dynamic group semanticsは`05`。
 
 Executor activation:
 
@@ -128,7 +136,7 @@ DB partial uniqueでもone-runningを保証。
 
 ## 8. Maintenance Loop
 
-Maintenance LoopはWorkflow Scheduler/Cronではなく、既存Runtime状態の**期限到来・housekeeping専用**の親Process内thread/task。
+Maintenance LoopはWorkflow Scheduler/Cronではなく、既存Runtime状態の期限到来・housekeeping専用の親Process内thread/task。
 
 対象:
 
@@ -177,15 +185,14 @@ Pause中もLease clockは止めず、expiry policyは実行する。
 Retention policyは`01/08/09`に従いWorkflow Run開始時のeffective snapshotを使う。
 
 - policyが全項目unlimitedなら、そのRunに対する期限削除は行わない
-- 期限あり項目はcompleted_at/created_at等の各対象基準時刻からdueを判定
-- non-terminal Workflow RunのRun record/実行中Log/Current Artifactを期限だけで削除しない
-- Managed Artifact data、Output blob、Execution Log、Event、Artifact metadata、Workflow Run recordsは対象ごとのpolicyに従う
-- External Reference Artifactの外部実体は削除しない
+- non-terminal Workflow RunのRun record/実行中Log/current Artifactを期限だけで削除しない
+- Managed Artifact data、Output blob、Execution Log、通常Event、Artifact metadata、Workflow Run recordsは対象policyに従う
+- External Reference Artifact外部実体は削除しない
 - relational row削除は`08`のFK依存順
-- 削除操作はidempotentで、部分失敗時に「削除済みdataをcurrentとして参照」しない
-- Run recordを最終削除する場合、Retention実施記録はRun row外のretention audit/event相当へ先に残す
+- system-level retention audit Eventは通常Event retentionから除外
+- 操作はidempotent
 
-Retention sweepはdeadline精度を要求しないhousekeepingなので、`maintenance_max_sleep_seconds`以内の遅延を許容する。
+Retention sweepは`maintenance_max_sleep_seconds`以内の遅延を許容するhousekeeping。
 
 ### 8.5 restart
 
@@ -202,7 +209,7 @@ Runtime restart時は起動Recoveryで:
 Terminal transition後idempotentに:
 
 - downstream needs/if
-- Dynamic expansion
+- Dynamic expansion/group propagation
 - Reusable parent
 - Result Reuse pending check
 - Workflow Output/conclusion
@@ -214,7 +221,7 @@ Terminal transition後idempotentに:
 
 Parent restart/Resume/Manual Retry後に、既に成功したJobを再実行せず使ってよいかを厳格に判定するための機能。Global cacheではない。
 
-別Workflow Runの結果は自動reuseしない。過去Artifactを親が明示Inputとして渡すことは別扱い。
+別Workflow Runの結果は自動reuseしない。過去ArtifactRefを親が明示Inputとして渡すことは別扱い。
 
 ## 11. Reuse Context / Key
 
@@ -250,19 +257,19 @@ validator_identity
 - validator無し: null
 - validator有り: `validator_id + validator_version`
 
-Canonical JSONをSHA-256し `reuse_key` とする。用語として「fingerprint」は使わない。
+Canonical JSONをSHA-256し `reuse_key` とする。
 
 ## 12. Reuse eligibility
 
 Successful Attemptは原則reuse eligible。ただし:
 
 - ActionがRuntime Handle `state.get` を実行
-- ActionがJob Input/direct upstream Artifact以外のArtifactをdynamic materialize
+- Actionがpersistent Input/direct upstream Artifact以外のArtifactをdynamic materialize
 - 親Adapterが明示 `reuse_eligible=false` としたexecutor extension
 
 ならfalse。
 
-ValidatorはJob定義とversion snapshotへ含まれるため、Validator使用だけではreuse不適格にしない。
+Validator使用だけではreuse不適格にしない。
 
 ## 13. Reuse判定条件
 
@@ -279,28 +286,18 @@ ValidatorはJob定義とversion snapshotへ含まれるため、Validator使用�
 
 が全て一致する場合のみreuse。
 
-Secret materialized valueは比較しない。Secret rotation互換性は親側Action/Validator/Workflow version管理責任。
+Secret materialized valueは比較しない。Secret rotation互換性は親側version管理責任。
 
 ## 14. Manual Retry後のdescendant処理
 
-### blocked / skipped descendants
+Blocked/skipped descendantはactivation再評価。
 
-Target dependency closureのblocked/skippedをactivation再評価。
-
-### successful descendants
-
-`reuse_check_pending=true`。
-
-Dependencies terminal後:
+Successful descendantは`reuse_check_pending=true`とし、dependencies terminal後:
 
 - match -> success維持、`job_result_reused`
 - mismatch/ineligible/payload missing/version unavailable -> `successful_job_result_not_reusable`
 
-MVPではsuccess Jobをnew Inputで同じJob Run内に自動再実行せずnew Workflow Runを要求。
-
-### failed descendants
-
-Target以外を勝手にRetryしない。
+Failed non-target descendantは勝手にRetryしない。
 
 ## 15. Pause / Resume
 
@@ -310,7 +307,7 @@ Pause:
 - running internal継続
 - new internal/External claim/Dynamic expansion禁止
 - existing External submit/Human review/started Child進行可
-- Maintenance LoopのLease expiry/Retention housekeepingは継続
+- Lease expiry/Retention housekeeping継続
 
 Resumeでactivation再評価。new Attemptは作らない。
 
@@ -337,7 +334,7 @@ Success:
 Failure:
 
 - non-allowed failure/blocked
-- Dynamic expansion failure
+- Dynamic expansion/group failure
 - Child failure
 - Workflow Output failure
 - successful_job_result_not_reusable
@@ -351,6 +348,7 @@ Concurrency holder/releaseは`08`。Group比較case-sensitive BINARY semantics�
 
 Runtime restart:
 
+- Integration Bootstrap(role=parent)を再構築
 - queued activation再評価
 - due retry/external Leaseを即時処理
 - Review/Child関係復元
@@ -364,19 +362,19 @@ Recoveryだけでcompleted Runをreopenしない。
 
 ## 19. 受入条件
 
-1. internal one-running
-2. deterministic ordering
-3. concurrency group identity
-4. Maintenance Loop no-busy-loop
-5. retry deadline wake <= max sleep lag
-6. external Lease expiry without external traffic
-7. paused Lease expiry processing
-8. retention unlimited no delete
-9. retention due sweep/idempotency/FK order
-10. non-terminal current data not deleted by retention
+1. parent Integration Bootstrap/provider/storage startup order
+2. bootstrap failure before scheduling
+3. internal one-running
+4. deterministic ordering
+5. concurrency group identity
+6. Maintenance Loop no-busy-loop
+7. retry deadline wake <= max sleep lag
+8. external Lease expiry without external traffic
+9. paused Lease expiry processing
+10. retention unlimited/due/non-terminal safety
 11. restart overdue timer/retention processing
 12. same-run reuse only
 13. reuse key includes Action+Validator version
-14. state.get/dynamic artifact ineligible
+14. state.get/non-input Artifact ineligible
 15. Manual Retry descendant reuse
-16. no cross-Run reuse
+16. no cross-Run automatic reuse
