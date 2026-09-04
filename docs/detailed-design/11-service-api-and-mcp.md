@@ -1,6 +1,6 @@
 # 11. Service API / MCP / HTTP 詳細設計
 
-- Status: Draft v1.5
+- Status: Draft v1.6
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `03`, `07`, `08`, `09`, `10`, `12`
@@ -108,6 +108,24 @@ source_yaml nullable
 
 ## 5. Workflow Run
 
+### 5.0 Public timestamp semantics
+
+全Run APIで以下を共通意味とする。
+
+```text
+created_at   = Workflow Run row作成時刻。常にnon-null、以後不変
+started_at   = 初めてConcurrency admissionされstatus=runningになった時刻。未admitならnull
+completed_at = current terminal completion時刻。non-terminalならnull
+```
+
+- 初回からadmission成功/no concurrencyなら`started_at=created_at`
+- Concurrency待ちRunは`started_at=null`
+- waiterがslot取得した時点で初めて`started_at`が入る
+- 一度もadmitされずcancelledになったRunは`started_at=null`のまま
+- Manual Retry reopenでは`created_at/started_at`を保持し、`completed_at`だけnullへ戻して再terminal時に更新
+
+Adapterがnull `started_at`を作成時刻へ補完してはいけない。
+
 ### 5.1 `wf_start`
 
 Request:
@@ -133,12 +151,13 @@ priority
 wait_reason nullable
 concurrency_queued_at nullable
 created_at
+started_at nullable
 ```
 
 Run start時`01/08` snapshot固定。Concurrency scope=`(workflow_id,group)`。
 
-- slot admission success/no concurrency -> Run作成、`status=running, wait_reason=null, concurrency_queued_at=null`
-- queue -> Run作成、`status=queued, wait_reason=concurrency, concurrency_queued_at=<queue time>`
+- slot admission success/no concurrency -> Run作成、`status=running, wait_reason=null, concurrency_queued_at=null, started_at=created_at`
+- queue -> Run作成、`status=queued, wait_reason=concurrency, concurrency_queued_at=created_at, started_at=null`
 - reject -> Run ID無し `concurrency_limit_reached`
 
 MVPのRun `queued`はConcurrency待ち専用。
@@ -158,7 +177,7 @@ concurrency_queued_at nullable
 progress nullable
 parent_workflow_run_id nullable
 root_workflow_run_id
-created_at/started_at/completed_at
+created_at/started_at nullable/completed_at nullable
 ```
 
 ### 5.3 `wf_run_info`
@@ -187,7 +206,7 @@ pause_requested/cancel_requested
 parent_workflow_run_id/root_workflow_run_id
 source_identity nullable
 progress nullable
-created_at/started_at/completed_at
+created_at/started_at nullable/completed_at nullable
 output_metadata nullable
 jobs nullable
 dynamic_groups nullable
@@ -270,8 +289,8 @@ Input/Output/State/Log/Event本文無し。
 
 Root non-terminal Runのみ。
 
-- `status=running` -> `status=paused, wait_reason=null, concurrency_queued_at=null`。Concurrency設定時はslot保持
-- `status=queued, wait_reason=concurrency` -> `status=paused, wait_reason=concurrency`。元`concurrency_queued_at`保持、slot無し、wake候補外
+- `status=running` -> `status=paused, wait_reason=null, concurrency_queued_at=null`。Concurrency設定時はslot保持、`started_at`保持
+- `status=queued, wait_reason=concurrency` -> `status=paused, wait_reason=concurrency`。元`concurrency_queued_at`保持、slot無し、wake候補外、未admitなら`started_at=null`のまま
 - already paused -> same-state success
 
 Child direct pause=`child_run_direct_control_forbidden`。
@@ -280,8 +299,8 @@ Child direct pause=`child_run_direct_control_forbidden`。
 
 Paused root Runのみ。New requestでnon-pausedなら`invalid_state`。Replayはstored result。
 
-- paused + `wait_reason=null` -> `status=running, concurrency_queued_at=null`。admitted holderは同じslotで再開
-- paused + `wait_reason=concurrency` -> `status=queued, wait_reason=concurrency`。元`concurrency_queued_at`を保持してslot取得まで待機
+- paused + `wait_reason=null` -> `status=running, concurrency_queued_at=null`。admitted holderは同じslotで再開、`started_at`保持
+- paused + `wait_reason=concurrency` -> `status=queued, wait_reason=concurrency`。元`concurrency_queued_at`を保持してslot取得まで待機。slot取得時に`started_at`がNULLなら設定
 
 ### 5.6 `wf_cancel`
 
@@ -310,6 +329,9 @@ run_status
 run_conclusion nullable
 wait_reason nullable
 concurrency_queued_at nullable
+created_at
+started_at nullable
+completed_at nullable
 job_status
 retry_not_before nullable
 updated_at
@@ -319,8 +341,8 @@ Non-terminal retryはrun_attempt不変。Completed failure reopenは`10`。
 
 Concurrency reacquire:
 
-- admitted -> Run running / queue timestamp null
-- queue -> success response、Run queued/concurrency + fresh `concurrency_queued_at`
+- admitted -> Run running / queue timestamp null / existing started_at保持
+- queue -> success response、Run queued/concurrency + fresh `concurrency_queued_at` / existing started_at保持
 - reject -> `concurrency_limit_reached` 409、state変更無し
 
 Retry pendingのtarget Jobは`status=queued, conclusion=null, completed_at=null`。
@@ -701,34 +723,40 @@ Canonical strict Service request/response modelを直接使用。Adapter独自�
 
 State change Eventへactor/source/request_id。Request body/Secret/巨大payloadを無条件保存しない。
 
+`workflow_started` Eventの意味は`03/08`と一致させ、`started_at`が初めて設定されるadmissionでexactly once発行する。Concurrency待ちRunのrow作成だけを`workflow_started`として扱わない。
+
 ## 21. 受入条件
 
 1. strict/no-coercion Core Service models
 2. HTTP explicit integer/boolean/timestamp parsing
 3. Definition/Run separation + start fresh source path
-4. admitted start=running / concurrency queue=queued + queue timestamp
-5. Run list/info/start/retry expose concurrency_queued_at consistently
-6. pause/resume admitted holder vs concurrency waiter preserves queue timestamp
-7. root priority/HTTP PATCH exact body
-8. Run info concrete Jobs/Dynamic groups/Step exact shapes
-9. Job/Attempt task-review-child navigation IDs
-10. Input info/read Secret reference only
-11. Output read/reopen unavailable
-12. State list metadata-only/current read/history values optional
-13. State history persists failed Attempt writes
-14. no public State mutation
-15. wf_retry Job terminal reset/run_attempt/concurrency response
-16. task claim/submit actor_id required
-17. canonical actor_principal_key used for claimant/idempotency
-18. task available_at ordering + job_key tie-break
-19. task_info does not expose another claimant's lease_id
-20. self claimant can recover active lease_id
-21. submit verifies lease + claimant ownership
-22. submit+claim_next same claimant transaction/replay
-23. Human mutation restrictions
-24. Artifact/Log byte-offset/Event contracts
-25. namespaced MCP includes State tools
-26. HTTP exact State routes
-27. status/no422
-28. idempotency commit recheck/expiry
-29. all read/write Authorization
+4. created_at/started_at/completed_at public semantics exact
+5. initial concurrency waiter exposes started_at=null
+6. first admission sets started_at; Manual Retry preserves it
+7. workflow_started Event aligns with first admission
+8. admitted start=running / concurrency queue=queued + queue timestamp
+9. Run list/info/start/retry expose concurrency_queued_at consistently
+10. pause/resume admitted holder vs concurrency waiter preserves queue timestamp
+11. root priority/HTTP PATCH exact body
+12. Run info concrete Jobs/Dynamic groups/Step exact shapes
+13. Job/Attempt task-review-child navigation IDs
+14. Input info/read Secret reference only
+15. Output read/reopen unavailable
+16. State list metadata-only/current read/history values optional
+17. State history persists failed Attempt writes
+18. no public State mutation
+19. wf_retry Job terminal reset/run_attempt/concurrency/timestamp response
+20. task claim/submit actor_id required
+21. canonical actor_principal_key used for claimant/idempotency
+22. task available_at ordering + job_key tie-break
+23. task_info does not expose another claimant's lease_id
+24. self claimant can recover active lease_id
+25. submit verifies lease + claimant ownership
+26. submit+claim_next same claimant transaction/replay
+27. Human mutation restrictions
+28. Artifact/Log byte-offset/Event contracts
+29. namespaced MCP includes State tools
+30. HTTP exact State routes
+31. status/no422
+32. idempotency commit recheck/expiry
+33. all read/write Authorization
