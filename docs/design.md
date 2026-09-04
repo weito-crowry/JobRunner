@@ -1,6 +1,6 @@
 # JobRunner 基本設計
 
-- Status: Draft v1.3
+- Status: Draft v1.4
 - 対象: MVP
 - WebUI: 画面構成のみ後続
 - 用語: GitHub Actions に対応概念がある場合は可能な限り合わせる
@@ -124,7 +124,7 @@ Root Workflow Run開始時に:
 - source YAML / typed Definition / hash
 - Workflow Input
 - Action/Validator versions
-- **System workflow defaults snapshot**
+- System workflow defaults snapshot
 - effective runtime settings（default_runner_pool含む）
 - effective Retention policy
 - initial priority
@@ -168,7 +168,7 @@ Scheduling軸:
 - JMESPath: JSON filter/projection
 - Custom Validator: trusted parent callable
 
-Core context shapeを固定:
+Core context shape:
 
 ```text
 workflow = {id,name,version}
@@ -194,10 +194,15 @@ Validatorはinternal/externalのみ。Human/Reusable parentでは不可。
 
 MVP Registryは1 IDにつきcurrent version 1つ。
 
+Action registrationは明示的にRuntime Handle利用有無を持つ。
+
 ```text
-action_id -> one current version/callable
-validator_id -> one current version/callable
+register_action(id, version, callable, uses_runtime=false)
+uses_runtime=false -> action(execution_input)
+uses_runtime=true  -> action(execution_input, runtime_handle)
 ```
+
+Coreはcallable signatureからRuntime Handle要否を推測しない。Actionはsync/async/awaitable return対応。ValidatorはMVPでは同期・軽量callable `(result, persistent_input)` のみ。
 
 Run start時version snapshot。Retry/Resume/Runner実行はcurrent Registry versionとのexact一致必須。Multi-version RegistryはMVP外。Version更新忘れは親責任。
 
@@ -244,6 +249,8 @@ Default max sleep5秒、busy loop無し。
 
 `timeout-minutes`はinternalのみ。Hidden default無し。
 
+Orphan filesystem cleanupにはSystem housekeeping設定 `orphan_cleanup_grace_seconds` を使う。既定300秒、finite > 0。Workflow Run semanticsではないためRun snapshot対象外。
+
 ## 13. 状態 / 条件
 
 Job status:
@@ -285,6 +292,8 @@ Reusable ParentはChild Workflow Output objectをresultとし、optional Parent 
 
 Managed Artifact=Core Store管理。External Reference=URI metadataのみ。
 
+Artifact digestのMVP形式は `sha256:<lowercase hex64>`。ManagedはCore計算、External Referenceは指定時に形式だけ検証する。
+
 Cross-run Managed Artifact利用は:
 
 - ArtifactRefがcurrent persistent Inputへ明示存在
@@ -302,9 +311,10 @@ Dynamic templateは仮想groupでありtemplate自身のJob Run/Attempt/Retry/Pr
 Root=`foreach`、Nested=`foreach.parent/items`。
 
 - depth固定上限無し
-- generated max default1000/Run
+- generated maxはWorkflow Run snapshot `effective_settings.max_dynamic_jobs`、canonical default1000
 - all-or-nothing expansion
 - stable key推奨
+- `key`省略時は0-based index fallbackし、各expansionで `dynamic_index_key_fallback` Eventを1回記録
 - order_by対応
 - `if=false` skip と `foreach=[]` successを区別
 - expansion digestでManual Retry後のgenerated set不変性を検証
@@ -354,6 +364,8 @@ Manual Retryはfailed Attempt/Input必須。Pre-Attempt failureはnew Run要求�
 
 Successful descendantはcurrent dependency contextから `if` / expected Input / Artifact / versions / stored Output validationを再確認。Mismatchならsame Runでchanged Input再実行せずnew Workflow Run要求。
 
+Runtime Handleで `state.get` または `state.set` を使用したSuccessful Attempt、およびpersistent Input外ArtifactをmaterializeしたAttemptは自動Result Reuse不適格。
+
 Dynamic expansionもdigest mismatchならnew Run要求。
 
 ## 20. Pause / Cancel
@@ -368,14 +380,16 @@ Public force-kill無し。
 
 State=get/set、persistent、last-write-wins、history。CAS/increment無し。
 
-Execution Log=全executor Attempt共通file。Input/Output全bodyをCoreが自動dumpしない。
+`state.set`は呼出時にcurrent+historyを即時commitし、Attemptが後でfailure/cancel/timeout/runner_lostになってもrollbackしない。業務上のtransactionが必要なら親Action側で実現する。
+
+Execution Log=全executor Attempt共通file。Input/Output全bodyをCoreが自動dumpしない。Log verbosityはWorkflow Run effective settings snapshotを使う。
 
 Event Log=append-only DB。
 
 Progress:
 
-- Job=`auto|explicit|none`
-- Workflow=`auto|none`
+- Job=`auto|explicit|none`。Job Run作成時にresolved modeをsnapshot
+- Workflow=`auto|none`。Workflow Run effective settings snapshotを使う
 - Workflow auto=concrete Job Run平均
 - Dynamic templateは分母外
 - Reusable ParentはChild progressを利用可能
@@ -400,6 +414,8 @@ Standard SQLite。MVP table=18。
 Idempotency=completed resultのみ保存、reserved row無し。Commit transaction内でkey/hash再確認。Replayは初回result/HTTP status。
 
 Retention=null=unlimited、System baseline -> Workflow override。Childはinherited System baseline -> Child override。Parent run-history expiryはChild subtree実効上限。
+
+Managed Artifact dataはdata retention、metadata retention、Run history上限の早い方で削除可能。Metadata期限が先ならManaged dataを先に消してからmetadata rowを削除する。External Referenceの外部実体は削除しない。
 
 ## 23. Authorization / Service / MCP / HTTP
 
