@@ -1,6 +1,6 @@
 # 11. Service API / MCP / HTTP 詳細設計
 
-- Status: Draft v1.1
+- Status: Draft v1.2
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `03`, `07`, `08`, `09`, `10`, `12`
@@ -26,7 +26,9 @@ Pydantic typed model + JSON-compatible serialization。
 - Python/MCP `request_id` optional
 - HTTPは`Idempotency-Key` header -> request_id
 - Unknown request field reject
-- Timestamp=RFC3339 UTC
+- Timestamp=`08` canonical UTC fixed form `YYYY-MM-DDTHH:MM:SS.ffffffZ`
+
+Timestamp input filterも同形式へparse/normalizeしてからServiceへ渡す。Naive/local offset文字列をcanonical responseへそのままechoしない。
 
 Pagination:
 
@@ -118,7 +120,7 @@ created_at
 
 Run start時`01/08` System baseline/effective settings/Retention/Registry version snapshot固定。
 
-Concurrency queueでもRun作成。RejectはRun ID無しerror。
+Concurrency scopeは`(workflow_id, resolved group)`。QueueならRun作成、`status=queued, wait_reason=concurrency`。`on-limit=reject`ならRun ID無しで`concurrency_limit_reached`。
 
 ### 5.2 `wf_run_list`
 
@@ -173,7 +175,7 @@ dynamic_groups nullable
 events_summary nullable
 ```
 
-`include_jobs=true` なら:
+`include_jobs=true`:
 
 - `jobs` = concrete Job Run list
 - `dynamic_groups` = Definition上のDynamic template aggregate list
@@ -186,21 +188,22 @@ executor/status/conclusion
 priority/progress
 current_attempt_id
 failure nullable
-current_artifacts nullable       # include_artifacts時
-attempts nullable                # include_attempts時
+current_artifacts nullable
+attempts nullable
 ```
 
 Dynamic group item:
 
 ```text
 template_id
-status/conclusion
+status=queued|running|completed
+conclusion nullable|success|failure|cancelled|skipped|blocked
 expansion_count
 generated_job_count
 failure nullable
 ```
 
-Nested templateもWorkflow Run全体のaggregate groupとして1 item。
+Nested templateもWorkflow Run全体aggregate groupとして1 item。
 
 Attempt item:
 
@@ -216,18 +219,11 @@ steps nullable
 artifacts nullable
 ```
 
-`log_metadata`:
+`log_metadata`=`available,size_bytes,updated_at?,deleted_at?`。
 
-```text
-available
-size_bytes
-updated_at nullable
-deleted_at nullable
-```
+`include_steps=true`でStep summary、`include_artifacts=true`かつAttempts含有時はAttempt全generation ArtifactRef/producer metadata。Attempts未指定の`current_artifacts`はcurrent successful Attemptのcurrent named Artifact mapだけ。
 
-`include_steps=true`でStep summary、`include_artifacts=true`かつAttempts含有時はAttempt全generation ArtifactRef/producer metadataを返す。Attempts未指定の`current_artifacts`はcurrent successful Attemptのcurrent named Artifact mapだけ。
-
-`events_summary` exact shape:
+`events_summary`:
 
 ```text
 count
@@ -247,9 +243,13 @@ Non-terminal root Run。Already paused=same-state success。
 
 Paused root Run。New requestでnon-pausedならinvalid_state。Replayはstored result。
 
+Paused concurrency holderはslotを保持しているため通常は同slotでresumeする。`wait_reason=concurrency`のpaused waiterを許可する実装ではresume後もslot取得までqueued待機とする。
+
 ### 5.6 `wf_cancel`
 
 Request=`workflow_run_id,reason?,request_id?`。Non-terminal root only。
+
+Cancel/result race=`10`。
 
 ### 5.7 `wf_priority_update`
 
@@ -278,12 +278,22 @@ Response:
 ```text
 workflow_run_id/job_run_id
 run_attempt
+run_status
+run_conclusion nullable
+wait_reason nullable
 job_status
 retry_not_before nullable
 updated_at
 ```
 
 Request時点new Attempt無し。
+
+Non-terminal Run retryはrun_attemptを増やさない。Completed failure Run retryは`10`どおりreopenしてrun_attemptを増やし、Workflow Output current pointerをclearする。
+
+Completed RunのConcurrency再取得で:
+
+- queue -> success response、`run_status=queued, wait_reason=concurrency`
+- reject -> `concurrency_limit_reached` 409、Run/Job state変更無し
 
 ## 6. Input inspection
 
@@ -333,9 +343,9 @@ selected boolean
 value any JSON object/value
 ```
 
-Job/Attempt Inputは**persistent Input**を返し、materialized Secret valueは絶対に返さない。Secret fieldはreference stringのまま。
+Job/Attempt Inputはpersistent Inputを返し、materialized Secret valueは絶対に返さない。Secret fieldはreference stringのまま。
 
-Unavailable read=`input_data_unavailable`。MCP response上限超過=`response_too_large`、silent truncate無し。
+Unavailable=`input_data_unavailable`。MCP response上限超過=`response_too_large`、silent truncate無し。
 
 ## 7. Output
 
@@ -344,6 +354,8 @@ Unavailable read=`input_data_unavailable`。MCP response上限超過=`response_t
 Exactly one selector=`workflow_run_id xor job_run_id xor attempt_id`。
 
 Response=`source_type/source_id/available/storage_kind/size_bytes/digest`。
+
+Manual Retryでcompleted Runをreopenした直後のWorkflow Run Outputは`available=false`。Past Attempt/Job Outputは履歴selectorで引き続き読める。
 
 ### `wf_output_read`
 
@@ -378,6 +390,8 @@ Request=`task_id? / workflow_run_id? / job_template_key? / request_id?`。Task I
 
 Task object=`task_id/lease_id/lease_expires_at/workflow_run_id/job_run_id/attempt_id/job_key/input`。
 
+Candidate ordering=`07`。Task `available_at`を使用しJob `ready_at`を使わない。
+
 ClaimantはActor/client principalからCore生成。
 
 ### `wf_task_submit`
@@ -397,6 +411,8 @@ next_task nullable
 Validation failureをterminal failureとして受理した場合もsubmitted=true。
 
 `claim_next=true`はsubmit terminal state + optional next Lease + full response/idempotencyを同一DB transaction。Replay時追加claim無し。
+
+`now >= lease_expires_at`は`lease_expired` conflictでresult不採用。
 
 Lease heartbeat/renew/extend/transfer API無し。
 
@@ -421,6 +437,8 @@ Completed/cancelled rewrite不可。同idempotency key replayのみ元response�
 ### `wf_artifact_info`
 
 Request=`artifact_id`。Response=canonical public ArtifactRef + producer/deletion metadata。Store path無し。Cross-run read Authorization必須。
+
+Artifact metadata retentionでrow削除済みなら`not_found`。
 
 ### `wf_log_read`
 
@@ -568,7 +586,7 @@ Lease renew/heartbeat/Job skip/override route無し。
 401 unauthenticated
 403 forbidden
 404 not_found
-409 state/idempotency/lease conflict
+409 state/idempotency/lease/concurrency conflict
 413 explicit Adapter size policy
 500 internal_error
 ```
@@ -597,7 +615,10 @@ input_data_unavailable
 retry_input_unavailable
 action_version_mismatch
 validator_version_mismatch
+action_contract_error
+validator_contract_error
 idempotency_conflict
+concurrency_limit_reached
 lease_conflict/lease_expired
 runner_unavailable
 payload_missing/payload_digest_mismatch
@@ -639,7 +660,7 @@ Flow:
 
 DB `reserved` row無し。Concurrent same-keyはSQLite write serialization + commit recheck。
 
-TTL内same hash=replay、different hash=conflict。Expired replace可。
+TTL内same hash=replay、different hash=conflict。`now >= expires_at`でexpired、replace可。
 
 ## 17. Authorization / pagination
 
@@ -656,22 +677,28 @@ State change Eventへactor/source/request_id。Request body/Secret/巨大payload
 ## 20. 受入条件
 
 1. Definition/Run separation
-2. request unknown field/Actor injection reject
-3. root start priority default/override
-4. priority update descendant propagation/Child direct reject
-5. Run info concrete jobs + Dynamic groups exact shapes
-6. include attempts/steps/artifacts implications
-7. events_summary exact shape
-8. Input info/read selector/current pending resolution
-9. Input read never materializes Secret
-10. Output selector/read
-11. task claim no-candidate null
-12. submit+claim_next same transaction/replay
-13. no lease renew APIs
-14. Human rewrite/manual Job mutation無し
-15. Artifact/Log errors
-16. Event filters/order/resource-chain validation
-17. namespaced MCP collision
-18. HTTP exact routes/Idempotency-Key/status/no422
-19. idempotency canonical hash/no-reserved/commit recheck
-20. all read/write Authorization
+2. canonical timestamp exact format
+3. request unknown field/Actor injection reject
+4. root start priority default/override
+5. concurrency start queue/reject code
+6. priority update descendant propagation/Child direct reject
+7. Run info concrete jobs + Dynamic group queued/running/completed
+8. include attempts/steps/artifacts implications
+9. events_summary exact shape
+10. Input info/read selector/current pending resolution
+11. Input read never materializes Secret
+12. Output selector/read + reopen output unavailable
+13. wf_retry nonterminal/completed run_attempt semantics
+14. wf_retry concurrency reacquire queue/reject response
+15. task claim no-candidate null + available_at ordering delegation
+16. expired Lease submit reject
+17. submit+claim_next same transaction/replay
+18. no lease renew APIs
+19. Human rewrite/manual Job mutation無し
+20. Artifact metadata retention -> not_found
+21. Artifact/Log errors
+22. Event filters/order/resource-chain validation
+23. namespaced MCP collision
+24. HTTP exact routes/Idempotency-Key/status/no422
+25. idempotency canonical hash/no-reserved/commit recheck/expiry
+26. all read/write Authorization
