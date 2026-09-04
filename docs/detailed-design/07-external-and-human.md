@@ -1,6 +1,6 @@
 # 07. External / Human Executor 詳細設計
 
-- Status: Draft v1.0
+- Status: Draft v1.1
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `02`, `03`, `08`, `09`, `10`, `11`, `12`
@@ -11,8 +11,8 @@
 2. `action/uses/runs-on/timeout-minutes`は禁止。
 3. Secret参照は禁止。
 4. Job Inputはactivation時snapshot。
-5. activation時にAttempt作成。
-6. Retryはnew Attempt。
+5. 初回activation時にAttempt作成。
+6. Retryはnew AttemptだがRetry request/schedule時にはまだ作らない。
 7. state changeはService/Authorization/idempotency経路。
 8. failed/cancelled Jobを管理操作で直接successへ書き換えない。
 9. YAML未定義manual skip操作無し。
@@ -34,8 +34,10 @@ jobs:
 Effective config:
 
 ```text
-Job external value > Workflow effective settings > System config > canonical default
+Job external value > Workflow Run effective settings
 ```
+
+Workflow Run effective settingsは`01`どおりRun System baseline + Workflow settingsから既にsnapshot済み。
 
 Canonical default:
 
@@ -44,40 +46,32 @@ lease-minutes=60
 on-lease-expiry=requeue
 ```
 
-Effective `lease-minutes/on-lease-expiry` はAttempt/Task activation時にsnapshotし、当該Taskのrequeueでも変えない。Retryでnew Attempt/Taskを作る場合も同じWorkflow Run Definition/effective settings snapshotから解決する。
+Effective lease/expiryはAttempt/Task activation時にTask rowへsnapshotし、requeueでも変えない。Retryでも同じWorkflow Run Definition/effective settings snapshotから解決する。
 
 ## 3. External activation
 
 1 transaction:
 
-1. `02` persistent Input snapshot確定
+1. `02` persistent Input snapshot
 2. Validator ID/version確認
-3. effective lease config確定
+3. effective lease config
 4. new Attempt
 5. External Task
 6. Job=`waiting_external`
-7. Attempt Execution Log作成
+7. Attempt Execution Log
 8. Event
 
 One Task / Attempt。
 
 ## 4. Task / Lease
 
-Task:
+Task=`available|leased|completed|cancelled`。
 
-```text
-available|leased|completed|cancelled
-```
-
-Lease:
-
-```text
-active|expired|released|invalidated
-```
+Lease=`active|expired|released|invalidated`。
 
 `task_claim` candidate順:
 
-1. Workflow priority DESC
+1. Workflow Run priority DESC
 2. Job priority DESC
 3. Dynamic order rank ASC
 4. source order ASC
@@ -86,28 +80,16 @@ active|expired|released|invalidated
 
 Atomic exactly-one claim。
 
-Claim時 `expires_at = claim_time + Task snapshot lease duration`。
+Claim時 `expires_at = claim_time + Task snapshot lease_seconds`。
 
-### 4.1 Lease feature boundary
-
-MVP Leaseは固定expiryの単純ownership window。
-
-無し:
-
-```text
-lease heartbeat
-lease renew / extend
-lease ownership transfer
-```
-
-長い処理は十分な`lease-minutes`をDefinition/Systemで指定する。
+MVPにLease heartbeat/renew/extend/transfer無し。
 
 ## 5. Lease expiry
 
 `requeue`:
 
 - same Attempt
-- current Lease -> expired
+- Lease -> expired
 - Task -> available
 - new Attempt無し
 
@@ -116,11 +98,9 @@ lease ownership transfer
 - Lease -> expired
 - Task terminal
 - Attempt failure `external_lease_expired`
-- `10` Retry policyへ
+- `10` Retry policy
 
-Pause中もlease clockは進む。
-
-Maintenance Loopがclient traffic無しでexpiryを処理。Restart時overdue Leaseを先処理。
+Pause中もclock継続。Maintenance Loopがclient traffic無しでexpiry処理。Restart時overdue Leaseを先処理。
 
 Expired/released/invalidated Lease submit reject。
 
@@ -146,64 +126,38 @@ Result validation:
 5. SecretGuard
 6. PayloadStore prepare
 
-### 6.1 Custom Validator
+Validatorにはresult + persistent Job Inputだけを渡しSecret/Runtime Handle無し。
 
-Validator receives:
-
-```text
-result
-persistent Job Input
-```
-
-Secret/Runtime Handle無し。
-
-- valid -> continue
-- invalid -> Attempt failure with Validator structured failure
-- exception -> `validator_exception`, retryable=false
-
-Validation/domain failureでもsubmitは当該Attemptについてterminalに受理する。Retry可能なら`10`がJobをretry waitingへscheduleする。
-
-**同じsubmit transaction内でnew Attempt/new Taskは作らない。** Backoff到来後またはimmediate due activationでnew Attempt/Taskを作る。
-
-Invalid resultを同じLeaseで再submitさせない。
-
-### 6.2 Output persistence
-
-Effective threshold以下SQLite、超過PayloadStore blob。Hidden output max無し。
-
-### 6.3 Artifact
+Validation/domain failureでもsubmitは当該Attemptについてterminalに受理する。Retry可能なら`10`がJobをretry waitingへscheduleする。同submit transaction内でnew Attempt/Taskは作らない。
 
 `task_submit.artifacts` はExternal Reference Artifact metadataのみ。Core binary upload/fetch無し。
 
 ## 7. Atomic submit + `claim_next`
 
-`claim_next=true` のresponseをidempotent replay可能にするため、**submit terminal DB state + optional next Task claim + completed idempotency resultを同一SQLite write transactionで確定する。**
+`claim_next=true` のresponseをidempotent replay可能にするため、submit terminal DB state + optional next Task claim + completed idempotency resultを**同一SQLite write transaction**で確定する。
 
-Long validation/filesystem prepareはtransaction前に行う。
+Long validation/filesystem prepareはtransaction前。
 
 正規flow:
 
-1. preliminary Lease/Task state read
-2. result/schema/Validator/success_if/SecretGuard
-3. PayloadStore temp/final prepare
-4. `BEGIN IMMEDIATE`
-5. idempotency key再確認
-6. current Task/Lease owner + `expires_at`を再確認
-7. Artifact metadata準備
-8. Attempt/Job terminal or Retry schedule
-9. Lease released / Task completed
-10. downstream terminal bookkeepingのうち同transactionで必要なDB stateを確定
-11. `claim_next=true`なら同じAuthorization + `task_claim` orderingでavailable Taskを検索
-12. candidateあり -> 同transactionでLease作成/Task leased
-13. candidate無し -> `next_task=null`
-14. submit response全体（next_task含む）をidempotency recordへ保存
-15. commit
+1. preliminary Lease/Task read
+2. validation + PayloadStore prepare
+3. `BEGIN IMMEDIATE`
+4. idempotency key/hash再確認
+5. Task/Lease owner/expiry再確認
+6. Artifact metadata
+7. Attempt/Job terminal or Retry schedule
+8. Lease release / Task completed
+9. 必要なdownstream DB bookkeeping
+10. `claim_next=true`なら同じAuthorization + orderingでavailable Task検索
+11. candidateあり -> 同transactionでLease/Task leased
+12. candidate無し -> `next_task=null`
+13. full submit responseをidempotency rowへ保存
+14. commit
 
-`claim_next`に候補が無いことはsubmit failureではない。
+Transaction未commitならsubmitも未commit。Prepared orphanはcleanup対象。
 
-Internal DB/storage errorでtransaction自体をcommitできない場合はsubmitも未commitなのでcaller retry可能。Prepared orphanは`08` cleanup対象。
-
-Idempotency replayは保存済みresponseを返し、別Taskを追加claimしない。
+Replayは保存responseを返し追加claimしない。
 
 ## 8. Pause / Cancel / Recovery
 
@@ -236,7 +190,21 @@ jobs:
       summary: ${{ needs.analyze.outputs }}
 ```
 
-Humanは`action/validator/uses/runs-on/success_if/external/timeout-minutes/secrets`禁止。
+Humanは:
+
+```text
+action
+validator
+uses
+runs-on
+success_if
+external
+timeout-minutes
+Secret reference
+outputs.schema
+```
+
+を禁止する。
 
 Activation:
 
@@ -246,18 +214,25 @@ Activation:
 - Attempt Execution Log
 - Job=`waiting_review`
 
-Outcome:
+Outcome=`approve|reject`。
 
-```text
-approve|reject
-```
+Approve:
 
-Approve -> success。
-Reject -> failure `human_rejected`, retryable=false default。
+- Job/Attempt success
+- canonical Job Output=`null`
+- PayloadStoreへ`null`を通常Outputとして保存
 
-Human lease/timeout無し。Concurrent submit first-wins。Job Output=`null`。
+Reject:
 
-### 9.1 Human control boundary
+- failure `human_rejected`
+- retryable=false default
+- current Job Output無し
+
+Human lease/timeout無し。Concurrent submit first-wins。
+
+Review metadataは`wf_review_info`がSource of TruthでJob Outputへ混ぜない。
+
+## 10. Human control boundary
 
 許可state change=pending Reviewへのapprove/rejectのみ。
 
@@ -269,17 +244,15 @@ manual Job skip
 completed Review rewrite
 ```
 
-Reject後は`wf_retry`でnew Attempt + new Review。
+Reject後は`wf_retry`でretry pending snapshotを作り、schedulerがnew Attempt + new Reviewを作る。
 
-## 10. Human Pause / Cancel / Retry
-
-Pause中review submit受理。Cancel後late submit reject。Reject後Retry=new pending Review。
+Pause中review submit受理。Cancel後late submit reject。
 
 ## 11. Common Execution Log
 
 External/Humanもinternalと同じAttempt Execution Logを持つ。
 
-ExternalではRuntime/Serviceが少なくとも:
+External:
 
 ```text
 task available
@@ -290,9 +263,7 @@ validation result
 Attempt terminal
 ```
 
-を記録する。
-
-Humanでは:
+Human:
 
 ```text
 review pending
@@ -301,19 +272,17 @@ cancel/retry
 Attempt terminal
 ```
 
-を記録する。
-
-CoreはExternal LLMだけ特別に「ログ禁止」としない。ただし全executor共通方針としてInput/Output全bodyをExecution Logへ自動複製せず、Input/Output APIをSource of Truthとする。SecretGuard/Authorizationは共通適用。
+Input/Output全bodyをCoreがLogへ自動複製しない。Input/Output APIが本文Source of Truth。SecretGuard/Authorization共通。
 
 ## 12. Idempotency / Authorization
 
-`task_claim/task_submit/review_submit` optional request_id。Scope/hash/TTLは`08/11`。
+`task_claim/task_submit/review_submit` optional request_id。Scope/hash/TTL=`08/11`。
 
-All read/write Authorization。
+All public read/write Authorization。
 
 ## 13. 受入条件
 
-1. Job>Workflow>System lease config hierarchy
+1. External Job > Run effective lease hierarchy
 2. Task config snapshot/requeue固定
 3. External arbitrary JSON result/spill
 4. External Validator valid/invalid/exception
@@ -322,11 +291,14 @@ All read/write Authorization。
 7. concurrent claim exactly one
 8. claim/claim_next same ordering
 9. submit + next claim + idempotency one transaction
-10. submit crash/replay does not double claim
+10. submit crash/replay no double claim
 11. no lease heartbeat/renew
 12. lease requeue/fail/Pause/Recovery
 13. stale/cancel submit reject
-14. Human output null / first-wins / retry
-15. Human override/skip/rewrite無し
-16. External/Human common Execution Log
-17. idempotency/authorization
+14. Human outputs.schema forbidden
+15. Human approve Output exactly null
+16. Human reject Output unavailable
+17. Human first-wins/retry
+18. Human override/skip/rewrite無し
+19. common Execution Log
+20. idempotency/authorization
