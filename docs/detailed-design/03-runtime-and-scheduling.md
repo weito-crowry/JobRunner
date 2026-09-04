@@ -1,6 +1,6 @@
 # 03. Runtime / Scheduling 詳細設計
 
-- Status: Draft v0.3
+- Status: Draft v0.4
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `02`, `05`, `08`, `10`
@@ -15,7 +15,7 @@
 6. DB永続状態がSource of Truth。
 7. claim/state transitionはconditional transaction。
 8. Priority変更はpreemptしない。
-9. **Job result自動再利用は同一Workflow Run内だけ。別Run/global cache無し。**
+9. Job result自動再利用は同一Workflow Run内だけ。別Run/global cache無し。
 
 ## 2. Runtime起動
 
@@ -32,6 +32,8 @@
 ## 3. Workflow Run start
 
 Start前にDefinition/Input/Action version/Runner Pool/Expression/Reusable/Concurrency/Authorizationを検証。
+
+Concurrency groupは`01`に従い、最終値がnon-empty stringであることを確認する。暗黙trim/lowercaseはせず、同一group判定はcase-sensitive完全一致。
 
 Start transaction:
 
@@ -103,7 +105,7 @@ Retry予約だけではAttemptを作らない。
 5. ready_at ASC
 6. Job Run ID
 
-InternalはPool適合も条件。External claimも同順序。
+Priorityは`01`のsigned 64-bit integer。InternalはPool適合も条件。External claimも同順序。
 
 ## 7. Atomic internal claim
 
@@ -135,9 +137,7 @@ Terminal transition後idempotentに:
 
 ## 9. Result Reuseの目的
 
-Parent restart/Resume/Manual Retry後に、**既に成功したJobを再実行せず使ってよいか**を厳格に判定するための機能。
-
-Global cacheではない。
+Parent restart/Resume/Manual Retry後に、既に成功したJobを再実行せず使ってよいかを厳格に判定するための機能。Global cacheではない。
 
 別Workflow Runの結果は自動reuseしない。過去Artifactを親が明示Inputとして渡すことは別扱い。
 
@@ -164,7 +164,7 @@ executor_identity
 
 `executor_identity`:
 
-- internal: `action_id + action_version`
+- internal: `action_id + action_version`。両方non-empty string
 - external: `jobrunner.external_llm.v1`
 - human: `jobrunner.human.v1`
 - reusable: `reusable_binding.child_definition_hash + child_action_versions`
@@ -179,9 +179,7 @@ Successful Attemptは原則reuse eligible。ただし以下の場合はautomatic
 - ActionがJob Input/direct upstream Artifact以外のArtifactをdynamicにmaterializeした
 - 親Adapterが明示 `reuse_eligible=false` としたexecutor extension
 
-理由はruntime中に追加dependencyを読んだため。
-
-通常Recoveryで成功済みJobを単に履歴として保持すること自体は可能だが、**Manual Retryによるdependency変更後にそのsuccessを再利用する場合**はeligibility/key検証必須。
+通常Recoveryで成功済みJobを単に履歴として保持すること自体は可能だが、Manual Retryによるdependency変更後にそのsuccessを再利用する場合はeligibility/key検証必須。
 
 ## 12. Reuse判定条件
 
@@ -212,7 +210,7 @@ Targetのdependency closureに属する `blocked` / `skipped` Jobはterminal sta
 Dependenciesが再びterminalになった時点で現在contextからreuse keyを再計算:
 
 - match -> successを保持、`job_result_reused` Event、pending clear
-- mismatch / ineligible / payload missing -> **その成功結果を自動使用しない**
+- mismatch / ineligible / payload missing -> その成功結果を自動使用しない
 
 MVPでは成功済みJobを新Inputで同じJob Run内に自動再実行しない。これは「Retry Input固定」と衝突するため。
 
@@ -274,7 +272,7 @@ Cancel request由来はcancelled。
 
 ## 17. Concurrency / Recovery
 
-Concurrency holder/releaseは`08`。
+Concurrency holder/releaseは`08`。Group比較はcase-sensitive BINARY semanticsで統一する。
 
 Runtime restart:
 
@@ -291,13 +289,15 @@ Recoveryだけでcompleted Runをreopenしない。
 
 1. internal one-running
 2. deterministic ordering
-3. pause/cancel/concurrency
-4. same-run reuse only
-5. reuse key Input/Artifact/definition/action version
-6. large/spilled Payload存在check
-7. state.get使用Job ineligible
-8. dynamic artifact access ineligible
-9. Manual Retry blocked/skipped再評価
-10. successful descendant match reuse
-11. successful descendant mismatch -> new Run required
-12. no cross-Run reuse
+3. priority signed64 boundaries
+4. concurrency group string/case-sensitive identity
+5. pause/cancel/concurrency
+6. same-run reuse only
+7. reuse key Input/Artifact/definition/action version
+8. large/spilled Payload存在check
+9. state.get使用Job ineligible
+10. dynamic artifact access ineligible
+11. Manual Retry blocked/skipped再評価
+12. successful descendant match reuse
+13. successful descendant mismatch -> new Run required
+14. no cross-Run reuse
