@@ -1,6 +1,6 @@
 # 09. Artifact / Log / Workflow State 詳細設計
 
-- Status: Draft v1.1
+- Status: Draft v1.2
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `02`, `03`, `04`, `08`, `11`, `12`
@@ -31,6 +31,10 @@ exists(store_key)
 ```
 
 MVP=`LocalArtifactStore`。Data root `artifacts/`へdurable保存。Backend交換可能。
+
+Managed Artifact digestはCore計算SHA-256で、public ArtifactRefでは `sha256:<lowercase hex64>` とする。
+
+External Reference Artifactの`digest`はoptional。指定する場合MVPでは同じ `sha256:<lowercase hex64>` 形式だけを許可し、Coreは外部実体をfetchしないため値の正しさは検証しない。
 
 ## 4. Runtime Handle Artifact
 
@@ -171,6 +175,7 @@ child_workflow_started/completed
 retry_scheduled/manual_retry_requested
 job_result_reused
 dynamic_expansion_reused
+dynamic_index_key_fallback
 ```
 
 Progress update/全log lineはEventへ複製しない。
@@ -262,9 +267,18 @@ state.get(name)
 state.set(name,value)
 ```
 
-Persistent、last-write-wins、revision/history。CAS/atomic increment/distributed lock無し。Child独立namespace。
+Persistence:
 
-State persistenceはSecretGuard。
+- `state.set` は呼び出しごとにcurrent value + append-only historyを1 DB transactionで即時commit
+- last-write-wins
+- Attempt成功時まで保留しない
+- Attemptが後でfailure/cancelled/timeout/runner_lostでもrollbackしない
+- Historyはrevision + producer Job/Attempt/Step + actor/timeを保持
+- `state.get` / `state.set` をRuntime Handleで使ったAttemptは`03`どおりResult Reuse不適格
+- CAS/atomic increment/distributed lock無し
+- Child Workflowは独立namespace
+
+State persistenceはAuthorization + SecretGuard。
 
 ## 16. Temp lifecycle
 
@@ -274,26 +288,54 @@ Attempt execution開始時mkdir、終了後削除。Cleanup failureはJob conclu
 
 Source=`workflow_runs.retention_policy_json` snapshot。
 
-### Execution Log
+### 17.1 Execution Log
 
 - basis=Attempt completed/Log close
 - running/non-terminal current Log削除無し
 - deleted_atを記録
 
-### Normal Event
+### 17.2 Normal Event
 
 - basis=created_at
 - system retention audit除外
 
-### Managed Artifact data/metadata
+### 17.3 Managed Artifact data
 
-- basis=Artifact created_at
-- owner non-terminal中は期限だけで削除しない
-- cross-run refはpinしない
-- data delete後`data_deleted_at`
-- metadata先行delete禁止
+Candidate due dateは以下のうちfiniteな最小:
 
-### Run history
+```text
+created_at + managed_artifact_data_days
+created_at + artifact_metadata_days
+owner Run completed_at + run_history_days   # Run subtree削除時の最終上限
+```
+
+ただしowner Run non-terminal中はRetention期限だけでdataを削除しない。
+
+意味:
+
+- `managed-artifact-data-days` が先ならdataだけ削除しmetadata rowは残せる
+- `artifact-metadata-days` が先ならmetadataを消す前提としてManaged dataも同時/先に削除する
+- data delete成功後`data_deleted_at`記録
+- cross-run ArtifactRefはpinしない
+
+### 17.4 Artifact metadata
+
+Artifact metadata row due:
+
+```text
+created_at + artifact_metadata_days
+```
+
+またはowner Run history deletion時。
+
+- owner Run non-terminal中はRetention期限だけでmetadata削除しない
+- Managed dataが残っているrowを先に削除しない。必要ならdataを先にdelete
+- metadata retention実施時はArtifact row自体を削除する
+- row削除後`wf_artifact_info`は`not_found`
+- cross-run ArtifactRefはsource row不在でfail-closed
+- External Reference Artifact metadata rowを削除しても外部実体は触らない
+
+### 17.5 Run history
 
 - basis=Run completed_at
 - non-terminal delete禁止
@@ -301,9 +343,11 @@ Source=`workflow_runs.retention_policy_json` snapshot。
 - Output PayloadはRun/Attempt historyと共にdelete
 - Parent expiryはChild subtree上限
 
-### Orphan cleanup
+### 17.6 Orphan cleanup
 
 Owner metadata無しtemp/payload/artifact objectはconsistency cleanup可能。System audit Eventを残す。
+
+Orphan scannerは現在進行中のprepare/finalizeと競合しないよう、Core system config `orphan_cleanup_grace_seconds`（default300、finite>=0）より新しいunowned filesystem objectを削除しない。これはhousekeeping設定でありWorkflow Run semanticsではないためRun snapshot対象外。
 
 ## 18. RetentionとReuse
 
@@ -322,20 +366,25 @@ Reuse対象Payload/Managed Artifactが削除済みならsilent reuse禁止。Cro
 ## 20. 受入条件
 
 1. Artifact generations/scope/Authorization
-2. cross-run no retention pin
-3. common Execution Log all four executor types
-4. execution log level uses Run snapshot and survives System/source config change
-5. no automatic Input/Output body dump
-6. Log retention deleted-state read behavior
-7. Event Log + public event read link
-8. Step observation-only
-9. Job progress resolution snapshot
-10. Job progress none/explicit/auto
-11. Reusable Child progress aggregation
-12. External/Human auto 0->1
-13. Workflow progress mode uses Run snapshot
-14. Workflow auto concrete-job aggregation
-15. Dynamic denominator growth/decrease allowed
-16. Progress no effect on conclusion
-17. state history/SecretGuard
-18. temp/retention/orphan cleanup
+2. Managed/external Artifact digest format
+3. cross-run no retention pin
+4. common Execution Log all four executor types
+5. execution log level uses Run snapshot and survives System/source config change
+6. no automatic Input/Output body dump
+7. Log retention deleted-state read behavior
+8. Event Log + dynamic index fallback/public event read
+9. Step observation-only
+10. Job progress resolution snapshot
+11. Job progress none/explicit/auto
+12. Reusable Child progress aggregation
+13. External/Human auto 0->1
+14. Workflow progress mode uses Run snapshot
+15. Workflow auto concrete-job aggregation
+16. Dynamic denominator growth/decrease allowed
+17. Progress no effect on conclusion
+18. state.set immediate durable/nonrollback
+19. state.get/state.set reuse ineligible
+20. Artifact data vs metadata retention precedence
+21. metadata row deletion semantics
+22. orphan cleanup grace race protection
+23. temp/retention/orphan cleanup
