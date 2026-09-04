@@ -1,6 +1,6 @@
 # 03. Runtime / Scheduling 詳細設計
 
-- Status: Draft v1.7
+- Status: Draft v1.8
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `02`, `04`, `05`, `06`, `08`, `09`, `10`
@@ -195,7 +195,12 @@ Internal Runner candidateは次のtotal order:
 3. `COALESCE(order_rank, 0)` ASC
 4. source/generated source order ASC
 5. Job `ready_at` ASC
-6. Job Run ID ASC
+6. **Job `job_key` ASC**
+7. Job Run ID ASC
+
+Static Jobの`source_order`はMVPでは全て0でよく、YAML declaration order自体をScheduling保証にしない。同条件のStatic Jobはstableな`job_key`で順序を確定する。
+
+Generated Jobは`order_rank/source_order`が`job_key`より先に効くため、Dynamic `order_by`/source array orderの意味は維持される。
 
 Job Run IDはUUID由来のopaque IDでありcross-run再現順序を意味しない。同一DB状態内の最終tie-breakとしてのみ使う。
 
@@ -210,8 +215,9 @@ External TaskはJob `ready_at`ではなくTask `available_at`を使う。Candida
 3. `COALESCE(order_rank, 0)` ASC
 4. source/generated source order ASC
 5. `external_tasks.available_at` ASC
-6. Job Run ID ASC
-7. Task ID ASC
+6. **Job `job_key` ASC**
+7. Job Run ID ASC
+8. Task ID ASC
 
 Lease expiry requeueではsame Taskの`available_at=expiry processing time`へ更新し、再claim順に反映する。
 
@@ -448,14 +454,15 @@ Completed RunはRecoveryだけでreopenしない。
 8. internal pending/claim copy
 9. all-executor Retry pending
 10. Internal order uses ready_at / External order uses task available_at
-11. stable ID tie-break semantics
-12. one-running/Pool
-13. Maintenance due boundary
-14. concurrency scope workflow_id+group
-15. mixed max-runs/waiter fairness
-16. Manual Retry concurrency reacquire/output clear linkage
-17. strict current if/Input/Artifact/version validation
-18. Secret-bound/state/non-input Artifact reuse ineligible
-19. Reusable identity includes Child baseline/settings/Retention
-20. Dynamic expansion reuse
-21. recovery idempotency/status repair
+11. static stable job_key tie-break / Dynamic order preserved
+12. opaque ID final tie-break semantics
+13. one-running/Pool
+14. Maintenance due boundary
+15. concurrency scope workflow_id+group
+16. mixed max-runs/waiter fairness
+17. Manual Retry concurrency reacquire/output clear linkage
+18. strict current if/Input/Artifact/version validation
+19. Secret-bound/state/non-input Artifact reuse ineligible
+20. Reusable identity includes Child baseline/settings/Retention
+21. Dynamic expansion reuse
+22. recovery idempotency/status repair
