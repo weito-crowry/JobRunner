@@ -1,332 +1,303 @@
 # 03. Runtime / Scheduling 詳細設計
 
-- Status: Draft v0.2
+- Status: Draft v0.3
 - 対象: MVP
 - 上位仕様: `docs/design.md`
-- 関連: `01-workflow-definition.md`, `02-expression-and-inputs.md`
+- 関連: `01`, `02`, `05`, `08`, `10`
 
-## 1. 目的
+## 1. 基本原則
 
-Workflow Run開始、Job activation、Scheduling、Priority、Runner claim、Pause/Resume/Cancel、Concurrency、Workflow conclusionの正規規則を定義する。
-
-## 2. 基本原則
-
-1. Runnerが取得する単位は Job。
+1. Runnerが取得する単位はJob。
 2. RunnerはWorkflow Runを占有しない。
-3. 同一Workflow Runではinternal Job同時実行最大1。
-4. 別Workflow RunはRunner Pool空き数まで並列可能。
-5. External/Human/Reusable待ちではRunnerを保持しない。
-6. DBの永続状態がSource of Truth。
-7. claim/state transitionはconditional transactionで二重適用を防ぐ。
-8. Priority変更は次回選択から反映しpreemptしない。
+3. 同一Workflow Run internal Job同時実行最大1。
+4. 別Workflow RunはRunner Pool空きまで並列。
+5. External/Human/Reusable待ちはRunner非占有。
+6. DB永続状態がSource of Truth。
+7. claim/state transitionはconditional transaction。
+8. Priority変更はpreemptしない。
+9. **Job result自動再利用は同一Workflow Run内だけ。別Run/global cache無し。**
 
-## 3. Runtime起動
+## 2. Runtime起動
 
-順序:
-
-1. Config / data root / DBを解決
+1. Config/data root/Storage解決
 2. Migration
 3. Action Registry bootstrap
-4. Workflow Resolver/Registry初期化
-5. Runner Pool設定検証
-6. `runtime_instance_id`発行
-7. non-terminal Run/Job/Runner recovery
-8. Runner Pool Supervisor起動
-9. Scheduling受付開始
+4. Workflow Resolver
+5. Runner Pool validation
+6. runtime_instance_id発行
+7. non-terminal Recovery
+8. Runner Supervisor
+9. Scheduling開始
 
-Runnerは別Processだが、必須の別HTTP/Broker serviceは置かない。Runner/Runtime間は`04`のinternal Service/Repository境界を使う。
+## 3. Workflow Run start
 
-## 4. Workflow Run start
+Start前にDefinition/Input/Action version/Runner Pool/Expression/Reusable/Concurrency/Authorizationを検証。
 
-request:
+Start transaction:
 
-```text
-workflow_ref
-inputs
-priority optional
-source_identity optional
-request_id optional
-actor_context
-```
-
-開始前にDefinition/Input/Action version/Runner Pool/CEL/JMESPath/Reusable reference/concurrency/Authorizationを検証する。
-
-### 4.1 concurrency
-
-`group`をstart前に評価。active holder数が`max-runs`以上なら:
-
-- `queue`: Run rowを作るが `wait_reason=concurrency` でScheduling対象外
-- `reject`: Run rowを作らず拒否
-
-### 4.2 start transaction
-
-同一transactionで:
-
-- Workflow Run row + definition/input/action version snapshot
+- Run snapshot
 - concurrency snapshot
-- static Job rows / Dynamic template metadata
-- `workflow_started` Event
-- idempotency result（request_idがある場合）
+- static Job/Dynamic template metadata
+- Event
+- idempotency result
 
-## 5. Workflow Run status
+Concurrency `queue|reject` は`08`のatomic holder countで処理。
 
-```text
-queued
-running
-paused
-completed
-```
+## 4. Status
 
-conclusion:
+Workflow:
 
 ```text
-success
-failure
-cancelled
+queued|running|paused|completed
 ```
 
-補助field:
+Conclusion:
 
 ```text
-wait_reason nullable
-pause_requested
-cancel_requested
-run_attempt >= 1
+success|failure|cancelled
 ```
 
-`run_attempt`は明示manual retryで完成済みfailed Runを再開した回数を含む論理Run試行番号。通常start時1。
-
-## 6. Job status
-
-MVP Job status:
+Job:
 
 ```text
-queued
-running
-waiting_external
-waiting_review
-waiting_child
-completed
+queued|running|waiting_external|waiting_review|waiting_child|completed
 ```
 
-conclusion:
+Conclusion:
 
 ```text
-success
-failure
-cancelled
-skipped
-blocked
+success|failure|cancelled|skipped|blocked
 ```
 
-**Job status に `paused` は持たない。** PauseはWorkflow Run側のScheduling gateであり、queued/waiting Jobの状態を変えない。
+Jobに`paused` status無し。
 
-Dynamic template/expansion管理状態はJob statusと分離する。
+## 5. Job activation
 
-## 7. Job activation
+条件:
 
-Jobをactivationできる条件:
+1. non-terminal
+2. Run cancel/pause/concurrency waitでない
+3. Dynamic parent/global dependency準備済み
+4. condition dependency set terminal
+5. `if`評価
 
-1. terminalでない
-2. Workflow Runがcancel中でない
-3. Workflow Runがpause中でない
-4. concurrency waitでない
-5. Dynamic templateなら必要なparent/global dependencyが揃う
-6. declared `needs` がterminal
-7. `if`を評価可能
+`if` helper/false semanticsは`02`。
 
-`if` helperとfalse時conclusionは`02`に従う。
+Executor activation:
 
-- default `success()` false due non-allowed failure/blocked -> `completed/blocked`
-- default false due skipped only -> `completed/skipped`
-- explicit `if=false` -> `completed/skipped`
-- cancel -> `completed/cancelled`
+- internal: final Input/continue-on-errorをsnapshotしqueued Runner対象。Attemptはclaim時作成
+- external: activation時Attempt + Task、waiting_external
+- human: Attempt + Review、waiting_review
+- reusable: binding + Attempt + Child、waiting_child
 
-## 8. executor別 activation
+Retry予約だけではAttemptを作らない。
 
-### internal
+## 6. Internal / External selection order
 
-final Input / continue-on-error snapshotを確定後、`queued`でRunner pull対象。
+共通ordering軸:
 
-### external_llm
+1. Workflow priority DESC
+2. Job priority DESC
+3. Dynamic order rank ASC
+4. source/generated order ASC
+5. ready_at ASC
+6. Job Run ID
 
-final Input確定後、Attemptとexternal taskを作り `waiting_external`。
+InternalはPool適合も条件。External claimも同順序。
 
-### human
+## 7. Atomic internal claim
 
-final Input確定後、Attemptとhuman review rowを作り `waiting_review`。
+1 transaction:
 
-### Reusable Workflow
+1. Runner current/idle/pool
+2. candidate/current Run gate
+3. same Run running internal無し
+4. Job queued + retry_not_before到達
+5. Job running
+6. new Attempt
+7. ownership
+8. Event
 
-binding/Input確定後、Attempt + Child Workflow Runを作り親Jobを`waiting_child`。詳細は`06`。
+DB partial uniqueでもone-runningを保証。
 
-Attempt作成時点はexecutorごとに上記またはRunner claim時。automatic Retry予約だけではAttempt rowを作らない。
+## 8. Terminal後 activation
 
-## 9. Runner pull / Job選択
-
-`claim_next_job(runtime_instance_id, runner_id, runner_instance_id, pool)`。
-
-選択順:
-
-1. Workflow Run priority desc
-2. Job priority desc
-3. Dynamic `order_by` rank
-4. source/generated order
-5. `ready_at` asc
-6. Job Run ID deterministic tie-break
-
-internal Job `runs-on`省略はSystem `default_runner_pool`へ解決済みであること。
-
-## 10. Atomic internal claim
-
-1 transactionで:
-
-1. Runner current/idle/pool一致
-2. candidate再確認
-3. Workflow Run pause/cancel/concurrency再確認
-4. 同じWorkflow Runにrunning internal Job無し
-5. Jobがqueuedかつ`retry_not_before <= now`またはnull
-6. Job -> running
-7. **新Attempt row作成**
-8. Runner ownership記録
-9. Runner -> running/busy
-10. Event + idempotent activation marker更新
-
-SQLiteは`08`で定義する partial unique indexにより「1 Run internal running最大1」をDBでも防ぐ。
-
-## 11. terminal後 activation
-
-Job/Attempt/Child/External/Humanがterminalになるたびidempotentに:
+Terminal transition後idempotentに:
 
 - downstream needs/if
-- nested/root Dynamic expansion
-- Workflow output候補
-- Workflow conclusion
-- concurrency slot release
-- reusable parent propagation
+- Dynamic expansion
+- Reusable parent
+- Result Reuse pending check
+- Workflow Output/conclusion
+- concurrency release
 
-を再評価する。
+を再評価。
 
-## 12. Pause / Resume
+## 9. Result Reuseの目的
+
+Parent restart/Resume/Manual Retry後に、**既に成功したJobを再実行せず使ってよいか**を厳格に判定するための機能。
+
+Global cacheではない。
+
+別Workflow Runの結果は自動reuseしない。過去Artifactを親が明示Inputとして渡すことは別扱い。
+
+## 10. Reuse Context / Key
+
+Job execution開始時にnon-secret `reuse_context` を作る。
+
+最低限:
+
+```text
+workflow_run_id
+job_key
+definition_hash
+persistent_job_input_digest
+direct_upstream_artifacts
+executor_identity
+```
+
+`direct_upstream_artifacts`:
+
+- condition dependency setの各dependencyについてcurrent Artifact identityをname順に収集
+- identityは `artifact_id` + optional digest
+- Artifact無しなら空集合
+
+`executor_identity`:
+
+- internal: `action_id + action_version`
+- external: `jobrunner.external_llm.v1`
+- human: `jobrunner.human.v1`
+- reusable: `reusable_binding.child_definition_hash + child_action_versions`
+
+Canonical JSONをSHA-256し `reuse_key` とする。用語として「fingerprint」は使わない。
+
+## 11. Reuse eligibility
+
+Successful Attemptは原則reuse eligible。ただし以下の場合はautomatic reuse checkで証明不能として`reuse_eligible=false`:
+
+- ActionがRuntime Handle `state.get` を実行した
+- ActionがJob Input/direct upstream Artifact以外のArtifactをdynamicにmaterializeした
+- 親Adapterが明示 `reuse_eligible=false` としたexecutor extension
+
+理由はruntime中に追加dependencyを読んだため。
+
+通常Recoveryで成功済みJobを単に履歴として保持すること自体は可能だが、**Manual Retryによるdependency変更後にそのsuccessを再利用する場合**はeligibility/key検証必須。
+
+## 12. Reuse判定条件
+
+同一Workflow Run内でのみ、以下がすべて同一なら成功結果をreuse可能:
+
+1. final persistent Job Input
+2. direct upstream Artifact identities
+3. entire Workflow Definition hash
+4. executor identity
+5. stored result Payloadが存在しintegrity検証可能
+6. current Registryがinternal Actionのsnapshot versionを提供可能
+7. `reuse_eligible=true`
+
+Secret materialized valueは保存/比較しない。Secret rotationが結果互換性へ影響する場合は親側Action version/Workflow version管理責任とする。
+
+## 13. Manual Retry後のdescendant処理
+
+`wf_retry(target_failed_job)` でRunをreopenするとき:
+
+### blocked / skipped descendants
+
+Targetのdependency closureに属する `blocked` / `skipped` Jobはterminal stateを解除してactivation再評価対象へ戻す。Explicit conditionも再評価する。
+
+### successful descendants
+
+削除/再実行しない。`reuse_check_pending=true`を付ける。
+
+Dependenciesが再びterminalになった時点で現在contextからreuse keyを再計算:
+
+- match -> successを保持、`job_result_reused` Event、pending clear
+- mismatch / ineligible / payload missing -> **その成功結果を自動使用しない**
+
+MVPでは成功済みJobを新Inputで同じJob Run内に自動再実行しない。これは「Retry Input固定」と衝突するため。
+
+代わりにWorkflow Runをfailureへ確定し:
+
+```text
+code = successful_job_result_not_reusable
+retryable = false
+details = affected job(s), changed component summary
+```
+
+新しいWorkflow Run開始を要求する。
+
+### failed descendants
+
+Target以外の既存failed Jobは勝手にRetryしない。必要なら個別manual retry。RetryはそのJob元Inputを固定使用する。
+
+## 14. Pause / Resume
 
 Pause:
 
-- `pause_requested=true`, Run status=`paused`
-- running internalは継続
-- 新internal claim不可
-- 新external claim不可
-- waiting_external/Review/Childは保持
-- claim済みexternal submit、Human review submit、開始済みChildの進行は受理
+- Run paused
+- running internal継続
+- new internal/External claim/Dynamic expansion禁止
+- existing External submit/Human review/started Child進行は許可
 
-Resume:
+Resumeでactivation再評価。new Attemptは作らない。
 
-- `pause_requested=false`
-- Runをqueued/runningへ戻しactivation再評価
-- 新Attemptは作らない
+## 15. Cancel
 
-同じ操作の再送はrequestが同等ならidempotent no-op。
+- cancel_requested
+- queued/waitingをcancel
+- External Lease invalidation
+- running internal cancel request
+- Child cancel propagation
+- new activation禁止
 
-## 13. Cancel
+`always()`でもcancel後new Job開始無し。
 
-Workflow cancel:
+## 16. Workflow conclusion
 
-- `cancel_requested=true`
-- queued/waiting_external/waiting_review/waiting_childをcancel処理
-- external lease invalidation
-- running internalへcancel request
--開始済みChildへcancel propagation
-- 以後新Job activation禁止
+Success:
 
-`always()`でもcancel後に新Job開始はしない。
+- required success
+- intentionally skipped
+- failure + continue-on-error
+- reuse_check_pending無し
 
-## 14. Workflow conclusion
+Failure:
 
-### success
-
-全required Jobが:
-
-- success、または
-- intentionally skipped、または
-- failureだがsnapshotted `continue-on-error=true`
-
-であり、required blocked/cancelledが無い。
-
-### failure
-
-- non-allowed failure
-- required blocked
+- non-allowed failure/blocked
 - Dynamic expansion failure
-- unhandled Child failure
-- Workflow output evaluation failure
-- engine fatal failure
+- Child failure
+- Workflow Output failure
+- `successful_job_result_not_reusable`
+- engine fatal
 
-### cancelled
+Cancel request由来はcancelled。
 
-Workflow cancel requestにより終了した場合。
+## 17. Concurrency / Recovery
 
-## 15. `continue-on-error`
+Concurrency holder/releaseは`08`。
 
-Job自身はfailureのまま。Workflow conclusionとdependencyの`success()`ではeffective successとして扱う。評価時点/Contextは`02`。
+Runtime restart:
 
-## 16. Workflow concurrency slot
+- queued activation再評価
+- External Lease/Review/Child関係復元
+- running internal -> `10` Runner recovery
+- paused維持
+- completed success Jobは保持
+- pending reuse checksがあれば再開
 
-active holder:
+Recoveryだけでcompleted Runをreopenしない。
 
-- queued/running/pausedで`wait_reason != concurrency`
+## 18. 受入条件
 
-concurrency待ちRunはholderに含めない。completedは含めない。Pause中はslotを保持。
-
-解放順:
-
-1. Workflow Run priority desc
-2. created_at asc
-3. Workflow Run ID
-
-空きslot数まで解放する。start/slot release競合はtransactionでactive countを再確認する。
-
-## 17. Runtime再起動
-
-- queued: activation再評価
-- waiting_external: task/lease照合
-- waiting_review: review row照合
-- waiting_child: child relation照合
-- running internal: Runner ownership/heartbeatを`10`へ渡す
-- paused:維持
-- concurrency wait:slot再計算
-- terminal: downstream activation漏れのみidempotent確認
-
-Recoveryだけでcompleted Runを再openしない。completed/failed Runを再openできるのは明示manual retryのみ（`10`）。
-
-## 18. wake-up
-
-Runnerはcandidate無しならbounded waitする。Runtime側のEvent/condition/pollingで以下をwake triggerにする:
-
-- Job terminal
-- Resume/Retry
-- External/Human submit
-- concurrency release
-- Dynamic expansion
-- Child completion
-
-DB busy-loopは禁止。
-
-## 19. 競合規則
-
-Cancel vs claim、completion vs runner_lost、start vs concurrency release等は「expected current state」をWHERE条件にしたconditional updateで解決する。更新0件なら最新状態を再読込し、古い操作で上書きしない。
-
-## 20. 受入条件
-
-1. start atomicity/idempotency
-2. Workflow/Job status enum（Job paused不存在）
-3. default/explicit Runner Pool routing
-4. dependency success/failure/skipped/blocked helpers
-5. internal 1 Run max1
-6. multiple Run parallel
-7. priority/order deterministic
-8. external/human/reusable activation時Attempt作成
-9. automatic retry予約時Attempt未作成
-10. pause/resume
-11. cancel no-new-activation
-12. concurrency queue/reject/release race
-13. restart recovery
-14. recoveryがterminal Runをreopenしない
+1. internal one-running
+2. deterministic ordering
+3. pause/cancel/concurrency
+4. same-run reuse only
+5. reuse key Input/Artifact/definition/action version
+6. large/spilled Payload存在check
+7. state.get使用Job ineligible
+8. dynamic artifact access ineligible
+9. Manual Retry blocked/skipped再評価
+10. successful descendant match reuse
+11. successful descendant mismatch -> new Run required
+12. no cross-Run reuse
