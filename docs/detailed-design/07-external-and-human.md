@@ -1,6 +1,6 @@
 # 07. External / Human Executor 詳細設計
 
-- Status: Draft v1.3
+- Status: Draft v1.4
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `02`, `03`, `08`, `09`, `10`, `11`, `12`
@@ -69,6 +69,14 @@ Task=`available|leased|completed|cancelled`。
 
 Lease=`active|expired|released|invalidated`。
 
+External Lease claimant identityは`12 §2.1`のcurrent Service caller `actor_principal_key`を使う。
+
+- `task_claim` / `task_submit` / `claim_next` はnon-empty `ActorContext.actor_id`必須
+- claim成功時 `external_leases.claimant_key = current actor_principal_key`
+- Lease IDだけではownershipを満たさない
+- submitは `lease_id + claimant_key + task_id + active status + expiry` を再確認する
+- Lease transfer無し。別principalへ所有権を移すには現Lease expiry/invalidation後に新claimが必要
+
 `task_claim` candidate順:
 
 1. Workflow Run priority DESC
@@ -134,6 +142,8 @@ claim_next optional
 request_id optional
 ```
 
+Current Service callerはnon-empty actor_idを持つこと。`claimant_key`はrequest bodyでは受け取らず、`12`のActorContext/AccessScopeからCoreが算出する。
+
 Result validation:
 
 1. JSON-compatible/canonical
@@ -157,22 +167,23 @@ Long validation/filesystem prepareはtransaction前。
 
 正規flow:
 
-1. preliminary Lease/Task read
-2. validation + PayloadStore prepare
-3. `BEGIN IMMEDIATE`
-4. idempotency key/hash再確認
-5. Task/Lease owner + `now < expires_at` を再確認
-6. Artifact metadata
-7. Attempt/Job terminal or Retry schedule
-8. Lease release / Task completed
-9. 必要なdownstream DB bookkeeping
-10. `claim_next=true`なら同じAuthorization + §4 orderingでavailable Task検索
-11. candidateあり -> 同transactionでLease/Task leased
-12. candidate無し -> `next_task=null`
-13. full submit responseをidempotency rowへ保存
-14. commit
+1. current caller `actor_principal_key` resolve
+2. preliminary Lease/Task read
+3. validation + PayloadStore prepare
+4. `BEGIN IMMEDIATE`
+5. idempotency key/hash再確認
+6. Task/Lease ID + `claimant_key == current actor_principal_key` + `now < expires_at` を再確認
+7. Artifact metadata
+8. Attempt/Job terminal or Retry schedule
+9. Lease release / Task completed
+10. 必要なdownstream DB bookkeeping
+11. `claim_next=true`なら同じAuthorization + same actor_principal_key + §4 orderingでavailable Task検索
+12. candidateあり -> 同transactionでLease/Task leased。新Lease claimant_keyもsame actor_principal_key
+13. candidate無し -> `next_task=null`
+14. full submit responseをidempotency rowへ保存
+15. commit
 
-Step 5で`now >= expires_at`ならresultを採用せず`lease_expired` conflict。Expiry policy適用は同transactionまたはMaintenanceのidempotent pathで一度だけ行う。
+Step 6でclaimant不一致なら`lease_conflict`、`now >= expires_at`ならresultを採用せず`lease_expired` conflict。Expiry policy適用は同transactionまたはMaintenanceのidempotent pathで一度だけ行う。
 
 Transaction未commitならsubmitも未commit。Prepared orphanはcleanup対象。
 
@@ -183,7 +194,7 @@ Replayは保存responseを返し追加claimしない。
 Pause:
 
 - 当該paused Runのnew claim禁止
-- existing Lease submit受理（expiry前のみ）
+- existing Lease submit受理（expiry前 + claimant一致のみ）
 - lease expiry継続
 - `claim_next`は他の`status=running` Runのeligible Taskをclaim可能だがpaused/queued concurrency waiterのTaskはcandidate外
 
@@ -197,6 +208,8 @@ Cancel:
 Recovery:
 
 - active `now < expires_at` Lease維持
+- same claimant principalは`wf_task_info`経由でcurrent active lease_idを復元可能
+- other principalへlease_idを公開しない
 - `now >= expires_at` -> snapshotted policy
 - terminal Attemptへnew Lease不可
 
@@ -298,7 +311,7 @@ Input/Output全bodyをCoreがLogへ自動複製しない。Input/Output APIが�
 
 `task_claim/task_submit/review_submit` optional request_id。Scope/hash/TTL=`08/11`。
 
-All public read/write Authorization。
+External claim/submitのactor principal定義=`12`。Claimant identityはAuthorizationの代替ではなく、All public read/write Authorizationを別途必須とする。
 
 ## 13. 受入条件
 
@@ -308,21 +321,25 @@ All public read/write Authorization。
 4. External Validator valid/invalid/exception
 5. Validator failure schedules Retry but no inline new Attempt
 6. External Artifact reference only
-7. concurrent claim exactly one
-8. claim order uses task available_at, not job ready_at
-9. stable job_key before opaque ID tie-break
-10. claim/claim_next same ordering
-11. lease boundary `now >= expires_at`
-12. requeue updates available_at
-13. submit + next claim + idempotency one transaction
-14. submit crash/replay no double claim
-15. no lease heartbeat/renew
-16. lease requeue/fail/Pause/Recovery
-17. stale/cancel submit reject
-18. Human outputs.schema forbidden
-19. Human approve Output exactly null
-20. Human reject Output unavailable
-21. Human first-wins/retry
-22. Human override/skip/rewrite無し
-23. common Execution Log
-24. idempotency/authorization
+7. task claim/submit actor_id required
+8. canonical claimant_key = current actor_principal_key
+9. concurrent claim exactly one
+10. claim order uses task available_at, not job ready_at
+11. stable job_key before opaque ID tie-break
+12. claim/claim_next same ordering + same claimant principal
+13. lease boundary `now >= expires_at`
+14. submit rejects claimant mismatch even with correct lease_id
+15. requeue updates available_at
+16. submit + next claim + idempotency one transaction
+17. submit crash/replay no double claim
+18. no lease heartbeat/renew/transfer
+19. lease requeue/fail/Pause/Recovery
+20. same claimant can recover active lease_id; other claimant cannot
+21. stale/cancel submit reject
+22. Human outputs.schema forbidden
+23. Human approve Output exactly null
+24. Human reject Output unavailable
+25. Human first-wins/retry
+26. Human override/skip/rewrite無し
+27. common Execution Log
+28. idempotency/authorization
