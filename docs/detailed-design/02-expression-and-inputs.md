@@ -1,6 +1,6 @@
 # 02. Expression / Inputs / Outputs 詳細設計
 
-- Status: Draft v1.1
+- Status: Draft v1.2
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `08`, `09`, `12`
@@ -163,6 +163,8 @@ Rules:
 
 Secret valueは各internal Attempt起動直前materialize。Retryでbinding/name固定、value rotation許容。
 
+**Secret bindingが1件でも存在するAttemptは自動Result Reuse不可**とする。Secret materialized valueを永続化・digest化しないため、過去Attemptと現在のSecret値が同一であることをCoreが証明できないため。RetryではActionを再実行し、各Attempt開始時のcurrent Secret valueを使う。
+
 ## 7. Persistent Job Input
 
 最終Job Input論理型=JSON-compatible **object**。
@@ -191,7 +193,7 @@ SHA-256(canonical-json-v1({
 }))
 ```
 
-Secret materialized valueはdigestへ入れない。
+Secret materialized valueはdigestへ入れない。したがってdigest一致だけではSecret付きAttemptのReuse可否を満たさない。`secret_bindings != []`なら`03/08`どおり`reuse_eligible=false`。
 
 InternalはRunner claim前にpending snapshotをDB保存。External/Human/Reusable初回はAttempt作成と同時。Retryはfailed Attempt snapshotをexact copyし`with`を再評価しない。
 
@@ -312,7 +314,7 @@ Default 4MiB。Maxではない。
 
 Attempt Outputはimmutable。Current Job Output=current successful Attempt。
 
-Human/Reusble Output semanticsは`01/06/07`。
+Human/Reusable Output semanticsは`01/06/07`。
 
 ## 16. Workflow Output
 
@@ -385,7 +387,7 @@ Order criterion=non-null stringまたはfinite number。同criterion内全candid
 | Job Payload persistence | validation/SecretGuard後 |
 | Workflow outputs | Workflow success確定直前 |
 
-Manual Retry後successful descendantは`03/10`どおりcurrent contextで`if`とexpected persistent Inputを再評価してreuse可否を決める。
+Manual Retry後successful descendantは`03/10`どおりcurrent contextで`if`とexpected persistent Inputを再評価してreuse可否を決める。ただしSecret binding付きAttemptは一致判定以前にReuse不適格。
 
 ## 22. 受入条件
 
@@ -396,15 +398,16 @@ Manual Retry後successful descendantは`03/10`どおりcurrent contextで`if`と
 5. Secret full-scalar only
 6. Secret binding JSON Pointer/sort/duplicate reject
 7. input_digest golden
-8. Internal pre-claim snapshot
-9. Retry exact binding copy
-10. Validator no Secret value
-11. Job Output arbitrary JSON
-12. Workflow Output object
-13. Schema/Validator/success_if order
-14. inline/spill
-15. skipped/default condition
-16. Nested parent helper
-17. Input nullable/missing/null
-18. order_by type rejection
-19. same/cross-run ArtifactRef
+8. Secret binding does not prove value identity / reuse_eligible=false
+9. Internal pre-claim snapshot
+10. Retry exact binding copy
+11. Validator no Secret value
+12. Job Output arbitrary JSON
+13. Workflow Output object
+14. Schema/Validator/success_if order
+15. inline/spill
+16. skipped/default condition
+17. Nested parent helper
+18. Input nullable/missing/null
+19. order_by type rejection
+20. same/cross-run ArtifactRef
