@@ -1,13 +1,13 @@
 # 04. Runner / IPC 詳細設計
 
-- Status: Draft v1.2
+- Status: Draft v1.3
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `02`, `03`, `08`, `09`, `10`, `12`
 
 ## 1. 目的
 
-Runner Process、Runner Pool、Integration Bootstrap、Heartbeat、Supervisor liveness、Common Action Runner、JSON Lines IPC v1、Secret materialization、Runtime Handle、large result、一時directory、restartを定義する。
+Runner Process、Runner Pool、Integration Bootstrap、Action invocation contract、Heartbeat、Supervisor liveness、Common Action Runner、JSON Lines IPC v1、Secret materialization、Runtime Handle、large result、一時directory、restartを定義する。
 
 ## 2. Process構成
 
@@ -27,7 +27,7 @@ Parent System
 
 Runner用HTTP/Broker必須無し。Action RunnerへDB path/provider/storage credentialを渡さない。
 
-## 3. Integration Bootstrap
+## 3. Integration Bootstrap / Registry callable contract
 
 Parentはimport可能entrypointを1つ設定する。
 
@@ -41,11 +41,31 @@ def configure_jobrunner(builder, role: str) -> None: ...
 
 Role=`parent|runner|action_runner`。
 
-Builder:
+Canonical Action registration:
+
+```python
+builder.register_action(
+    action_id,
+    version,
+    callable,
+    uses_runtime=False,
+    metadata=None,
+)
+```
+
+Canonical Validator registration:
+
+```python
+builder.register_validator(
+    validator_id,
+    version,
+    callable,
+)
+```
+
+Other builder operations:
 
 ```text
-register_action(action_id, version, callable, metadata?)
-register_validator(validator_id, version, callable)
 set_authorization_provider_factory(factory)
 set_secrets_provider_factory(factory)
 set_payload_store_factory(factory) optional
@@ -54,7 +74,48 @@ set_artifact_store_factory(factory) optional
 
 Registry semanticsは`01`。各Processで1 IDにつき1 current version。同じID二重登録reject。
 
-Role:
+### 3.1 Action invocation
+
+`uses_runtime` はboolean required/default falseで、Coreがcallable signatureを推測して切り替えない。
+
+```text
+uses_runtime=false -> callable(execution_input)
+uses_runtime=true  -> callable(execution_input, runtime_handle)
+```
+
+- positional callで実行するためparameter nameは契約に含めない
+- callableは上記argument countで呼出可能でなければbootstrap/registration validation error
+- varargs等で受けられても`uses_runtime`がSource of Truth
+- returnはJSON-compatible valueまたはawaitable producing JSON-compatible value
+- returnがawaitableならAction Runner専用event loopで完了までawait
+- sync callableがawaitableを返す形も許可
+- Action child内で既存parent event loopを継承しない
+
+したがって親はdecorator/callable object等でsignature introspectionが不安定な場合も、必要ならwrapper callableを登録して契約を満たす。
+
+### 3.2 Validator invocation
+
+ValidatorはMVPでは**同期・軽量**callableだけ。
+
+```python
+validator(result_value, persistent_input) -> ValidationResult
+```
+
+Awaitableを返した場合は`validator_contract_error`。重い/非同期validationは通常Job Actionへ分離する。
+
+Canonical `ValidationResult`:
+
+```text
+valid: boolean
+code: non-empty string optional
+message: string default ""
+retryable: boolean default false
+details: JSON-compatible optional
+```
+
+`valid=false`かつcode省略時はCore code=`domain_validation_failed`。`valid=true`ではcode/message/retryable/detailsはresult判定へ影響しない。
+
+### 3.3 Role
 
 - parent: Registry/Auth/Secrets/Store factory/public Service
 - runner: Action metadata + Validator callable/Auth/Secrets/Store/RunnerService
@@ -106,11 +167,7 @@ pool_name
 pid
 ```
 
-Status:
-
-```text
-starting|idle|claiming|running|stopping|stopped|lost|restart_suppressed
-```
+Status=`starting|idle|claiming|running|stopping|stopped|lost|restart_suppressed`。
 
 Parent lifecycle pipe EOFでnew claim停止。旧Runtime/instance updateはfencing reject。
 
@@ -141,27 +198,11 @@ pending_input_json/bindings/digest present
 same Workflow Run running internal無し
 ```
 
-`03/08` 1 transactionで:
-
-- Job running
-- new Attempt
-- pending persistent Input/bindings/digest exact copy
-- Runner ownership/current Job
-- Execution Log row/file metadata
-- Event
-
-を確定。
+`03/08` 1 transactionでJob running + new Attempt + pending snapshot copy + Runner ownership + Execution Log + Event。
 
 1 Runner同時1 Job。
 
-## 8. Action callable
-
-```python
-def action(input_data) -> AnyJson: ...
-def action(input_data, runtime) -> AnyJson: ...
-```
-
-sync/async対応。
+## 8. Action failure contract
 
 ```python
 raise ActionFailure(
@@ -218,12 +259,7 @@ Envelope:
 
 ready前message/start重複/terminal重複=`ipc_protocol_error`。
 
-`ready`:
-
-```text
-pid integer
-protocol_version=1
-```
+`ready`: `pid integer`, `protocol_version=1`。
 
 ## 11. `start` / Secret materialization
 
@@ -242,87 +278,50 @@ work_dir: absolute path
 runtime.cancel_requested: boolean
 ```
 
-Rules:
+- persistent_input/bindings/digest Source of Truth=Attempt snapshot
+- bindings=`02` RFC6901 canonical form
+- `secrets` key集合=bindings Secret name集合exact一致
+- Secret value=`12` non-empty string
+- binding pointer先persistent value=canonical `${{ secrets.NAME }}` string
+- unbound marker-like literal=通常string
+- binding不整合=`ipc_protocol_error|secret_binding_invalid`
 
-- persistent_input/bindings/digestのSource of TruthはAttempt snapshot
-- bindingsは`02` RFC6901 canonical form
-- `secrets` key集合はbindingsで参照されるSecret name集合とexact一致
-- Secret valueは`12` non-empty string
-- binding pointer先persistent valueはcanonical `${{ secrets.NAME }}` string
-- unbound marker-like literalは通常stringとして扱う
-- binding不整合=`ipc_protocol_error`/`secret_binding_invalid`
-
-ChildはAction呼出直前にpersistent_inputをmemory copyし、binding pointerだけを`secrets[name]`へ置換してexecution inputを作る。
+ChildはAction呼出直前にpersistent_inputをmemory copyしbinding pointerだけをSecret valueへ置換してexecution inputを作る。
 
 Execution input/Secret値をfile/log/debug dumpへ保存しない。
 
-RunnerはSecret missing/invalidをChild spawn前に検出し、`secret_not_found|secret_value_invalid`でAttempt failureにできる。
+RunnerはSecret missing/invalidをChild spawn前に検出可能。
 
 ## 12. `cancel_requested`
 
-Payload:
+Payload=`reason=workflow_cancel|timeout`, `requested_at`。
 
-```text
-reason=workflow_cancel|timeout
-requested_at RFC3339 UTC
-```
-
-Child reader loopはAction中も受信しRuntime Handle cancel flag更新。
-
-- workflow_cancel -> Job cancelled
-- timeout -> grace後terminateなら`job_timeout`
-
-Parent normal shutdownはcancel messageではない。
+Child reader loopはAction中も受信しRuntime Handle cancel flag更新。Parent normal shutdownはcancel messageではない。
 
 ## 13. Runtime Handle request/response
 
-Child requestはunique non-empty `request_id`。Runnerはexactly one response。
-
-Success:
-
-```json
-{"type":"runtime_response","request_id":"req","payload":{"ok":true,"result":{}}}
-```
-
-Failure:
-
-```json
-{"type":"runtime_response","request_id":"req","payload":{"ok":false,"error":{"code":"...","message":"...","retryable":false,"details":null}}}
-```
-
-Outstanding request中もcancel受信。Terminal後new request禁止。
+Child requestはunique non-empty `request_id`。Runnerはexactly one response。Outstanding request中もcancel受信。Terminal後new request禁止。
 
 ### 13.1 `state_get`
 
-Request=`name` non-empty。
-
-Response=`found/value/revision`。成功利用でAttempt `reuse_eligible=false`。
+Request=`name` non-empty。Response=`found/value/revision`。成功利用でAttempt `reuse_eligible=false`。
 
 ### 13.2 `state_set`
 
 Request=`name + JSON-compatible value`。Response=`revision>=1`。
 
-RunnerServiceがAuthorization + SecretGuard + current/history transactionを**request時点で即時commit**する。
+RunnerServiceがAuthorization + SecretGuard + current/history transactionをrequest時点で即時commit。
 
-- Attempt successまでtransactionを保留しない
-- Attemptが後でfailure/cancelled/timeout/runner_lostになってもstate writeをrollbackしない
-- append-only state historyからどのAttempt/Stepがwriteしたか追跡可能
+- Attempt successまで保留しない
+- later failure/cancel/timeout/runner_lostでもrollbackしない
+- historyへproducer Job/Attempt/Stepを記録
 - 成功利用でAttempt `reuse_eligible=false`
 
-この即時・非rollback semanticsを前提に、Action側が業務transactionを必要とする場合は専用Action/親DB transaction等で設計する。
+業務transactionが必要なら専用Action/親DB transaction等で設計する。
 
 ### 13.3 `artifact_put_file`
 
-Request:
-
-```text
-name
-relative_work_path
-media_type optional
-metadata object optional
-```
-
-Response=canonical ArtifactRef。
+Request=`name,relative_work_path,media_type?,metadata?`。Response=canonical ArtifactRef。
 
 ### 13.4 `artifact_register_external`
 
@@ -334,14 +333,14 @@ Request=`artifact_ref`。Response=`relative_work_path`。DB re-resolve + `09/12`
 
 ## 14. Observation messages
 
-### `log`
+`log`:
 
 ```text
 level=debug|info|warning|error
 message string
 ```
 
-### `progress`
+`progress`:
 
 ```text
 current finite>=0
@@ -350,41 +349,19 @@ message optional
 unit optional
 ```
 
-Totalありならcurrent<=total。`09`のJob progress modeに従い反映する。
+Totalありならcurrent<=total。`09` progress mode。
 
-### `step_started`
+`step_started`: `step_key` unique/name/metadata?。Runnerがsequence/DB Step ID採番。
 
-```text
-step_key non-empty unique/name/metadata?
-```
-
-Runnerがsequence/DB Step ID採番。
-
-### `step_finished`
-
-```text
-step_key existing open
-conclusion=success|failure|cancelled
-metadata optional
-```
-
-Unknown/closed key=protocol error。Open Stepは異常終了時incomplete。
+`step_finished`: existing open `step_key`, conclusion=`success|failure|cancelled`, metadata?。Unknown/closed=protocol error。Crash時incomplete。
 
 ## 15. Terminal `error`
 
-Payload:
-
-```text
-category
-code
-message
-retryable
-details optional
-```
+Payload=`category/code/message/retryable/details?`。
 
 ActionFailure -> category=action。Unhandled -> action_exception/false。Version mismatchはvalidation failure。
 
-RunnerはSecretGuardしてAttempt failure。Secret混入errorはsafe replacementへ変換。
+RunnerはSecretGuard。Secret混入errorはsafe replacement。
 
 ## 16. Terminal `result` / result file
 
@@ -397,26 +374,18 @@ Child:
 5. size/SHA-256
 6. result message
 
-Payload:
-
-```text
-relative_path=".jobrunner/result.json"
-size_bytes>=0
-sha256 lowercase hex
-```
+Payload=`relative_path=".jobrunner/result.json"`, `size_bytes`, `sha256 lowercase hex64`。
 
 Runner:
 
-1. exact reserved path/symlink escape
+1. reserved path/symlink escape
 2. existence/size/digest
 3. JSON deserialize
 4. Output Schema
-5. Validator with **persistent_input**
+5. Validator with persistent_input
 6. success_if
 7. SecretGuard
 8. PayloadStore
-
-Validatorへexecution input/Secret valueを渡さない。
 
 ## 17. `exiting` / exit matrix
 
@@ -424,45 +393,30 @@ Optional `exiting.reason=result|error`。Source of Truthではない。
 
 - result + exit0 + validation success -> success候補
 - result + nonzero -> action_process_exit, result非採用
-- error + any exit -> error failure採用、exit0はdiagnostic
+- error + any exit -> error failure採用、exit0 diagnostic
 - no terminal + nonzero -> action_process_exit
 - no terminal + exit0 -> action_result_missing
 - result+error -> ipc_protocol_error
 
 ## 18. stdout/stderr / Execution Log
 
-Child stdout/stderrは別pipeでAttempt Execution Logへ。Known Secretはwrite前redact。IPC parserへ渡さない。
-
-Log verbosity/全executor共通規則は`09`。
+Child stdout/stderrは別pipeでAttempt Logへ。Known Secret write前redact。IPC parserへ渡さない。Log policy=`09`。
 
 ## 19. Terminal fencing
 
-State updateはcurrent runtime/runner/job/attempt ownershipを条件にする。
-
-Attempt terminal/Runner lost後のlate IPC/result/runtime responseはDB状態を変更しない。
+State updateはcurrent runtime/runner/job/attempt ownership条件。Attempt terminal/Runner lost後late messageはDB変更不可。
 
 ## 20. Temp lifecycle
 
-```text
-runs/<workflow_run_id>/tmp/<job_run_id>/<attempt_no>/
-```
+`runs/<workflow_run_id>/tmp/<job_run_id>/<attempt_no>/`。
 
-Payload commit後削除。Managed Artifactはput時durable copy済み。Cleanup failureはconclusion不変、maintenance cleanup候補。Sandboxではない。
+Payload commit後削除。Managed Artifactはput時durable copy済み。Cleanup failureはconclusion不変。Sandboxではない。
 
 ## 21. Internal timeout
 
-`timeout-minutes` internalのみ。未指定無期限。
-
-1. deadline
-2. cancel_requested(timeout)
-3. grace default10秒 configurable finite>=0
-4. terminate
-5. `job_timeout`
-6. Retry policy
+`timeout-minutes` internalのみ、未指定無期限。Deadline -> cancel(timeout) -> grace default10s -> terminate -> job_timeout -> Retry。
 
 ## 22. Parent shutdown / restart
-
-Workflow CancelとParent shutdownを分離。
 
 Parent正常shutdown=New claim停止/bounded reap/cancel_requested無し。未完了Attemptは次起動runner_lost Recovery。
 
@@ -475,23 +429,21 @@ CPU/RAM/GPU quota、本格sandbox、arbitrary shell、Pool global pause、Pool A
 ## 24. 受入条件
 
 1. Bootstrap roles/Registry one-current semantics
-2. Pool config/liveness/restart
-3. claim requires ready_at + pending snapshot
-4. pending snapshot exact Attempt copy
-5. ready->start handshake/envelope errors
-6. start secret_bindings exact materialization
-7. marker-like unbound literal not materialized
-8. Secret missing/invalid pre-child failure
-9. cancel while Action/request waits
-10. Runtime Handle correlation
-11. state_get marks reuse ineligible
-12. state_set immediate durable/nonrollback + reuse ineligible
-13. Artifact operations
-14. progress/Step validation
-15. ActionFailure/error
-16. result file canonical path/size/digest
-17. Validator gets persistent input only
-18. result/error/exit matrix
-19. stdout/redaction/common Log
-20. fencing/timeout/temp
-21. Parent restart runner_lost/restart suppression
+2. register_action uses_runtime exact invocation
+3. sync/async/returned-awaitable Action
+4. invalid Action arity registration reject
+5. Validator sync-only/awaitable reject/ValidationResult defaults
+6. Pool config/liveness/restart
+7. claim ready_at + pending snapshot
+8. ready->start/IPC errors
+9. Secret binding materialization
+10. cancel while Action/request waits
+11. Runtime Handle correlation
+12. state_get reuse ineligible
+13. state_set immediate nonrollback + reuse ineligible
+14. Artifact operations
+15. progress/Step
+16. ActionFailure/error
+17. result file/exit matrix
+18. stdout/redaction/common Log
+19. fencing/timeout/temp/restart
