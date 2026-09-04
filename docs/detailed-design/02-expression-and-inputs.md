@@ -1,13 +1,13 @@
 # 02. Expression / Inputs / Outputs 詳細設計
 
-- Status: Draft v0.6
+- Status: Draft v0.7
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01-workflow-definition.md`
 
 ## 1. 目的
 
-CEL/JMESPath、`${{ ... }}`、Input/Job Output/Workflow Output/Artifact/state/Secret参照とcondition helperの正規契約を定義する。
+CEL/JMESPath、`${{ ... }}`、Input/Job Output/Workflow Output/Artifact/state/Secret参照、Custom Validator連携、condition helperの正規契約を定義する。
 
 ## 2. Expression実装
 
@@ -15,6 +15,8 @@ CEL/JMESPath、`${{ ... }}`、Input/Job Output/Workflow Output/Artifact/state/Se
 - JMESPath: `jmespath >=1.1,<2`
 
 独自DSLは作らない。
+
+`jmespath(...)` はCEL custom function bindingとして登録する。親システム任意functionを自由登録する仕組みにはせず、JobRunnerが定義したhelperだけをCEL環境へ公開する。
 
 ## 3. 式記法
 
@@ -51,7 +53,12 @@ jobs
 
 ## 5. `inputs` / `env`
 
-`inputs`はRun start snapshot。extra reject、null/missing区別。
+`inputs`はRun start snapshot。Input fieldの`nullable`規則は`01`。
+
+- missingと明示nullを区別
+- nullable=falseのnull reject
+- nullable=trueならnull保持
+- extra Input reject
 
 `env`はJSON-compatible literal-only。Expression/Secret参照禁止。
 
@@ -59,7 +66,7 @@ jobs
 
 `${{ secrets.* }}` はinternal Action Job `with`だけ。
 
-Persistent Inputにはreference markerだけ。値は各Attempt Action起動直前materialize。
+Persistent Inputにはreference markerだけ。値は各Attempt Action起動直前materialize。Secret value contractは`12`のnon-empty string。
 
 ## 7. `needs`
 
@@ -176,9 +183,20 @@ Canonical JSON:
 - NaN/Infinity禁止
 - deterministic object serialization可能
 
-Optional JSON Schema validation。
+### 15.1 Result validation pipeline
 
-### 15.1 Transparent PayloadStore
+正規順序:
+
+1. JSON-compatible / canonical JSON validation
+2. optional JSON Schema (`outputs.schema`)
+3. optional Custom Validator (`validator`)
+4. optional `success_if`
+5. SecretGuard
+6. PayloadStore persistence
+
+Custom Validatorは`01`のValidator Registry callable。Validatorへ渡すInputはpersistent Job Inputで、materialized Secret valueは渡さない。Validatorはresultを変換しない。
+
+### 15.2 Transparent PayloadStore
 
 Canonical JSON bytes:
 
@@ -195,7 +213,7 @@ Default threshold=4MiB。Validation最大値ではない。
 
 Blob load時はsize/digest検証。欠落/破損はstorage failure。
 
-### 15.2 Attempt history
+### 15.3 Attempt history
 
 OutputはAttempt単位immutable。Failed/cancelled AttemptのOutputはcurrentとして公開しない。Current Job Outputはcurrent successful Attemptから解決。
 
@@ -249,19 +267,26 @@ Dynamic groupは個別skipをaggregateしgroup conclusionがsuccessになり得�
 
 ## 20. `success_if`
 
-ResultのJSON Schema検証後:
+JSON Schema + Custom Validator成功後に評価する。
 
-- true -> success
-- false -> `success_condition_failed`
+- boolean true -> success
+- boolean false -> `success_condition_failed`
+- non-boolean -> `expression_type_error`
 - expression error -> `expression_evaluation_error`
 
 Payload persistenceはSecretGuard後。
 
 ## 21. `order_by` / JMESPath
 
-Order criterionはnon-null string/number、同criterion同型。bool/object/array/null/混在禁止。
+Order criterionはnon-null stringまたは**finite number**。同criterion内で全candidate同型。
 
-`jmespath(value, expression)`はJSON-compatible valueを対象とする。
+禁止:
+
+```text
+bool/object/array/null/NaN/Infinity/混在型
+```
+
+`jmespath(value, expression)`はJSON-compatible valueを対象とし、結果型は利用field側で検証する。
 
 ## 22. 評価タイミング
 
@@ -274,7 +299,9 @@ Order criterionはnon-null string/number、同criterion同型。bool/object/arra
 | with | activation/Attempt1前 |
 | Secret | 各internal Attempt child起動前 |
 | retry if | failed Attempt後 |
-| success_if | Job result/schema検証後 |
+| JSON Schema | Job result canonical validation後 |
+| Custom Validator | JSON Schema後 |
+| success_if | Custom Validator後 |
 | Job Payload persistence | success_if/SecretGuard後 |
 | Workflow outputs | Workflow success確定直前 |
 
@@ -283,10 +310,13 @@ Order criterionはnon-null string/number、同criterion同型。bool/object/arra
 1. Job Output scalar/list/object/null
 2. Workflow Output always object
 3. optional JSON Schema各型
-4. 4MiB inline/spill
-5. large Output downstream透過参照
-6. blob欠落/破損fail-closed
-7. skipped/default condition
-8. Nested parent helper
-9. Secret利用位置
-10. missing/null/type strictness
+4. Custom Validator execution order/invalid/exception
+5. 4MiB inline/spill
+6. large Output downstream透過参照
+7. blob欠落/破損fail-closed
+8. skipped/default condition
+9. Nested parent helper
+10. Secret利用位置
+11. Input nullable/missing/null strictness
+12. success_if non-boolean reject
+13. order_by NaN/Infinity reject
