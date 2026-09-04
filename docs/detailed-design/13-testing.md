@@ -1,6 +1,6 @@
 # 13. Testing 詳細設計
 
-- Status: Draft v2.2
+- Status: Draft v2.3
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`〜`12`
@@ -47,6 +47,9 @@ Definition:
 - canonical-json-v1 golden
 - Draft2020-12 only
 - duplicate/merge/custom tag/unknown key reject
+- Core/Pydantic strict no-coercion
+- bool not accepted as integer/number
+- string not coerced to number/bool
 - Input nullable/default/null/extra
 - env literal-only
 - needs/Dynamic parent cycle
@@ -60,6 +63,8 @@ Definition:
 - one current version semantics
 - snapshot/current mismatch fail-closed
 - concurrency case-sensitive
+- concurrency scope=`workflow_id + group`
+- mixed `max-runs` uses conservative minimum capacity
 - signed64/NaN/Infinity boundaries
 - timeout executor constraints
 
@@ -88,6 +93,8 @@ Definition reload:
 
 - valid update without restart
 - explicit refresh
+- `wf_start` always re-reads current source bytes
+- unchanged mtime/size but changed bytes still detected at start
 - invalid new YAML no old-cache fallback
 - existing Run old snapshot
 
@@ -116,6 +123,7 @@ Persistent Input:
 - marker-like unbound literal
 - input digest golden
 - Secret value excluded
+- **Secret binding付きAttemptはreuse_eligible=false**
 
 Activation:
 
@@ -183,9 +191,12 @@ State runtime:
 SecretGuard:
 
 - SecretsProvider non-empty str only
+- unique Secret name resolved once per Attempt
+- same resolved value used for all bindings/redaction/artifact scan
 - Output/state/Artifact metadata/Event/error reject
 - spill pre-guard
-- log redact
+- stdout/stderr streaming redaction catches chunk-boundary match
+- log/progress/step telemetry redaction
 - managed Artifact byte match/chunk boundary
 - transformed Secret guarantee外
 - Input read references only
@@ -241,43 +252,54 @@ Scheduling:
 - internal pending claim
 - all-executor Retry pending
 - noninternal due Retry no with re-eval
-- priority/order axes
+- Internal order uses Job `ready_at`
+- External claim order uses Task `available_at`
+- Lease requeue updates Task `available_at`
+- stable opaque ID only final tie-break
 - Child priority propagation
 - one internal/Run
 - multiple Runs
 - claim races
-- concurrency case
+- concurrency scope/workflow separation
+- paused holder retains concurrency slot
 
 ## 10. Maintenance / Recovery
 
 - no busy loop
 - earlier deadline wake
 - max sleep5
+- due boundary `now >= deadline`
 - retry/Lease due without traffic
 - Pause lease continues/retry waits
 - restart overdue/Retention
 - pending survives restart
 - runner_lost
 - root/Child priority repair
-- completed no reopen
+- concurrency holder/waiter repair
+- completed no reopen except explicit Manual Retry
 - orphan scanner does not delete unowned object younger than `orphan_cleanup_grace_seconds`
-- default grace300 / invalid non-positive reject
+- default grace300 / invalid `<=0` reject
 
 ## 11. Runner / IPC
 
 - handshake/envelope/terminal matrix
 - exact Attempt persistent_input
 - Secret bindings/materialization
+- unique Secret resolution once/Attempt
 - marker literal
 - pre-child Secret failure
 - Runtime request correlation/cancel
 - state/artifact auth request-response
 - state_set immediate/nonrollback
-- log/progress/step
+- streaming stdout/stderr redaction across chunks
+- progress/log/step telemetry redaction
+- step_key correlation
+- Step `start_metadata_json` / `finish_metadata_json` separate
 - large result file
 - Validator persistent Input only
-- stdout separate/redacted
 - fencing
+- cancel/result race first terminal wins
+- timeout deadline result rejection/grace cleanup only
 
 ## 12. Execution Log / Event / Progress
 
@@ -318,17 +340,23 @@ Retry:
 - no new Attempt at schedule
 - exact pending copy
 - pre-Attempt new Run
-- run_attempt++
+- completed failure Run explicit reopen increments run_attempt
+- non-terminal retry does not increment run_attempt
 - target no with/item/version re-eval
-- Secret binding fixed/value rotate
+- Secret binding fixed/value rotates only on re-execution
+- completed Run Manual Retry reacquires concurrency slot
+- concurrency reject leaves Run/Job unchanged
+- concurrency queue reopens with `wait_reason=concurrency`
+- reopen clears current Workflow Output
 
 Strict reuse:
 
 - blocked/skipped reactivation
 - successful current if/input/artifact/version/Payload validation
 - executor-specific output revalidation
-- **state_get successful Attempt is ineligible**
-- **state_set successful Attempt is ineligible**
+- state_get successful Attempt ineligible
+- state_set successful Attempt ineligible
+- Secret-bound successful Attempt ineligible
 - non-input Artifact materialize ineligible
 - mismatch -> new Run
 
@@ -345,6 +373,7 @@ Strict reuse:
 - System limit change after Run start no effect
 - 1000/1001 rollback
 - ordering/stable tie
+- group status queued/running/completed
 - if=false vs empty
 - zero-parent
 - expansion digest
@@ -355,6 +384,8 @@ Strict reuse:
 ## 15. Reusable Workflow
 
 - reference/path safety
+- first binding re-reads current Child source bytes
+- invalid current Child source fails binding; no stale cache fallback
 - Binding Definition+versions+System baseline
 - Child settings/Retention
 - current System change no effect
@@ -366,6 +397,10 @@ Strict reuse:
 - ArtifactRef/no mirror
 - Parent outputs.schema
 - Parent progress
+- Child concurrency scope uses Child workflow_id
+- Child concurrency queue creates Child/Parent waits
+- Child concurrency reject creates no Child row and Parent Attempt fails
+- Retry after reject uses same binding
 - direct control reject
 - cycle/depth/Dynamic/restart
 - parent retention upper bound
@@ -399,6 +434,8 @@ External:
 - Task snapshot
 - arbitrary result
 - claim race
+- claim order uses `available_at`
+- lease expiry boundary `now >= expires_at`
 - no renew
 - requeue/fail
 - submit Retry later
@@ -417,32 +454,42 @@ Human:
 Verify all18 tables:
 
 - exact columns/checks/indexes/FKs
+- canonical fixed UTC timestamp format
 - System baseline/effective settings
 - Child binding baseline/settings/Retention
 - priority support
 - Dynamic no Job row
 - pending invariant
-- Secret bindings/digest
+- Secret bindings/digest + secret-bound reuse_eligible=0
 - one-running
 - Dynamic unique/digest
 - State current/history atomic
+- Step start/finish metadata columns
 - Artifact/log schema
 - Runner liveness
 - External Task config/Lease
 - Human immutable
 - Idempotency
+- Reusable reject no Child row
 - Child-first Retention
 - migration gap/future
 
 ## 19. Service / MCP / HTTP
 
+- Core Service models strict/no-coercion
+- HTTP query explicit parse only
+- canonical timestamp response/filter normalization
 - Run info jobs/Dynamic groups/attempts
+- active_task/review/child IDs navigation
 - Input info/read refs only
 - Output/Event/Log
+- State list/read/history read-only public API
+- no public State mutation API
 - priority start/update
 - namespaced MCP
-- exact HTTP incl Input/Event
+- exact HTTP incl Input/Output/State/Event
 - status/no422/idempotency replay
+- concurrency_limit_reached 409
 - forbidden APIs
 
 ## 20. Idempotency / Concurrency
@@ -455,7 +502,10 @@ Verify all18 tables:
 - no reserved
 - claim exactly one
 - submit claim_next replay
-- concurrency race/order
+- concurrency scope=`workflow_id + group`
+- mixed max-runs conservative capacity
+- waiter head-of-line fairness
+- Manual Retry concurrency reacquire atomicity
 
 ## 21. Retention
 
@@ -491,22 +541,22 @@ platform-matrix
 ## 23. MVP completion gate
 
 1. `01`〜`12`全受入条件対応
-2. Dependencies/extras
+2. Dependencies/extras/strict model parsing
 3. Definition/System baseline/Priority/Registry/reload
-4. Expression context/Input/Secret binding
+4. Expression context/Input/Secret binding/reuse safety
 5. Bootstrap/Action invocation/IPC/Runtime Auth
-6. Runner Pool/Scheduling
+6. Runner Pool/Scheduling/Concurrency
 7. Exact18-table schema/migrations
 8. Payload/Artifact + retention
-9. Validator/SecretGuard
-10. State immediate/reuse rules
+9. Validator/SecretGuard/streaming redaction
+10. State immediate/reuse + public read APIs
 11. External/Human
-12. Dynamic index/1000/nested/order/reuse
-13. Reusable baseline/priority/artifact/schema/progress
-14. Retry/Recovery strict reuse
-15. Service/MCP/HTTP/Input/Output/Event
+12. Dynamic index/1000/nested/order/status/reuse
+13. Reusable baseline/priority/concurrency/artifact/schema/progress
+14. Retry/Recovery strict reuse/reopen/output invalidation
+15. Service/MCP/HTTP/Input/Output/State/Event
 16. Idempotency/concurrency/claim_next
-17. Common Log/Progress
+17. Common Log/Progress/Step metadata
 18. Retention/orphan grace/audit
 
 WebUI E2Eは後続。
