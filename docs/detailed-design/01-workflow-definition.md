@@ -1,12 +1,12 @@
 # 01. Workflow Definition 詳細設計
 
-- Status: Draft v1.1
+- Status: Draft v1.2
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 
 ## 1. 目的
 
-JobRunner の Workflow YAML、型、JSON Schema、canonical serialization、Action/Validator定義、設定継承、reload、Job fieldの正規契約を定義する。
+JobRunner の Workflow YAML、型、JSON Schema、canonical serialization、Action/Validator定義、設定継承、priority、reload、Job fieldの正規契約を定義する。
 
 ## 2. MVP Python / OSS依存
 
@@ -157,7 +157,20 @@ Output全体object、PayloadStore利用。
 
 ## 10. Priority / Concurrency
 
-Priority=signed64 integer default0。
+Workflow Definition `priority`=signed64 integer、default0。
+
+Root Workflow Run初期priority:
+
+```text
+wf_start.priority specified -> request value
+otherwise -> Workflow Definition priority
+```
+
+Reusable Child RunはChild Definitionのtop-level priorityを使わず、**root Workflow Runのcurrent priorityを継承**する。Root `wf_priority_update` はroot自身と全non-terminal descendant Child Runへ同値を伝播し、future Childも更新後root priorityを継承する。Childへのdirect priority updateは`06/11`どおり禁止。
+
+Job `priority` は各Job Definitionのsigned64 integer、default0。Workflow Run priorityとは別軸。
+
+Concurrency:
 
 ```yaml
 concurrency:
@@ -172,7 +185,7 @@ concurrency:
 - max-runs 1..signed64 max
 - on-limit queue|reject
 
-## 11. System Runtime Defaults と Workflow `settings`
+## 11. System Workflow Defaults / Workflow `settings`
 
 System config canonical defaults:
 
@@ -186,6 +199,7 @@ execution_log_level = normal
 workflow_progress_mode = auto
 job_progress_mode = auto
 idempotency_ttl_hours = 24
+retention.* = null
 ```
 
 Workflow YAML:
@@ -207,13 +221,42 @@ settings:
     managed-artifact-data-days: null
 ```
 
-`default_runner_pool`はSystem configのみでWorkflow YAMLから上書きしない。ただし**Workflow Run start時にeffective settingsへsnapshot**し、`runs-on`省略Job/Generated JobはそのRun snapshotの値を使う。Parent restart後にcurrent System defaultが変わっても既存RunのPool解決を変えない。
+### 11.1 Root Run system baseline snapshot
 
-その他effective runtime setting:
+Root Workflow Run開始時に、Workflow実行へ影響するSystem baselineを `system_workflow_defaults_json` としてsnapshotする。
+
+Exact shape:
 
 ```text
-Workflow specified value > System config > canonical default
+default_runner_pool
+max_dynamic_jobs
+external_lease_minutes
+external_on_lease_expiry
+output_inline_threshold_bytes
+execution_log_level
+workflow_progress_mode
+job_progress_mode
+retention:
+  run_history_days
+  execution_logs_days
+  event_days
+  artifact_metadata_days
+  managed_artifact_data_days
 ```
+
+`idempotency_ttl_hours` はService requestのTTLでRun execution semanticsではないため、このsnapshotには含めない。
+
+Root Run effective runtime settings/RetentionはこのSystem baseline snapshot + Workflow Definition settingsから算出する。
+
+Reusable Childは**binding作成時のcurrent System configを読み直さず、Parent Workflow Runの `system_workflow_defaults_json` を継承**してChild settings/Retentionを算出する。これにより、Root Run開始後のSystem config変更で同一Run lineageのChild挙動が変わらない。Exact rules=`06`。
+
+### 11.2 Effective runtime setting
+
+```text
+Workflow specified value > Run system baseline snapshot > canonical default
+```
+
+`default_runner_pool`はSystem-onlyでWorkflow YAMLから上書きしない。ただしRun effective settingsへcopyする。
 
 External Job lease/expiryは§18 Job overrideが最優先。
 
@@ -232,7 +275,7 @@ Validation:
 
 `idempotency_ttl_hours`はSystem configのみ。Workflowから上書きしない。finite positive number。
 
-### 11.1 Retention settings
+### 11.3 Retention settings
 
 各retention値:
 
@@ -241,9 +284,7 @@ null = unlimited
 integer >=1 = 作成/完了基準の日数
 ```
 
-System configも同じ5項目を持ち、System defaultは全て`null`。
-
-Effective policyは **Workflow setting（指定項目のみ） > System config > unlimited default**。Workflow Run開始時にeffective retention policyをsnapshotする。
+Effective policyは **Workflow setting（指定項目のみ） > Run system baseline retention > unlimited default**。Workflow Run開始時にeffective retention policyをsnapshotする。
 
 - run-history-days: Workflow Run DB履歴と必須従属data
 - execution-logs-days: Execution Log file
@@ -273,8 +314,6 @@ MVP Registryは各Processで:
 action_id -> exactly one current {version, callable, metadata}
 validator_id -> exactly one current {version, callable}
 ```
-
-を持つ。
 
 - ID/versionはnon-empty string
 - 同一Processで同じIDの二重登録はreject
@@ -367,6 +406,8 @@ outputs:
 
 Schema=Draft2020-12。Job Output本体は任意JSON value。トップレベルWorkflow outputs name mappingとは別概念。
 
+Human JobはOutputが常に`null`でReview metadataは別APIにあるため、Humanでは`outputs.schema`を禁止する。Reusable Jobでは`outputs.schema`を許可し、Child Workflow Output objectをParent Job Outputとして受け取った後にSchema検証する。Exact semantics=`06/07`。
+
 ### 14.4 Job `progress`
 
 ```yaml
@@ -374,9 +415,11 @@ progress:
   mode: auto|explicit|none
 ```
 
-Omitted -> Workflow `settings.job-progress-mode` -> System/default auto。Exact semantics=`09`。
+Omitted -> Workflow `settings.job-progress-mode` -> Run system baseline/default auto。Exact semantics=`09`。
 
 ## 15. Result validation order
+
+Internal/External:
 
 1. JSON-compatible/canonical JSON v1
 2. optional Draft2020-12 Output Schema
@@ -385,6 +428,16 @@ Omitted -> Workflow `settings.job-progress-mode` -> System/default auto。Exact 
 5. SecretGuard
 6. PayloadStore
 7. success
+
+Reusable:
+
+1. Child Workflow success + Child Workflow Output object取得
+2. optional Parent Job `outputs.schema`
+3. SecretGuard
+4. Parent Attempt PayloadStore
+5. Parent Job success
+
+Human: approve時Output=`null`をそのままParent Attempt Outputとして保存し、Schema/Validator/success_ifは持たない。
 
 ## 16. Executor constraints
 
@@ -402,13 +455,15 @@ External:
 Human:
 
 - action/validator/uses/runs-on/success_if/external/timeout forbidden
+- non-empty `outputs.schema` forbidden
 
 Reusable:
 
 - uses required
 - action/validator/executor/runs-on/success_if/external/timeout forbidden
+- `outputs.schema` optional
 
-`with/if/continue-on-error/priority/retry/outputs/progress/foreach/key/order_by` は共通規則に従い利用可能。
+`with/if/continue-on-error/priority/retry/progress/foreach/key/order_by` は共通規則に従い利用可能。
 
 ## 17. Secret expression field restriction
 
@@ -445,7 +500,7 @@ Allowed keysはこの2つだけ。
 Effective:
 
 ```text
-Job external value > Workflow settings > System config > canonical default
+Job external value > Workflow effective settings > Run system baseline > canonical default
 ```
 
 - lease-minutes finite positive
@@ -465,16 +520,25 @@ Standard filesystem WorkflowResolver:
 
 File watcher/background hot reload必須無し。Python Action/Validator code reloadは親development autoreloadへ任せる。
 
-## 20. Definition Snapshot
+## 20. Definition / Run Snapshot
+
+Definition snapshot:
 
 - workflow id/version/name
 - source YAML
 - typed Definition JSON/hash
 - Workflow Input
 - Action/Validator ID+version
+
+Root Run additionally snapshots:
+
+- `system_workflow_defaults_json`
 - effective runtime settings（default_runner_pool含む）
 - effective retention policy
+- initial Workflow Run priority
 - optional source_identity
+
+Child Run snapshot rules=`06`。
 
 ## 21. 検証
 
@@ -488,12 +552,15 @@ Load:
 - executor/field conflicts
 - settings/external/progress
 - Secret placement/full-scalar
+- Human/Reusable outputs.schema constraint
 
 Run start:
 
 - Input
 - current Registry versions
+- System workflow defaults snapshot
 - default/explicit Runner Pool
+- priority resolution
 - concurrency
 - Reusable refs
 - effective settings/retention
@@ -508,16 +575,19 @@ FailureならRun row無し。
 3. Draft2020-12 only
 4. Input nullable
 5. executor default/internal + uses->reusable
-6. default_runner_pool System default/snapshot/restart stability
-7. explicit/omitted runs-on resolution
-8. Job outputs.schema exact shape
-9. Registry one-current-version/duplicate reject/version mismatch
-10. runtime setting inheritance
-11. External lease hierarchy
-12. progress/log setting validation
-13. Secret full-scalar
-14. retention inheritance
-15. reload valid/invalid/refresh
-16. concurrency identity
-17. arbitrary Output/spill
-18. deterministic hash
+6. Root System baseline snapshot/restart stability
+7. Child uses Parent Run System baseline rather than current System config
+8. default_runner_pool snapshot/runs-on resolution
+9. root priority request override/definition default
+10. Child priority inheritance/root update propagation
+11. Job outputs.schema exact shape + Human/Reusable boundary
+12. Registry one-current-version/duplicate reject/version mismatch
+13. runtime setting inheritance
+14. External lease hierarchy
+15. progress/log setting validation
+16. Secret full-scalar
+17. retention inheritance
+18. reload valid/invalid/refresh
+19. concurrency identity
+20. arbitrary Output/spill
+21. deterministic hash
