@@ -1,6 +1,6 @@
 # 12. Security / Secrets 詳細設計
 
-- Status: Draft v0.7
+- Status: Draft v1.0
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `02`, `04`, `08`, `09`, `11`
@@ -10,15 +10,15 @@
 1. Authenticationは親責任。
 2. CoreはAuthorizationProvider必須hook。
 3. Default AllowAll。
-4. 全public read/writeをauthorize。
-5. Secret valueをCore管理persistent storageへ平文保存しない。
+4. 全public read/write authorize。
+5. Secret valueをCore persistent storageへ平文保存しない。
 6. Secret materializeはinternal Action Job `with`だけ。
-7. Coreは本格sandbox/arbitrary code標準実行を提供しない。
-8. Runnerはinternal fencing。
-9. Cross-run Artifact accessもAuthorizationを迂回しない。
-10. Provider/Registryは`04`のProcess-local Integration Bootstrapで再構築し、親memory instanceのpickle転送に依存しない。
+7. 本格sandbox/arbitrary code標準実行無し。
+8. Runner fencing。
+9. Cross-run Artifact accessもAuthorization必須。
+10. Provider/RegistryはProcess-local Integration Bootstrapで再構築。
 
-## 2. Actor / AccessScope / Authorization
+## 2. Actor / AccessScope
 
 ActorContext:
 
@@ -30,61 +30,29 @@ claims optional
 metadata optional
 ```
 
-AccessScopeはparent-defined project/workspace/tenant/resource scope。
+AccessScope=parent-defined project/workspace/tenant/resource scope。
 
-ChildはParent scopeを継承し権限拡大禁止。
+ChildはParent scope継承、権限拡大禁止。Runtime Handle内部operationもcurrent Actor/Scopeを引き継ぐ。
 
-Action Runtime Handleの内部operationもcurrent Workflow RunのActorContext/AccessScopeを引き継ぐ。
+ActorContext/AccessScopeはJSON-compatible persistence-safe dataとし、parentはsession token/password等を入れない。Known Secret値はpersist前SecretGuard対象。
 
-## 3. Integration Bootstrap / provider boundary
+## 3. Integration Bootstrap boundary
 
-Source of Truth=`04-runner-and-ipc.md`。
+Source=`04`。
 
-親システムはimport可能なbootstrap entrypointを登録し、Process roleごとに必要componentを再構築する。
-
-```text
-parent
-runner
-action_runner
-```
-
-### parent
-
-- AuthorizationProvider factory
-- SecretsProvider factory
-- Action/Validator Registry
-- optional PayloadStore/ArtifactStore factory
-
-を構築可能。
-
-### runner
-
-- AuthorizationProvider
-- SecretsProvider
-- Validator callable/Registry metadata
-- Storage backend
-
-をProcess内で再構築する。
-
-RunnerはWorkflow Run snapshotのActorContext/AccessScopeを内部operationへ引き継ぐ。
-
-### action_runner
-
-Action Runner子Processには以下を渡さない。
+Parent/RunnerはAuthorizationProvider/SecretsProvider/Registry/StoreをProcess内再構築。Action Runnerへ:
 
 ```text
 SQLite path/connection
-AuthorizationProvider instance/config credential
-SecretsProvider instance/config credential
-ArtifactStore/PayloadStore credential
+AuthorizationProvider credential
+SecretsProvider credential
+Store credential
 parent authentication/session credential
 ```
 
-Action Runnerが受け取れるSecretは、Runnerがcurrent Attempt用に解決して`start` IPCへ入れた必要値だけ。
+を渡さない。
 
-Bootstrap code自体は親側trusted codeだが、Coreはroleに不要なproviderをAction Runnerへ自動注入しない。
-
-Parent/Runner間でProvider policyが異なる構成は親責任だが、public ServiceとRunner internal operationの双方がAuthorization hookを通ることはCore invariant。
+Action Runnerへ渡るSecretはcurrent Attemptに必要なmaterialized valueだけ。
 
 ## 4. Runner fencing
 
@@ -92,10 +60,10 @@ Parent/Runner間でProvider policyが異なる構成は親責任だが、public 
 runtime_instance_id
 runner_id
 runner_instance_id
-attempt_id where applicable
+attempt_id
 ```
 
-current ownership不一致のlate update reject。
+Current ownership不一致late update reject。
 
 ## 5. SecretsProvider
 
@@ -104,17 +72,7 @@ class SecretsProvider:
     def get(self, name, actor, scope) -> str: ...
 ```
 
-MVP Secret valueはnon-empty Python `str`。空string/bytes/number/object reject。
-
-Invalid provider value:
-
-```text
-category=security
-code=secret_value_invalid
-retryable=false
-```
-
-Binary secret等は将来typed contractで拡張し暗黙変換しない。
+Secret value=non-empty Python `str`のみ。Empty/bytes/number/object reject=`secret_value_invalid`。
 
 Secret name:
 
@@ -122,11 +80,13 @@ Secret name:
 ^[A-Za-z_][A-Za-z0-9_]*$
 ```
 
+Missing=`secret_not_found`。
+
 ## 6. Secret reference policy
 
-許可はinternal Action Job `with`のみ。
+Allowed=internal Action Job `with`のみ。
 
-禁止:
+Forbidden:
 
 ```text
 env
@@ -136,22 +96,71 @@ foreach/key/order_by
 Workflow outputs/concurrency
 ```
 
-Persistent Inputはreference marker。各Attempt Action起動直前materialize。Retryはreference固定、rotation後new value許容。
+MVPでは**Secret expressionが1 scalar全体を占める場合だけ**許可。
 
-Missing Secret=`secret_not_found`。
+Allowed:
 
-## 7. Attempt Secret Set
+```yaml
+with:
+  token: ${{ secrets.API_TOKEN }}
+```
 
-Runnerはcurrent internal AttemptでmaterializeしたSecretをAttempt専用Setとして保持。
+Rejected:
 
-- persistence無し
-- Event/debug metadataへ出さない
-- Attempt終了時memory reference破棄
-- UTF-8 bytesもmanaged file scan用に保持
+```yaml
+with:
+  auth: "Bearer ${{ secrets.API_TOKEN }}"
+```
 
-## 8. Structured SecretGuard
+加工はAction内部で行う。
 
-Core管理persistent JSON/textへ書く前にrecursive string scan。
+## 7. Persistent Secret binding
+
+Secret valueの代わりに`02`のpersistent Inputへcanonical reference stringを残し、別metadataとしてbindingを保存する。
+
+```json
+{
+  "pointer": "/token",
+  "name": "API_TOKEN"
+}
+```
+
+Properties:
+
+- RFC6901 pointer
+- pointer unique
+- binding array pointer ASC
+- Secret value無し
+- retryでpointer/name固定
+- unbound marker-like stringは通常literalでありSecretとして解決しない
+
+Persistence=`job_runs.pending_secret_bindings_json` / `job_attempts.secret_bindings_json`。
+
+## 8. Attempt Secret materialization
+
+Internal Attempt実行直前:
+
+1. binding listをread
+2. current Actor/ScopeでSecretsProvider.get(name)
+3. value contract検証
+4. Attempt Secret Set作成
+5. `04 start`へpersistent_input + bindings +必要name->valueだけ送信
+6. Action Runnerがmemory上execution inputを作る
+
+Secret Set:
+
+- persist無し
+- debug/Event metadata無し
+- Attempt終了時reference破棄
+- UTF-8 bytesをmanaged Artifact scan用に保持
+
+Retryではbinding固定、Provider value rotationは許可。
+
+Custom Validatorはpersistent input/reference stringだけを受け、Secret value無し。
+
+## 9. Structured SecretGuard
+
+Core persistent JSON/textへ書く前にrecursive string scan。
 
 対象:
 
@@ -160,9 +169,10 @@ Core管理persistent JSON/textへ書く前にrecursive string scan。
 - Artifact URI/metadata/name
 - Event payload
 - structured error/details
-- idempotency persisted result
+- idempotency result/adapter metadata
+- Actor/AccessScope persistence
 
-Known Secret exact/substring含有 ->
+Known Secret exact/substring ->
 
 ```text
 category=security
@@ -170,118 +180,90 @@ code=secret_value_persistence_blocked
 retryable=false
 ```
 
-PayloadStore inline/blob前に必須。
+PayloadStore前に必須。
 
-## 9. Managed Artifact content guard
+Persistent Secret **reference string/name**はSecret valueではないため保存可。
 
-`runtime.artifact.put_file` はdurable finalize前にsource fileをstream scan。
+## 10. Managed Artifact content guard
 
-- current Attempt known Secret UTF-8 bytes検索
-- chunk境界match用overlap
-- match時保存拒否/temp copy削除/metadata無し
-- binaryでもexact bytes matchならreject
+`put_file` durable finalize前にcurrent Attempt known Secret UTF-8 bytesをstream scan。Chunk境界match対応。
 
-Failure=`secret_value_persistence_blocked`。
+Match -> save reject/temp cleanup/metadata無し=`secret_value_persistence_blocked`。
 
-External Reference Artifactは外部実体内容scan無し。URI/metadataだけSecretGuard。外部実体のSecret管理は親責任。
+External Reference実体はscan無し。URI/metadataだけGuard。
 
-## 10. Artifact authorization
+## 11. Artifact authorization
 
-Canonical ArtifactRefとmaterialize規則は`09`。
+Same-run Managed Artifactもcurrent Actor/Scope確認。
 
-### same-run
+Cross-run:
 
-Current Workflow Run所有ArtifactはRuntime内部resourceとして利用可能。ただしcurrent Actor/AccessScopeのRun accessとArtifact状態を確認する。
+1. canonical ArtifactRefがpersistent Job Inputに明示
+2. row/data存在
+3. source Artifact read Authorization
+4. current scopeから参照可能
 
-### cross-run
+Raw artifact_idだけでは不可。Reusable ChildはParent Actor/Scope継承。
 
-別Workflow Run所有Managed Artifactを`runtime.artifact.materialize`する場合:
+External ArtifactはCore materialize無し。
 
-1. canonical ArtifactRefがcurrent persistent Job Input内に明示存在
-2. source Artifact row/dataが存在
-3. `AuthorizationProvider.authorize(current_actor, "artifact.read", source_artifact, current_scope)` 相当がallowed
-4. source Artifactがcurrent scopeから参照可能
+## 12. Execution Log redaction
 
-InputにArtifactRefがあることはAuthorizationの代替ではない。
+stdout/stderr/logはknown Secret substringを`[REDACTED]`へ置換してwrite。Raw pre-redaction別sink無し。
 
-Raw artifact_idだけを知っているcaller/Actionへcross-run materializeを許可しない。
+All executor共通Log policyは`09`。
 
-Reusable ChildはParent ActorContext/AccessScopeを継承するため、ArtifactRefを渡しても権限拡大しない。
-
-External Reference ArtifactはCore materialize無し。
-
-## 11. Execution Log redaction
-
-stdout/stderr/logはknown Secret substringを `[REDACTED]` に置換してwrite。
-
-Redaction前raw lineを別sinkへ保存しない。
-
-## 12. 検出限界
+## 13. 検出限界
 
 完全検出保証外:
 
 - Base64/hash/encryption
-- Secret fragment分割
-- current Attemptへmaterializeされていない別機密値
+- fragment分割
+- current Attemptへmaterializeされていない別機密
 
-保証はcurrent AttemptでJobRunnerが知るexact substring/UTF-8 bytes。
+保証=current AttemptでCoreが知るexact substring/UTF-8 bytes。
 
-## 13. Process environment
+## 14. Process environment
 
-Parent全environmentをAction childへ無条件継承しない。
+Parent全environmentをAction childへ無条件継承しない。Python/processに必要な最小非Secret環境を基本とし、provider credentialをenvironmentへ一括コピーしない。
 
-Action Runner child environmentはPython/process起動に必要な最小非Secret環境を基本とする。Secret/provider credentialはenvironmentへ一括コピーしない。
-
-## 14. YAML / Reusable security
+## 15. YAML / Reusable security
 
 Safe YAML:
 
-- custom tag reject
-- duplicate key reject
-- merge key reject
-- arbitrary include/fetch reject
+- custom tag/duplicate/merge reject
+- arbitrary include/fetch無し
+- Reusable URL fetch無し
 
-ReusableはWorkflow root local/registered ID。URL fetch無し。
+## 16. Arbitrary code / Sandbox
 
-## 15. Arbitrary code / Sandbox
+Coreに`shell:`/arbitrary Python source無し。必要なら親専用Action + Docker等。
 
-Coreに `shell:` / arbitrary Python source無し。必要なら親専用Action + Docker等。
+Temp directory=sandboxではない。
 
-Temp directoryはsandboxではない。
+## 17. MCP / information leakage
 
-## 16. Log / Artifact / filesystem
+Tool非公開はAuthorization代替ではない。Namespace必須。
 
-- Log read authorize
-- external path指定read不可
-- Managed store key/path Core生成
-- put/materialize destination current work_dir内
-- External Artifact URI auto-fetch無し
-- cross-run Artifact readはexplicit ref + authorization
-
-## 17. MCP exposure / information leakage
-
-Tool subset非公開はAuthorization代替ではない。Namespace必須。
-
-Providerは`forbidden/not_found` policyを選べる。Error detailsもSecretGuard。
+Providerはforbidden/not_found policyを選べる。Error detailsもSecretGuard。
 
 ## 18. 受入条件
 
-1. parent/runner/action_runner Bootstrap role境界
-2. Runner Provider process-local reconstruction
-3. Action RunnerへDB/provider/storage credential非注入
-4. all public read/write authorization
-5. Secret name/value contract
-6. Secret参照位置
-7. per-Attempt Secret Set non-persistent
-8. Output/State/Event/Error guard
-9. PayloadStore spill前guard
-10. managed Artifact exact byte guard
-11. external Artifact metadata guard/no content scan
-12. Log redaction
-13. transformed Secret非保証
-14. same-run Artifact access
-15. cross-run Artifact explicit ref + authorization
-16. raw cross-run artifact_id reject
-17. Reusable Child no scope escalation
-18. Runner fencing
-19. safe YAML/path safety
+1. Bootstrap/provider boundary
+2. all public read/write authorization
+3. Secret name/non-empty str
+4. full-scalar-only placement
+5. canonical binding pointer/sort/no value persistence
+6. unbound marker literal remains literal
+7. Retry binding fixed/value rotation
+8. Action Runner materialization only in memory
+9. Validator no Secret value
+10. Structured SecretGuard targets
+11. Payload spill pre-guard
+12. Managed Artifact byte guard/chunk boundary
+13. External Artifact no content scan
+14. Log redaction
+15. transformed Secret non-guarantee
+16. same/cross-run Artifact authorization
+17. Reusable scope non-escalation
+18. Runner fencing/path safety
