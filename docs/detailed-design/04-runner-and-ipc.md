@@ -1,6 +1,6 @@
 # 04. Runner / IPC 詳細設計
 
-- Status: Draft v1.1
+- Status: Draft v1.2
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `02`, `03`, `08`, `09`, `10`, `12`
@@ -300,7 +300,16 @@ Response=`found/value/revision`。成功利用でAttempt `reuse_eligible=false`�
 
 ### 13.2 `state_set`
 
-Request=`name + JSON-compatible value`。Response=`revision>=1`。RunnerServiceがSecretGuard + current/history transaction。
+Request=`name + JSON-compatible value`。Response=`revision>=1`。
+
+RunnerServiceがAuthorization + SecretGuard + current/history transactionを**request時点で即時commit**する。
+
+- Attempt successまでtransactionを保留しない
+- Attemptが後でfailure/cancelled/timeout/runner_lostになってもstate writeをrollbackしない
+- append-only state historyからどのAttempt/Stepがwriteしたか追跡可能
+- 成功利用でAttempt `reuse_eligible=false`
+
+この即時・非rollback semanticsを前提に、Action側が業務transactionを必要とする場合は専用Action/親DB transaction等で設計する。
 
 ### 13.3 `artifact_put_file`
 
@@ -475,12 +484,14 @@ CPU/RAM/GPU quota、本格sandbox、arbitrary shell、Pool global pause、Pool A
 8. Secret missing/invalid pre-child failure
 9. cancel while Action/request waits
 10. Runtime Handle correlation
-11. Artifact/state operations
-12. progress/Step validation
-13. ActionFailure/error
-14. result file canonical path/size/digest
-15. Validator gets persistent input only
-16. result/error/exit matrix
-17. stdout/redaction/common Log
-18. fencing/timeout/temp
-19. Parent restart runner_lost/restart suppression
+11. state_get marks reuse ineligible
+12. state_set immediate durable/nonrollback + reuse ineligible
+13. Artifact operations
+14. progress/Step validation
+15. ActionFailure/error
+16. result file canonical path/size/digest
+17. Validator gets persistent input only
+18. result/error/exit matrix
+19. stdout/redaction/common Log
+20. fencing/timeout/temp
+21. Parent restart runner_lost/restart suppression
