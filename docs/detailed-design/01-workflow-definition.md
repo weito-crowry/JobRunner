@@ -1,6 +1,6 @@
 # 01. Workflow Definition 詳細設計
 
-- Status: Draft v0.4
+- Status: Draft v0.5
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 
@@ -15,14 +15,18 @@ Pythonは **3.10以上**。
 Coreの基本依存は以下へ固定する。
 
 ```text
-ruamel.yaml >=0.19,<0.20     # YAML 1.2 / duplicate key検出
+ruamel.yaml >=0.19.1,<0.20   # YAML 1.2 / duplicate key検出
 pydantic >=2.13,<3           # typed immutable models / request models
 jsonschema >=4.26,<5         # optional Input/Output JSON Schema
-cel-python >=0.5,<0.6        # CEL
+cel-python >=0.5,<0.6        # CEL (PyPI cel-python / cloud-custodian/cel-python)
 jmespath >=1.1,<2            # JSON projection/filter
 ```
 
-MVP時点でいずれもPython 3.10で利用可能。YAMLは`ruamel.yaml`のduplicate key rejectを有効にし、merge key `<<` はJobRunner側でも明示rejectする。
+MVP時点でPython 3.10で利用可能。ライセンスは `ruamel.yaml/pydantic/jsonschema/jmespath = MIT`, `cel-python = Apache-2.0` で、Coreへの通常依存として許容する。
+
+`ruamel.yaml 0.19.0` は導入上の既知問題を避けるため対象外とし、0.19.1以上を使う。
+
+YAMLは`ruamel.yaml`のduplicate key rejectを有効にし、merge key `<<` はJobRunner側でも明示rejectする。
 
 Process/SQLite/JSON/UUID等はPython標準libraryを優先する。
 
@@ -35,6 +39,8 @@ Process/SQLite/JSON/UUID等はPython標準libraryを優先する。
 5. load後はtyped immutable `WorkflowDefinition`。
 6. Run開始時にruntime dependency含め再検証し実使用定義をsnapshot。
 7. 元YAML変更は既存Runへ反映しない。
+8. 数値fieldはNaN/Infinityを拒否する。
+9. SQLite INTEGERへ保存する整数はsigned 64-bit範囲に収める。
 
 ## 4. トップレベル
 
@@ -65,7 +71,7 @@ Workflow-level Output mapping。literalまたはexpression。
 
 Workflow IDは親登録名またはWorkflowResolver canonical reference。
 
-`version`は親管理version。定義同一性はtyped definition canonical JSONのSHA-256 `definition_hash`も使用。
+`version`は `1..9223372036854775807` の整数。親管理versionであり、定義同一性はtyped definition canonical JSONのSHA-256 `definition_hash`も使用する。
 
 ## 6. Workflow Input
 
@@ -75,7 +81,37 @@ Workflow IDは親登録名またはWorkflowResolver canonical reference。
 string/integer/number/boolean/object/array
 ```
 
-`null`許可は明示。Run開始時にrequired/extra/type/defaultを検証しsnapshot。
+Input fieldの正規形:
+
+```yaml
+inputs:
+  name:
+    type: string
+    required: true
+    nullable: false
+    default: optional
+    description: optional
+    schema: optional
+```
+
+規則:
+
+- `type`: 必須、上記標準型の1つ
+- `required`: boolean、既定false
+- `nullable`: boolean、既定false
+- `default`: 任意
+- `description`: string任意
+- `schema`: JSON Schema object任意。object/array等の追加制約に使う
+
+`null`を許可する正規方法は `nullable: true`。`type`を配列にする等の別表現はInput fieldでは許可しない。
+
+- callerが`null`を渡す場合 `nullable=true` 必須
+- `default: null` も `nullable=true` 必須
+- `required=true` は「keyの存在」を要求し、`nullable=true`なら値nullは許可
+- optional + default無しはmissing
+- extra Inputはreject
+
+Run開始時にrequired/extra/type/nullable/default/schemaを検証し、最終Inputをsnapshotする。
 
 ## 7. Workflow `outputs`
 
@@ -90,7 +126,7 @@ Workflow OutputもJob Outputと同じPayloadStore規則で、小さいJSONはSQL
 
 ## 8. Priority / Concurrency
 
-Priorityはinteger、既定0、大きいほど高い。
+Priorityはsigned 64-bit integer、既定0、大きいほど高い。
 
 ```yaml
 concurrency:
@@ -99,7 +135,15 @@ concurrency:
   on-limit: queue
 ```
 
-`on-limit = queue|reject`。
+Concurrency規則:
+
+- `group`: literalまたはCEL。最終評価結果は**非空string必須**
+- stringをtrim/lowercase等へ暗黙正規化しない
+- group比較はUTF-8文字列の**case-sensitive完全一致**
+- `max-runs`: `1..9223372036854775807` のinteger
+- `on-limit`: `queue|reject`、既定`queue`
+
+Group式がstring以外/null/emptyならRun start validation failureでRun rowを作らない。
 
 ## 9. Workflow `settings`
 
@@ -113,9 +157,10 @@ settings:
   output-inline-threshold-bytes: 4194304
 ```
 
-- `max-dynamic-jobs`: integer >=0、default1000
-- external lease: default60分 / `requeue`
-- `output-inline-threshold-bytes`: positive integer、default4MiB
+- `max-dynamic-jobs`: integer >=0、default1000、signed 64-bit範囲
+- `external-lease-minutes`: finite positive number、default60分
+- `external-on-lease-expiry`: `requeue|fail`
+- `output-inline-threshold-bytes`: positive signed 64-bit integer、default4MiB
 
 **4MiBは最大OutputサイズではなくSQLite inline保存からfilesystem blobへ切り替える閾値。** MVPにhiddenなJob Output最大サイズは設けない。
 
@@ -135,7 +180,20 @@ Unknown settingはerror。優先順位はWorkflow setting > System default。Ext
 
 Dynamic `foreach.parent`もDAG dependency edgeとしてcycle検証対象。
 
-## 11. Job共通field
+## 11. Action identity
+
+Action Registryの正規identity:
+
+```text
+action_id: non-empty string
+action_version: non-empty string
+```
+
+Action versionは親システムが更新責任を持つ。integer等を暗黙string変換せず、Registry登録APIでstringを要求する。
+
+Workflow Run開始時に参照Actionの `action_id + action_version` をsnapshotする。
+
+## 12. Job共通field
 
 ```yaml
 jobs:
@@ -161,7 +219,7 @@ jobs:
 
 ### `runs-on`
 
-internalのみ。省略時System `default_runner_pool`、default文字列`default`。未登録PoolはRun開始前error。
+internalのみ。省略時System `default_runner_pool`、default文字列`default`。最終値は非空string。未登録PoolはRun開始前error。
 
 ### `executor`
 
@@ -169,7 +227,7 @@ internalのみ。省略時System `default_runner_pool`、default文字列`defaul
 
 ### `action`
 
-internal必須。external/human/reusableは禁止。
+internal必須。external/human/reusableは禁止。値はRegistryのnon-empty `action_id` string。
 
 ### `with`
 
@@ -187,13 +245,17 @@ internal/externalのみ。**Action/External resultは任意のJSON-compatible va
 
 boolean/CEL boolean、activation時snapshot。
 
+### `priority`
+
+signed 64-bit integer、既定0。
+
 ### `timeout-minutes`
 
-internalのみoptional。external/human/reusableは禁止。
+internalのみoptional。finite positive number。external/human/reusableは禁止。
 
 ### `retry`
 
-未指定automatic retry無し。
+未指定automatic retry無し。数値規則は`10`。
 
 ### Job `outputs`
 
@@ -219,7 +281,9 @@ external:
   on-lease-expiry: fail
 ```
 
-## 12. Executor別constraint
+`lease-minutes`はfinite positive number。
+
+## 13. Executor別constraint
 
 ### internal
 
@@ -237,7 +301,7 @@ external:
 
 `uses` required literal。`action/executor/runs-on/success_if/external/timeout-minutes` forbidden。
 
-## 13. Dynamic syntax
+## 14. Dynamic syntax
 
 Root:
 
@@ -255,7 +319,7 @@ foreach:
 
 詳細は`05`。
 
-## 14. Definition Snapshot
+## 15. Definition Snapshot
 
 保存:
 
@@ -266,14 +330,16 @@ foreach:
 - Action ID/version snapshot
 - optional source_identity
 
-## 15. 検証
+## 16. 検証
 
 load:
 
 - safe YAML / duplicate / merge / custom tag
 - schema/unknown key
+- Input nullable/default schema
 - Job/Dynamic dependency cycle
 - executor field constraint
+- numeric finite/range
 - CEL/JMESPath compile
 - reusable syntax
 - retry/internal timeout/settings
@@ -281,22 +347,28 @@ load:
 Run start:
 
 - Input
-- Action ID/version
+- Action ID/version string
 - Runner Pool
+- concurrency group result string
 - reusable resolution/cycle
 - Secret利用位置
 - runtime settings
 
 失敗時Run rowを作らない。
 
-## 16. 受入条件
+## 17. 受入条件
 
 1. dependency versions/import on Python3.10
-2. duplicate/merge/tag rejection
-3. env literal-only/expression reject
-4. arbitrary JSON Output scalar/list/object/null
-5. inline threshold 4MiBとtransparent spill
-6. Outputにhidden max無し
-7. internal timeout / others reject
-8. Dynamic parent cycle
-9. definition hash deterministic
+2. ruamel.yaml 0.19.1 lower bound
+3. duplicate/merge/tag rejection
+4. Input nullable true/false/default null
+5. env literal-only/expression reject
+6. Action version non-empty string
+7. concurrency group non-empty string/case-sensitive
+8. numeric finite/signed64 boundary
+9. arbitrary JSON Output scalar/list/object/null
+10. inline threshold 4MiBとtransparent spill
+11. Outputにhidden max無し
+12. internal timeout / others reject
+13. Dynamic parent cycle
+14. definition hash deterministic
