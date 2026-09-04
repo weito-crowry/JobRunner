@@ -1,9 +1,9 @@
 # 09. Artifact / Log / Workflow State 詳細設計
 
-- Status: Draft v0.4
+- Status: Draft v0.5
 - 対象: MVP
 - 上位仕様: `docs/design.md`
-- 関連: `02-expression-and-inputs.md`, `04-runner-and-ipc.md`, `08-persistence.md`
+- 関連: `02-expression-and-inputs.md`, `04-runner-and-ipc.md`, `08-persistence.md`, `11-service-api-and-mcp.md`
 
 ## 1. 目的
 
@@ -136,7 +136,7 @@ Attemptごとにfile。Runnerがstructured log/stdout/stderr/diagnosticを追記
 
 Periodic flush。全量memory保持禁止。
 
-`wf_log_read`でattempt IDからfull/offset/tail read。`wf_info`に本文を埋め込まない。外部path指定read不可。
+`wf_log_read`でattempt IDからfull/offset/tail read。`wf_run_info`に本文を埋め込まない。外部path指定read不可。
 
 ## 12. Event Log
 
@@ -217,6 +217,6 @@ Tempはsandboxではない。
 6. Output PayloadとArtifactの分離
 7. managed retention data delete
 8. Dynamic full-key reference
-9. Log read/path safety
+9. Log read/path safety / `wf_run_info` no log body
 10. state/history/SecretGuard
 11. temp cleanup
