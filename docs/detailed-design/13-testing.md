@@ -1,6 +1,6 @@
 # 13. Testing 詳細設計
 
-- Status: Draft v1.0
+- Status: Draft v1.1
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`〜`12`
@@ -16,7 +16,7 @@
 7. 競合testはbarrier/hook。
 8. 完了判定はcoverage率より各詳細設計の受入条件対応を優先。
 
-## 2. Foundation dependencies
+## 2. Foundation dependencies / package
 
 Python3.10で:
 
@@ -36,9 +36,15 @@ jmespath >=1.1,<2
 - Windows/Linux Python3.10
 - dependency license inventory
 - ruamel.yaml duplicate key reject/merge key explicit reject
+- base packageのみでMCP/HTTP optional依存をimport要求しない
+- `[mcp]`, `[web]`, `[all]` extrasで対応Adapter import可能
+- CoreからAdapter implementationへ逆依存しない
 
 ## 3. Definition / Expression / Type boundaries
 
+- YAML1.2
+- canonical-json-v1 golden bytes/hash
+- Draft2020-12 only / other draft reject
 - duplicate/merge/custom tag/unknown key reject
 - Input nullable false/true
 - required+nullable
@@ -60,6 +66,15 @@ jmespath >=1.1,<2
 - continue-on-error -> effective success
 - Dynamic group / Nested parent helper
 - order_by NaN/Infinity/mixed type reject
+
+### Definition reload
+
+- valid YAML file更新をparent process restart無しで`wf_definition_info`/`wf_start`が認識
+- mtime_ns+size変化でcache replace
+- explicit `WorkflowResolver.refresh()`でmetadata同一でもreload
+- invalid new YAMLはold cacheへsilent fallbackせずnew Run start reject
+- already running Workflow Runはold snapshot継続
+- Action/Validator code reloadはJobRunner hot-reload対象外
 
 ## 4. Custom Validator
 
@@ -87,13 +102,9 @@ Reusable/Dynamic:
 
 ## 5. JSON Output / PayloadStore
 
-Positive result shapes:
+Positive result shapes=`null/boolean/number/string/array/object`。
 
-```text
-null/boolean/number/string/array/object
-```
-
-Workflow Outputはobject。
+Workflow Output object。
 
 - optional JSON Schema各shape
 - threshold-1 inline
@@ -127,14 +138,15 @@ Output:
 HTTP:
 
 - exact v1 routes/methods from`11`
-- Definition info uses query `workflow_ref`, slash-containing IDs supported
+- Definition info query `workflow_ref`, slash-containing IDs supported
 - opaque generated IDs in path
-- Idempotency-Key header mapping
+- Idempotency-Key mapping
 - no duplicate request_id body
 - status 200/201/400/401/403/404/409/413/500
 - no 422
-- idempotency replay preserves original 201/200 status/body
+- idempotency replay preserves original status/body
 - source_identity non-empty string when present
+- canonical request/response required fields from`11`
 
 ## 7. SecretGuard
 
@@ -290,14 +302,12 @@ Managed:
 - immutable generations
 - materialize destination safety
 - Retry current generation
-- retention data delete
 - store finalize DB failure orphan cleanup
 
 External:
 
 - URI metadata
 - no fetch
-- retention external data non-delete
 - External LLM reference only
 
 ## 15. External / Human
@@ -322,15 +332,9 @@ Human:
 
 ## 16. Same-Run Result Reuse
 
-Scope same Run only, no cross-Run.
+Scope same Run only, no cross-Run。
 
-Key includes:
-
-- persistent Input
-- direct upstream Artifact identity
-- Definition hash
-- executor/Action version
-- Validator identity/version
+Key includes persistent Input / direct upstream Artifact / Definition hash / executor+Action / Validator identity。
 
 Negative:
 
@@ -355,7 +359,7 @@ Manual Retry descendant:
 - reuse pending restore
 - completed Run Recovery-only reopen無し
 
-## 18. Persistence / Idempotency / Retention
+## 18. Persistence / Idempotency
 
 - migration/WAL/FK/busy timeout
 - future schema reject
@@ -367,13 +371,53 @@ Manual Retry descendant:
 - state current/history atomic
 - deadline indexes
 - concurrency race/case
-- FK NO ACTION/explicit retention order
+- FK NO ACTION
 - idempotency Actor/AccessScope isolation
 - TTL replay/conflict/expired replacement
 - HTTP adapter_meta original status replay
 - task_claim replay no extra Lease
 
-## 19. Authorization / Security
+## 19. Retention
+
+Policy:
+
+- System all-null default -> unlimited
+- Workflow specified field overrides System only for that field
+- effective policy snapshotted at Run start
+- source settings changed later do not alter existing Run
+
+Cutoff:
+
+- run-history uses completed_at; non-terminal never deleted
+- Execution Log uses Attempt completed/log close; running log retained
+- normal Event uses created_at
+- Managed Artifact data/metadata use Artifact created_at; owner non-terminal guard
+- Output Payload follows Run history
+
+Ordering/safety:
+
+- Managed data before metadata when needed
+- External Artifact data never deleted
+- Run-history FK leaf->parent explicit deletion
+- longer component retention cannot outlive Run history
+- deleted Managed data not current/materializable
+- Retention-caused missing Payload/Artifact makes reuse fail-closed
+
+Audit:
+
+- system-level `retention_deleted` has no Run FK
+- normal `event-days` does not delete retention audit Event
+- retention audit survives Run row deletion
+- repeated sweep no duplicate audit
+- orphan cleanup emits `retention_orphan_cleaned`
+
+Maintenance:
+
+- finite retention due sweep without external traffic
+- all-unlimited Run excluded from due deletion
+- restart processes due retention idempotently
+
+## 20. Authorization / Security
 
 - AllowAll/Deny/filtered scope
 - all public read/write authorize
@@ -382,7 +426,7 @@ Manual Retry descendant:
 - Artifact URI no fetch
 - arbitrary shell無し
 
-## 20. Platform / CI
+## 21. Platform / CI
 
 Windows11/Linux。
 
@@ -396,23 +440,25 @@ recovery
 platform-matrix
 ```
 
-## 21. MVP completion gate
+## 22. MVP completion gate
 
 1. `01`〜`12`受入条件対応
-2. dependencies Python3.10 Windows/Linux
-3. Validator contract
-4. migrations/FK retention
-5. process integration
-6. claim/concurrency/deadline races
-7. PayloadStore
-8. Service/MCP/HTTP contract
-9. ArtifactStore
-10. External/Human E2E
-11. Dynamic1000/nested/rollback
-12. Reusable binding/cycle/version
-13. SecretGuard
-14. Retry failure policy
-15. same-run Result Reuse
-16. idempotency scope/status replay
+2. dependencies/package extras Python3.10 Windows/Linux
+3. YAML reload/canonical JSON/JSON Schema
+4. Validator contract
+5. migrations/FK/Retention
+6. process integration
+7. claim/concurrency/deadline races
+8. PayloadStore
+9. Service/MCP/HTTP contract
+10. ArtifactStore
+11. External/Human E2E
+12. Dynamic1000/nested/rollback
+13. Reusable binding/cycle/version
+14. SecretGuard
+15. Retry failure policy
+16. same-run Result Reuse
+17. idempotency scope/status replay
+18. Retention sweep/audit/orphan cleanup
 
 WebUI E2Eは後続。
