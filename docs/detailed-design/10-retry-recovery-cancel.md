@@ -1,22 +1,22 @@
 # 10. Retry / Recovery / Cancel 詳細設計
 
-- Status: Draft v0.6
+- Status: Draft v1.0
 - 対象: MVP
 - 上位仕様: `docs/design.md`
-- 関連: `01`, `03`, `04`, `07`, `08`, `11`
+- 関連: `01`, `02`, `03`, `04`, `05`, `07`, `08`, `11`
 
 ## 1. 基本原則
 
-1. Retryはnew Attempt。
-2. Failed Attemptをqueuedへ戻さない。
-3. Retry Input/Definition/Action/Validator version/Dynamic iteration/Reusable bindingは固定。
+1. Retry=new Attempt。
+2. Failed Attempt rowを書き換えない。
+3. Retry Input/Secret bindings/Definition/Action/Validator/Dynamic iteration/Reusable binding固定。
 4. Automatic Retryは`retry` block明示時のみ。
 5. Manual Retryはfailed Job指定。
-6. Retryには既存Attemptのpersistent Input snapshotが必須。
+6. Retryにはfailed Attempt persistent Input snapshot必須。
 7. Internal timeoutのみ。未指定無期限。
-8. Cancelはgraceful。
-9. Recoveryだけでcompleted Runをreopenしない。
-10. Manual Retry後のsuccessful descendantは`03`のsame-run Result Reuse必須。
+8. Cancel=graceful。
+9. Recoveryだけでcompleted Run reopen無し。
+10. Manual Retry後successful descendantは`03/05` strict reuse必須。
 
 ## 2. Structured Failure
 
@@ -29,42 +29,39 @@ details optional
 occurred_at
 ```
 
-`retryable`は必須boolean。Failure producerが必ず明示し、missingを暗黙trueにしない。
+`retryable`必須bool。Missingを暗黙trueにしない。
 
-## 3. Failure retryability defaults
+## 3. Core retryability defaults
 
-Core生成failureの既定:
+| code | default retryable |
+| --- | --- |
+| runner_lost | true |
+| job_timeout | true |
+| external_lease_expired(fail) | true |
+| payload_storage_failed | true |
+| action_process_exit | false |
+| action_exception | false |
+| ipc_protocol_error | false |
+| result_file_invalid | false |
+| output_validation_failed | false |
+| validator_exception | false |
+| domain_validation_failed | Validator value |
+| success_condition_failed | false |
+| action_version_mismatch | false |
+| validator_version_mismatch | false |
+| human_rejected | false |
+| secret_not_found/secret_value_invalid | false |
+| secret_value_persistence_blocked | false |
+| successful_job_result_not_reusable | false |
+| dynamic_expansion_not_reusable | false |
+| retry_input_unavailable | false |
+| cancelled/internal_error | false |
 
-| code | retryable | 理由 |
-| --- | --- | --- |
-| `runner_lost` | true | 実行基盤の一時的消失 |
-| `job_timeout` | true | 同Input再試行で回復可能性あり |
-| `external_lease_expired` (`fail` policy) | true | 外部owner不在/遅延 |
-| `payload_storage_failed` | true | local I/O一時障害の可能性 |
-| `action_process_exit` | false | Action crashは既定で明示Retryさせる |
-| `action_exception` | false | 未分類Action例外 |
-| `ipc_protocol_error` | false | 実装/契約不整合の疑い |
-| `result_file_invalid` | false | 実装/破損 |
-| `output_validation_failed` | false | 同Output再試行で直る保証無し |
-| `validator_exception` | false | Validator実装問題 |
-| `domain_validation_failed` | Validator結果 | 親Validatorが判断 |
-| `success_condition_failed` | false | 業務条件不成立 |
-| `action_version_mismatch` | false | Registry/Run snapshot不整合 |
-| `validator_version_mismatch` | false | Registry/Run snapshot不整合 |
-| `human_rejected` | false | 人間判断 |
-| `secret_not_found` | false | 環境設定修正が必要 |
-| `secret_value_invalid` | false | Provider contract違反 |
-| `secret_value_persistence_blocked` | false | Security violation |
-| `successful_job_result_not_reusable` | false | new Runが必要 |
-| `retry_input_unavailable` | false | new Runが必要 |
-| `cancelled` | false | Retry対象failureではない |
-| `internal_error` | false | 分類不能Core error |
+Parent `ActionFailure`/Validator supplied retryableはそのまま使用。
 
-親`ActionFailure`は指定された`retryable`をそのまま使用する。
+`retryable=false`でもYAML `retry.if`が明示trueならAttempt failureはAutomatic Retry可能。ただしAttempt自体が無い`retry_input_unavailable`系はRetry不能。
 
-`retryable=false`でもYAMLで `retry.if: ${{ true }}` と明示すればAutomatic Retryを許可する。`failure.retryable`は安全な既定判断であり絶対禁止フラグではない。ただし `retry_input_unavailable` はAttemptが無いためAutomatic/Manual Retryの対象外。
-
-## 4. Retry YAML canonical schema
+## 4. Retry YAML
 
 ```yaml
 retry:
@@ -76,216 +73,253 @@ retry:
     multiplier: 2.0
 ```
 
-### 4.1 `retry` block absent
+Absent:
 
 ```text
-automatic retry = disabled
-max attempts = 1
+automatic retry disabled
+max attempts=1
 ```
 
-### 4.2 `retry` block present
-
-Canonical defaults:
+Present defaults:
 
 ```text
-max-attempts = 2
-if = ${{ failure.retryable }}
-backoff.initial-seconds = 0
-backoff.max-seconds = initial-seconds
-backoff.multiplier = 1.0
+max-attempts=2
+if=${{ failure.retryable }}
+initial=0
+max=initial
+multiplier=1
 ```
-
-つまり `retry: {}` は「最大2 Attempt、retryable failureを1回だけ即時再試行」。
 
 Validation:
 
-- `max-attempts`: integer `2..9223372036854775807`
-- `if`: CEL boolean expression
-- `initial-seconds`: finite number >=0
-- `max-seconds`: finite number >= initial-seconds
-- `multiplier`: finite number >=1.0
+- max-attempts integer 2..signed64 max
+- if CEL boolean
+- initial finite>=0
+- max finite>=initial
+- multiplier finite>=1
 - unknown key reject
 
-`max-attempts=1`でAutomatic Retryを無効化したい場合は`retry` block自体を省略する。意味を二重化しない。
-
-### 4.3 Backoff calculation
-
-次Attempt番号を `n`（2から開始）として:
+Delay for next Attempt `n>=2`:
 
 ```text
-delay = min(max_seconds,
-            initial_seconds * multiplier ** (n - 2))
+min(max_seconds, initial_seconds * multiplier ** (n-2))
 ```
 
-initial=0なら常に0。JitterはMVP無し。Delay計算結果はfiniteでなければDefinition validation errorとなる範囲へ事前制約する。
+Jitter無し。
 
-## 5. Automatic Retry flow
+## 5. Retry pending snapshot
 
-Automatic Retryはfailed Attemptに対してのみ。
+Retry request/schedule時に基準failed Attemptから:
 
-1. Attempt failure確定
-2. Workflow cancel確認
-3. current attempt_no < max-attempts確認
-4. Retry `if`を`failure` contextで評価
-5. false -> Job failure terminal
-6. true -> backoff計算
-7. Jobをqueued/retry waitingへし `retry_not_before` 保存
-8. Maintenance Loopへdeadline notify
-9. Event `retry_scheduled`
+```text
+input_json
+secret_bindings_json
+input_digest
+```
 
-Backoff予約時new Attemptを作らない。Deadline到来後、Runner/internalまたはexecutor activation時にnew Attemptを作る。
+をJob `pending_*`へexact copyする。
 
-Retry `if` expression errorはretryせず、元failureを保持したまま `retry_condition_evaluation_failed` diagnostic/Eventを追加する。元failureを別failureへ上書きしない。
+さらに:
 
-## 6. Manual Retry eligibility
+```text
+ready_at = retry schedule/request time
+retry_not_before = due time or NULL
+status = queued
+```
+
+とする。
+
+**new Attemptはまだ作らない。**
+
+Due後:
+
+- internal -> Runner claimがpending snapshotをnew Attemptへcopy
+- external -> scheduler activationがnew Attempt + Taskへcopy
+- human -> new Attempt + Reviewへcopy
+- reusable -> new Attempt + Child Runへcopy
+
+Attempt作成後pending fieldsはclear可能。
+
+この方式で全executorのRetry Inputを同じ規則にする。
+
+## 6. Automatic Retry flow
+
+Failed Attempt terminal時:
+
+1. Workflow cancel確認
+2. current attempt_no < max-attempts
+3. Retry `if`を`failure` contextで評価
+4. false -> Job completed/failure
+5. true -> delay計算
+6. §5 pending snapshot作成
+7. `retry_not_before`保存
+8. Maintenance notify
+9. `retry_scheduled` Event/Execution Log
+
+Retry condition errorはRetryせず元failure維持 + diagnostic/Event。
+
+Validation/domain failureをExternal submitで受けた場合もこのflow。Submit transaction内でnew Attempt/Taskは作らない。
+
+## 7. Manual Retry eligibility
 
 `wf_retry(workflow_run_id, job_run_id)`。
 
-必須:
+Required:
 
-- target Job conclusion=`failure`
-- terminal failed Attempt >=1
-- latest failed Attemptにpersistent `input_json`
-- Workflow Run conclusion=`failure` またはnon-terminal
-- snapshotted Action/Validator/Reusable binding versionをcurrent Registryで提供可能
+- target Job conclusion=failure
+- terminal failed Attempt>=1
+- latest failed Attempt input/bindings/digest存在
+- Workflow Run conclusion=failure またはnon-terminal
+- snapshot Action/Validator/Reusable binding version available
 
 Reject:
 
 - success/cancelled Run
-- Dynamic expansion自体のfailureでAttempt無し
-- activation/Input resolutionでAttempt開始前failure
+- Dynamic expansion failureでAttempt無し
+- activation/Input resolution等Pre-Attempt failure
 
-Input snapshot無し:
+Attempt/Input無し:
 
 ```text
-code=retry_input_unavailable
+retry_input_unavailable
 retryable=false
 ```
 
-Version不足は`action_version_mismatch|validator_version_mismatch`。
-
-## 7. Manual Retry reopen
+## 8. Manual Retry reopen
 
 Completed/failure Run:
 
-1. eligibility + idempotency
+1. eligibility/idempotency
 2. `run_attempt += 1`
 3. Run reopen
-4. target Job retry waiting/queued (`retry_not_before=null`)
-5. blocked/skipped descendants activation再評価
-6. successful descendants `reuse_check_pending=1`
-7. Event
+4. target Jobへ§5 pending snapshot、`retry_not_before=NULL`
+5. blocked/skipped descendants activation再評価対象へ戻す
+6. whole-skipped Dynamic expansion rowは`05`規則でreset可能
+7. successful descendants `reuse_check_pending=1`
+8. successful Dynamic group/expanded rows `05` reuse check対象
+9. Event/Execution Log
 
-過去Attempt/Output/Artifact/Eventは削除しない。
+Past Attempt/Output/Artifact/Event削除無し。
 
-Manual Retryはautomatic `max-attempts`上限をリセットしない。Manual Retryによるnew Attemptは既存`attempt_no+1`を採番し、そのAttempt failure後のautomatic Retry可否は **その時点のattempt_noとmax-attemptsを比較**する。したがって既にmax-attempts以上なら追加Automatic Retryは起こらない。
+Manual Retryはautomatic max-attempts budgetをリセットしない。New Attempt番号=existing max+1。その失敗後automatic Retry可否はactual attempt_noとmax-attempts比較。
 
-## 8. Retry固定Input
+## 9. Target Retry固定値
 
-Retryは基準failed Attemptのpersistent `input_json`をnew Attemptへcopy。
-
-再評価しない:
+Target Retryで再評価しない:
 
 - `with`
-- current upstream Output/state
-- Dynamic item/iteration/order
+- upstream Output/state
+- Secret binding name/path
+- Dynamic item/iteration/key/order
 - continue-on-error
 - Reusable binding
 - Action/Validator version
 
-Secret referenceは固定、materialized valueはAttemptごと再解決。
+Secret **value**だけAttemptごとcurrent SecretsProviderから再materialize。
 
-## 9. Descendant reactivation / reuse
+## 10. Descendant reactivation / reuse
 
-Blocked/skipped descendantはcurrent dependenciesで`if/with`再評価。
+### blocked/skipped Job
 
-Failed non-target descendantは自動Retryしない。
+まだ成功実行していないためcurrent dependenciesで `if/with` を通常activationとして再評価可能。
 
-Successful descendantは`03` reuse check:
+### failed non-target Job
 
-- match + eligible + Payload integrity + Action/Validator version available -> success reuse
-- otherwise `successful_job_result_not_reusable`, retryable=false, new Workflow Run必要
+勝手にRetryしない。
 
-## 10. Internal timeout
+### successful Job
+
+`03` strict reuse:
+
+- current `if=true`
+- expected persistent Input/binding digest match
+- upstream Artifact match
+- Definition/executor/Validator identity match
+- Payload/Artifact availability
+- stored Output validation re-pass
+- eligible
+
+Mismatch -> `successful_job_result_not_reusable`, new Workflow Run必要。
+
+### Dynamic expansion
+
+Committed `expanded` setは`05` expansion digest exact match必須。Mismatch=`dynamic_expansion_not_reusable`。Same Runでgenerated setを差し替えない。
+
+## 11. Internal timeout
 
 1. timeout cancel
 2. grace default10秒
-3. child terminate
+3. terminate
 4. `job_timeout/retryable=true`
 5. Retry policy
 
 External/Human/Reusableに`timeout-minutes`無し。
 
-## 11. Runner Lost / Runtime restart
+## 12. Runner Lost / Runtime restart
 
-Runner lost/old-runtime orphan running Attempt:
+Runner lost/old Runtime orphan running Attempt -> `runner_lost/retryable=true` terminal failure -> Retry policy。
 
-```text
-runner_lost
-retryable=true
-```
+Runtime起動:
 
-でconditional terminal化してRetry policyへ。
+1. new runtime_instance_id/Bootstrap
+2. non-terminal Runs
+3. running orphan
+4. ready queued/pending snapshots
+5. overdue Retry
+6. External Lease
+7. Review/Child
+8. Dynamic expansion/reuse pending
+9. downstream/conclusion
+10. Retention/cleanup
 
-Runtime起動時:
+Completed RunはRecoveryのみでreopenしない。
 
-1. new runtime_instance_id
-2. Registry/Pool/Storage
-3. non-terminal Runs
-4. running orphan
-5. overdue Retry deadlines
-6. active/expired External Leases
-7. pending Review
-8. waiting Child
-9. Dynamic expansion
-10. reuse_check_pending
-11. downstream/conclusion
-
-Completed RunはRecoveryでreopenしない。
-
-## 12. Pause
+## 13. Pause
 
 - running internal継続
-- new internal/External claim/Dynamic expansion禁止
-- existing External submit/Human submit/started Child進行可
-- Lease expiry処理継続
-- retry_not_before到来は保持するがnew Attempt開始はResume後
+- new internal/external claim/Dynamic expansion禁止
+- existing submit/review/Child進行可
+- Lease expiry継続
+- due retry pending snapshotを保持、new AttemptはResume後
+- ready Job Input snapshotを再評価しない
 
-## 13. Cancel
+## 14. Cancel
 
 - cancel_requested
 - queued/retry-wait/waiting executor cancel
-- active External Lease invalidated
-- running internal cancel
-- Child cancel propagation
+- active Lease invalidate
+- running internal cooperative cancel
+- Child cancel
 - new activation禁止
 
-Workflow conclusion cancelled。
+Workflow conclusion=cancelled。
 
-## 14. External / Human
+## 15. External / Human
 
-Lease `requeue`: same Attempt、Retryではない。
+Lease requeue=same AttemptでRetryではない。
 
-Lease `fail`: `external_lease_expired/retryable=true` -> Retry policy。
+Lease fail=Attempt failure -> Retry policy。
 
-Human reject: `human_rejected/retryable=false`。Manual Retryはpersistent Inputがあるため可能。
+Human reject=retryable false defaultだがYAML retry.ifで明示Automatic Retry可能。Retry時はnew Review。
 
-## 15. Recovery idempotency
+## 16. Recovery idempotency
 
-Repeated RecoveryでAttempt/Task/Lease/Review/Dynamic/Child/reuse/retry scheduleを重複生成しない。
+Repeated RecoveryでAttempt/Task/Lease/Review/Dynamic/Child/retry schedule/reuse resultを重複生成しない。
 
-## 16. 受入条件
+## 17. 受入条件
 
-1. retry block absent disabled
-2. `retry:{}` exact default = max2 / retryable / zero backoff
-3. retry numeric validation/backoff formula
-4. failure retryable mapping
-5. ActionFailure retryability propagation
-6. auto retry failed Attemptのみ
-7. Maintenance deadline wake
-8. Retry condition error preserves original failure
-9. manual retry Input/version eligibility
-10. manual retry attempt numbering/max-attempt interaction
-11. descendant reactivation/reuse
-12. internal timeout/runner_lost defaults
-13. pause/cancel/recovery idempotency
+1. retry absent/default/backoff
+2. core retryable map/parent override
+3. pending snapshot exact copy all executors
+4. no new Attempt at retry scheduling/request
+5. due executor-specific Attempt creation
+6. External validation failure follows scheduler retry flow
+7. Manual Retry Input/version eligibility
+8. Manual run_attempt/attempt numbering
+9. Target no with/item/version re-eval
+10. Secret value re-materializes but binding fixed
+11. descendant blocked/skipped reactivation
+12. successful Job current-context reuse
+13. Dynamic expansion strict reuse
+14. timeout/runner_lost
+15. pause/cancel/recovery idempotency
