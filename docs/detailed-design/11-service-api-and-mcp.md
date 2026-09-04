@@ -1,34 +1,30 @@
 # 11. Service API / MCP 詳細設計
 
-- Status: Draft v0.1
+- Status: Draft v0.2
 - 対象: MVP
 - 上位仕様: `docs/design.md`
-- 関連:
-  - `docs/detailed-design/03-runtime-and-scheduling.md`
-  - `docs/detailed-design/07-external-and-human.md`
-  - `docs/detailed-design/10-retry-recovery-cancel.md`
-  - `docs/detailed-design/12-security-and-secrets.md`
+- 関連: `03-runtime-and-scheduling.md`, `06-reusable-workflows.md`, `07-external-and-human.md`, `10-retry-recovery-cancel.md`, `12-security-and-secrets.md`
 
 ## 1. 目的
 
-本書は JobRunner の Runtime Service API、Python API、MCP Adapter、Web Adapter が共有する操作境界、request/response、idempotency、namespace、error handlingを定義する。
+Python/Web/MCPが共有するService operation、Definition/Runの区別、request/response、Authorization、Idempotency、namespace、Errorを定義する。
 
 ## 2. 基本原則
 
-1. Web / MCP / Python APIは同じService layerを呼ぶ。
-2. Adapterがrepository / SQLiteを直接更新しない。
-3. state-changing operationはAuthorizationProviderを必ず通す。
-4. state-changing operationはoptional idempotency keyを受け付ける。
-5. MCP public tool名は親システムnamespaceを必須とする。
-6. read APIは大きいlog本文を通常infoに埋め込まない。
-7. responseはJSON-compatibleなtyped modelとする。
+1. Python/Web/MCPは同じService layerを呼ぶ。
+2. AdapterはDB/Repositoryを直接更新しない。
+3. **read/writeを含む全Service operationがAuthorizationProviderを通る。**
+4. State-changing operationはoptional `request_id` idempotencyを持つ。
+5. Side effect/Event/idempotency resultは可能な限り同一transaction。
+6. MCP public toolは親システムnamespace必須。
+7. DefinitionとWorkflow Runをoperation名で明確に分ける。
+8. 大きいExecution Log本文をRun infoへ埋め込まない。
 
 ## 3. Service構成
 
-概念:
-
 ```text
-WorkflowService
+WorkflowDefinitionService
+WorkflowRunService
 JobService
 ExternalTaskService
 HumanReviewService
@@ -37,47 +33,78 @@ LogService
 RunnerService
 ```
 
-単一Facadeにまとめてもよいが、内部責務は分離する。
+外部Facadeは統合しても内部責務は分離。
 
-## 4. ActorContext
+## 4. ActorContext / request metadata
 
-すべてのService operationは内部的にActorContextを受け取れる。
-
-```text
-actor_type
-actor_id optional
-source optional
-access_scope optional
-metadata optional
-```
-
-MVP default providerがAllowAllでも呼び出し経路は省略しない。
-
-## 5. 共通request metadata
-
-state-changing operation:
+全operation:
 
 ```text
-request_id optional
 actor_context
 ```
 
-`request_id`はidempotency keyとして扱う。
-
-## 6. Workflow operations
-
-### 6.1 start
-
-logical name:
+state-changing:
 
 ```text
-wf_start
+request_id optional
 ```
+
+`request_id`はidempotency key。Authorizationはidempotency replayより先に実施する。
+
+## 5. Workflow Definition read operations
+
+### `wf_definition_list`
+
+利用可能Workflow設計図一覧。
+
+filter:
+
+```text
+workflow_id/name optional
+limit/cursor
+```
+
+返却:
+
+```text
+workflow_id
+name
+version
+description
+definition_hash
+input schema summary
+```
+
+### `wf_definition_info`
 
 request:
 
 ```text
-workflow reference
+workflow_ref
+include_source_yaml=false
+```
+
+返却:
+
+```text
+canonical workflow_id
+name/version/description/hash
+input/output schema
+job definition summary
+validation status
+source_yaml optional
+```
+
+Definition readでWorkflow Runを作成しない。
+
+## 6. Workflow Run operations
+
+### `wf_start`
+
+request:
+
+```text
+workflow_ref
 inputs
 priority optional
 source_identity optional
@@ -89,66 +116,74 @@ response:
 ```text
 workflow_run_id
 status
+run_attempt
 created_at
-validation summary
 ```
 
-開始前validation failure時はWorkflow Runを作らない。
+validation failureはRun rowを作らない。
 
-### 6.2 list
+### `wf_run_list`
 
-```text
-wf_list
-```
-
-filter候補:
+filter:
 
 ```text
 workflow_id
 status
 conclusion
-created_from / created_to
-limit
-cursor
+created_from/to
+parent_workflow_run_id optional
+limit/cursor
 ```
 
-### 6.3 info
+### `wf_run_info`
+
+request:
 
 ```text
-wf_info
+workflow_run_id
+include_jobs=false
+include_attempts=false
+include_steps=false
+include_artifacts=false
+include_events_summary=false
 ```
 
-option:
+`include_attempts/steps/artifacts`がtrueなら必要な上位情報をAdapter/Serviceが自動包含できる。
 
-```text
-include_jobs
-include_attempts
-include_steps
-include_artifacts
-include_events_summary
-```
+Log本文は含めない。log availability/size/latest timeはsummary可能。
 
-Execution Log本文は含めない。
-
-### 6.4 pause / resume / cancel
+## 7. Workflow Run control
 
 ```text
 wf_pause
 wf_resume
 wf_cancel
+wf_retry
+wf_priority_update
 ```
 
-request_id対応。
+すべてrequest_id optional。
 
-terminal Runに対する無効操作はconflictまたはidempotent no-opをoperation規則で統一する。
+### repeat semantics
 
-### 6.5 retry
+- pause on paused -> no-op success
+- resume on non-paused active Run -> no-op success
+- cancel on already cancelled Run -> no-op success
+- pause/resume on completed -> conflict
+- cancel on completed success/failure -> conflict（既にcancelledならno-op）
+- retryは`10`のfailed Job指定条件のみ
+
+### Child Run direct control
+
+`parent_workflow_run_id != null`のRunへのpublic pause/resume/cancel/retry/priority updateは:
 
 ```text
-wf_retry
+child_run_direct_control_forbidden
 ```
 
-MVPではJob指定を基本とする。
+Readは許可。Parent propagationのinternal operationは別。
+
+### `wf_retry`
 
 request:
 
@@ -158,51 +193,47 @@ job_run_id
 request_id optional
 ```
 
-Retry Input変更は許可しない。
+Job-only。Input変更fieldは存在しない。completed failed Runは`10`に従いreopen。
 
-## 7. External Task operations
+### `wf_priority_update`
 
-### task_info
-
-```text
-wf_task_info
-```
-
-read-only。
-
-### task_claim
+request:
 
 ```text
-wf_task_claim
+workflow_run_id
+priority integer
+request_id optional
 ```
 
-request候補:
+実行中Jobはpreemptしない。
+
+## 8. External Task operations
+
+### `wf_task_info`
+
+read-only。task_idまたはcurrent Job/Attemptから取得。
+
+### `wf_task_claim`
+
+request:
 
 ```text
 claimed_by
 workflow_run_id optional
-job key/filter optional
+job_key optional
 request_id optional
 ```
 
 response:
 
 ```text
-task_id
-lease_id
-lease_expires_at
-workflow_run_id
-job_run_id
-attempt_id
+task_id/lease_id/lease_expires_at
+workflow_run_id/job_run_id/attempt_id
 input
 metadata
 ```
 
-### task_submit
-
-```text
-wf_task_submit
-```
+### `wf_task_submit`
 
 request:
 
@@ -210,58 +241,47 @@ request:
 task_id
 lease_id
 result
-claim_next optional
+artifacts optional
+claim_next=false
 request_id optional
 ```
 
-## 8. Human Review operations
+`artifacts`は保存済み実体へのmetadata reference。Result/Artifact/Attempt/Job/Event/idempotencyをatomicに確定。`claim_next`だけはsubmit commit後の別claim transaction。
 
-### review info
+## 9. Human Review discovery/control
 
-read APIとして`wf_info`内のwaiting_review一覧または専用read operationを提供可能。
+### `wf_review_list`
 
-### review submit
+filter:
 
 ```text
-wf_review_submit
+workflow_run_id optional
+status=pending|completed|cancelled optional
+limit/cursor
 ```
 
-request:
+### `wf_review_info`
+
+request `review_id`。Review Input、Artifact refs、status/outcome/comment/actor summaryを返せる。
+
+### `wf_review_submit`
 
 ```text
-workflow_run_id
-job_run_id
-attempt_id
-outcome: approve | reject
+review_id
+outcome approve|reject
 comment optional
 request_id optional
 ```
 
-## 9. Artifact operations
+first terminal submit wins。
 
-```text
-wf_artifact_info
-```
+## 10. Artifact / Log / Runner read
 
-request:
+### `wf_artifact_info`
 
-```text
-artifact_id
-```
+artifact_idまたはworkflow/job/name filter。Metadata/historyのみ。Core標準download無し。
 
-またはworkflow/job/nameから検索可能。
-
-responseはArtifact reference metadataのみ。
-
-Artifact実体downloadをCore標準APIに必須としない。
-
-## 10. Log operations
-
-```text
-wf_log_read
-```
-
-request候補:
+### `wf_log_read`
 
 ```text
 attempt_id
@@ -270,7 +290,7 @@ limit optional
 tail_lines optional
 ```
 
-response:
+返却:
 
 ```text
 content
@@ -280,109 +300,69 @@ size_bytes
 updated_at
 ```
 
-## 11. Runner operations
+### `wf_runner_info`
 
-```text
-wf_runner_info
-```
+Pool/Runner status, instance ID, heartbeat, current Job, restart count/suppression。
 
-取得内容:
+Public force-kill無し。
 
-```text
-runner pools
-runner status
-runner_instance_id
-last_heartbeat_at
-current job
-restart count
-restart suppressed
-```
+## 11. MCP public names
 
-Runner管理用force kill APIはMVP公開Serviceに含めない。
-
-## 12. Priority update
-
-Workflow Run priorityは実行中でも変更可能。
-
-logical operation候補:
-
-```text
-wf_priority_update
-```
-
-実行中Jobをpreemptしない。
-
-Job priority個別変更をMVP必須にはしないがService内部拡張可能にする。
-
-## 13. MCP namespace
-
-Core logical nameとMCP public nameを分ける。
+Core logical nameの先頭へ`<system_namespace>_`を付ける。
 
 例:
 
 ```text
-Core: wf_start
-Novel MCP: novel_wf_start
-FX MCP: fx_wf_start
+novel_wf_definition_list
+novel_wf_definition_info
+novel_wf_start
+novel_wf_run_list
+novel_wf_run_info
+fx_wf_task_claim
 ```
 
-Adapter登録時に`system_namespace`を必須とする。
-
-空namespaceは原則拒否。
-
-## 14. MCP tool set
-
-MVP候補:
+MVP tool set:
 
 ```text
+<ns>_wf_definition_list
+<ns>_wf_definition_info
 <ns>_wf_start
-<ns>_wf_list
-<ns>_wf_info
+<ns>_wf_run_list
+<ns>_wf_run_info
 <ns>_wf_pause
 <ns>_wf_resume
 <ns>_wf_cancel
 <ns>_wf_retry
+<ns>_wf_priority_update
 <ns>_wf_task_info
 <ns>_wf_task_claim
 <ns>_wf_task_submit
+<ns>_wf_review_list
+<ns>_wf_review_info
 <ns>_wf_review_submit
 <ns>_wf_artifact_info
 <ns>_wf_log_read
 <ns>_wf_runner_info
 ```
 
-親システムは不要toolを非公開にできる。
+`system_namespace`は空禁止。推奨syntax `^[a-z][a-z0-9_]*$`。親システムは不要toolを登録しない選択ができる。
 
-## 15. MCP tool granularity
+## 12. MCP granularity
 
-巨大な万能tool 1個にまとめない。
+万能tool 1個へ集約しない。Read/Run control/External/Human/Logを分離し、Agentが意図しないstate changeを起こしにくいschemaにする。
 
-read / state change / external task / human reviewを分ける。
+## 13. Pagination
 
-ChatGPT / Agentが誤操作しにくいschemaを優先する。
-
-## 16. include option
-
-`wf_info`は必要に応じて下位情報を含める。
+list/historyはcursor pagination。外部contract:
 
 ```text
-include_jobs=false default
-include_attempts=false default
-include_steps=false default
-include_artifacts=false default
+items
+next_cursor nullable
 ```
 
-下位includeが上位includeを必要とする場合、Adapterで自動補完してもよい。
+Cursorはopaque。Default limit 50、max 200をMVP既定としSystemで下げてもよい。
 
-## 17. Pagination
-
-list / events / artifact history等はcursor paginationを基本とする。
-
-offset paginationを内部実装しても外部contractはcursorへ抽象化可能にする。
-
-## 18. Error model
-
-共通error:
+## 14. Error model
 
 ```text
 code
@@ -392,13 +372,7 @@ field/path optional
 details optional
 ```
 
-HTTP status等はWeb Adapterがmappingする。
-
-MCPではtool errorとして構造化dataを返す。
-
-## 19. Error code分類
-
-代表:
+共通code:
 
 ```text
 not_found
@@ -411,99 +385,85 @@ idempotency_conflict
 lease_conflict
 lease_expired
 runner_unavailable
+child_run_direct_control_forbidden
 internal_error
 ```
 
-domain codeをdetailsに追加可能。
+MCPはstructured tool error、WebはAdapterがHTTPへmapping。
 
-## 20. Idempotency
-
-対象:
-
-```text
-wf_start
-wf_pause
-wf_resume
-wf_cancel
-wf_retry
-wf_task_claim optional
-wf_task_submit
-wf_review_submit
-priority update
-```
-
-同じrequest_id + operation + scopeで同じrequestなら最初のresponseを再返却する。
-
-同じkeyでrequest内容が異なる場合は`idempotency_conflict`。
-
-## 21. Validation order
+## 15. Idempotency order
 
 state-changing request:
 
-1. request schema validation
-2. actor/authentication-derived context取得
-3. authorization
-4. idempotency lookup
-5. domain state validation
-6. transaction
-7. Event記録
-8. idempotency result保存
-9. response
+1. request schema
+2. parent-derived ActorContext
+3. Authorization
+4. canonical request hash作成（Secret value無し）
+5. idempotency record lookup
+6. same key/hash completedならstored response replay
+7. different hashならconflict
+8. domain validation
+9. transactionでside effect + Event + idempotency result
+10. response
 
-Secret値をrequest hash / Event payloadへ平文保存しない。
+Concurrent same keyはDB uniqueness/transactionによりsingle side effect。
 
-## 22. Python API
+Default TTL 24hは`08`。
 
-親システムからService objectを直接呼べる。
+## 16. Python API
 
-例:
+同じtyped request/response modelを使う。
 
 ```python
-run = workflow_service.start(
-    workflow="analysis.yml",
+run = services.workflow_runs.start(
+    workflow_ref="analysis",
     inputs={"document_id": 1},
     actor=actor,
 )
 ```
 
-MCP/Webと同じvalidation / authorization / idempotencyを通す。
+Python APIだからAuthorizationを迂回することはない。
 
-## 23. Web Adapter
+## 17. Web Adapter
 
-WebUI画面設計は別途。
+画面詳細は別途。HTTP AdapterはService modelの薄いmapping。
 
-HTTP AdapterはService modelをREST/JSONへmappingする薄い層とする。
+Exact URL/path/versioningはWeb/API設計で決められるが、**Service operation名と意味を変えない**。
 
-MVPのexact pathはWebUI/API設計時に確定してよい。
+## 18. Internal Runner Service
 
-Core詳細設計ではService operationをSource of Truthとする。
+Runner Processが使う:
 
-## 24. Versioning
+```text
+runner_register/heartbeat/claim/attempt reflection
+```
 
-Service model / MCP schemaには将来互換性を考慮する。
+はpublic MCP/Web operationではない。Runtime/Runner identity fencingを使う内部API。Public Actor Authorizationとは別のruntime trust boundaryだが、DB state transitionは同じRepository規則を使う。
 
-MVPでURLに`v1`を必須とするかはWeb Adapter時に決めるが、内部request/response modelは破壊変更を識別できるversioning方針を持つ。
+## 19. Observability
 
-## 25. Observability
+state change Eventに:
 
-state-changing operationはactor/source/request_idをEventへ残す。
+```text
+actor/source/request_id
+```
 
-request body全体を無条件にEventへ保存しない。Secrets /巨大payloadを避ける。
+を保存可能。Request body全体やSecretを無条件保存しない。
 
-## 26. 受入条件
+## 20. 受入条件
 
-1. Python API start
-2. MCP namespaced start
-3. namespace衝突防止
-4. wf_info include options
-5. large log separate read
-6. task claim/submit
-7. review submit
-8. pause/resume/cancel/retry
-9. idempotency replay
-10. idempotency conflict
-11. authorization hook
-12. error mapping
-13. parentによるtool非公開
-14. pagination
-15. priority update non-preemptive
+1. Definition list/infoとRun list/infoの区別
+2.全read/write Authorization
+3. MCP namespace/tool set
+4. wf_run_info include hierarchy
+5. Log separate read
+6. pause/resume/cancel repeat semantics
+7. Manual Retry reopen
+8. priority update
+9. Child public control拒否/read許可
+10. task submit Artifact + claim_next
+11. Review list/info/submit
+12. idempotency side effect同transaction/concurrent same key
+13. cursor default/max
+14. parent tool非公開選択
+15. Python/MCP/Web contract equivalence
