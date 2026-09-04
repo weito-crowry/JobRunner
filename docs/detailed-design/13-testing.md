@@ -1,6 +1,6 @@
 # 13. Testing 詳細設計
 
-- Status: Draft v2.5
+- Status: Draft v2.6
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`〜`12`
@@ -39,7 +39,7 @@ jmespath >=1.1,<2
 - `[mcp]`, `[web]`, `[all]`
 - Core -> Adapter逆依存無し
 
-## 3. Definition / System baseline / Priority / Registry
+## 3. Definition / System baseline / Priority / Registry / Resolver
 
 Definition:
 
@@ -98,10 +98,21 @@ Definition Resolver/reload:
 - registered Workflow IDもtyped objectだけではなくsource bytes必須
 - valid update without restart
 - explicit refresh
-- `wf_start` always re-reads current source bytes
+- `wf_start` always re-reads current root source bytes
 - unchanged mtime/size but changed bytes still detected at start
 - invalid/unavailable new source no old-cache fallback
 - existing Run old snapshot
+
+Reusable preflight/binding:
+
+- `wf_start` recursively preflights current reusable graph
+- preflight catches missing/unavailable source, invalid Definition, reference/path errors, cycles, Action/Validator missing, Runner Pool missing
+- preflight creates no reusable_binding and no Child Run
+- child source may change between root start and first reusable activation
+- first binding always re-reads current Child source independent of preflight/cache
+- binding-time source is authoritative Child Definition
+- invalid/current-version mismatch at binding fails even if preflight passed
+- Retry reuses binding and does not reread child source
 
 ## 4. Expression / Context / Persistent Input / Secret binding
 
@@ -255,9 +266,24 @@ Runner Pool:
 - registered only
 - default from Run snapshot
 - runner_count exact
-- heartbeat/lost/stale
-- restart/suppression
 - no Action allow-list/Pool pause
+
+Runner liveness/restart:
+
+- first heartbeat前に固まるRunnerは`started_at`基準でlost
+- after heartbeatはlast_heartbeat基準でlost
+- stale main loop stops heartbeat and eventually lost
+- planned parent shutdown/stopping is not failure restart
+- unexpected exit including exit0 is failure unless planned
+- restart mode `never` suppresses immediately
+- restart mode `on_failure` only failures restart
+- `max_restarts=0` suppresses first failure
+- rolling window counts automatic restart launches per runtime+pool+runner logical slot
+- window expiry naturally restores budget
+- restart ordinal/backoff uses overflow-safe saturation
+- scheduled restart canceled by Parent shutdown is not launched
+- Parent Runtime restart uses new runtime_instance_id/new restart budget
+- restart_suppressed reason visible
 
 Workflow Run status:
 
@@ -426,8 +452,10 @@ Strict reuse:
 
 - every executable ref provides current UTF-8 YAML source bytes
 - relative/registered reference/path safety
-- first binding re-reads current Child source bytes
-- invalid/unavailable current Child source fails binding; no stale cache fallback
+- run-start recursive preflight creates no binding/Child
+- source change after preflight before activation is allowed
+- first binding re-reads current Child source bytes and binding-time source wins
+- invalid current Child source/version/pool fails binding; no stale preflight/cache fallback
 - Binding Definition+versions+System baseline
 - Child settings/Retention
 - current System change no effect
@@ -520,6 +548,7 @@ Verify all18 tables:
 - State current/history atomic + current Step producer
 - Artifact/log schema
 - Runner liveness
+- runner_restarts row fields/restart ordinal/window/suppression semantics
 - External Task config/Lease + claimant principal
 - Human immutable
 - Idempotency canonical actor principal/no duplicate AccessScope
@@ -604,20 +633,21 @@ platform-matrix
 1. `01`〜`12`全受入条件対応
 2. Dependencies/extras/strict model parsing/source resolver
 3. Definition/System baseline/Priority/Registry/reload/self-contained JSON Schema
-4. Expression context/Input/Secret binding/reuse safety
-5. Bootstrap/Action invocation/IPC/Runtime Auth/full-attempt timeout
-6. Runner Pool/Scheduling/Run status/Concurrency queue time
-7. Exact18-table schema/migrations
-8. Payload/Artifact immutability + retention
-9. Validator/SecretGuard/streaming redaction
-10. State immediate/reuse + public read APIs
-11. External/Human/Lease claimant ownership
-12. Dynamic index/1000/nested/order/status/reuse
-13. Reusable baseline/priority/concurrency/artifact/schema/progress
-14. Retry/Recovery strict reuse/reopen/output invalidation/overflow-safe backoff
-15. Service/MCP/HTTP/Input/Output/State/Event
-16. Idempotency/concurrency/claim_next
-17. Common Log/Progress/Step metadata
-18. Retention/orphan grace/audit
+4. Reusable preflight vs binding-time fresh snapshot
+5. Expression context/Input/Secret binding/reuse safety
+6. Bootstrap/Action invocation/IPC/Runtime Auth/full-attempt timeout
+7. Runner Pool/Scheduling/Run status/Concurrency queue time/exact restart policy
+8. Exact18-table schema/migrations
+9. Payload/Artifact immutability + retention
+10. Validator/SecretGuard/streaming redaction
+11. State immediate/reuse + public read APIs
+12. External/Human/Lease claimant ownership
+13. Dynamic index/1000/nested/order/status/reuse
+14. Reusable baseline/priority/concurrency/artifact/schema/progress
+15. Retry/Recovery strict reuse/reopen/output invalidation/overflow-safe backoff
+16. Service/MCP/HTTP/Input/Output/State/Event
+17. Idempotency/concurrency/claim_next
+18. Common Log/Progress/Step metadata
+19. Retention/orphan grace/audit
 
 WebUI E2Eは後続。
