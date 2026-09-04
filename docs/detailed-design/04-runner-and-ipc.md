@@ -1,26 +1,15 @@
 # 04. Runner / IPC 詳細設計
 
-- Status: Draft v0.4
+- Status: Draft v0.5
 - 対象: MVP
 - 上位仕様: `docs/design.md`
-- 関連: `03-runtime-and-scheduling.md`, `08-persistence.md`, `10-retry-recovery-cancel.md`
+- 関連: `02-expression-and-inputs.md`, `03-runtime-and-scheduling.md`, `08-persistence.md`, `09-artifacts-logs-state.md`, `10-retry-recovery-cancel.md`, `12-security-and-secrets.md`
 
 ## 1. 目的
 
-Runner Process、Runner Pool、Heartbeat、main-loop liveness、Common Action Runner子Process、IPC、internal Job Cancel/Timeout、一時directory、restartを定義する。
+Runner Process、Runner Pool、Heartbeat、Common Action Runner、JSON Lines IPC、large result受渡し、Runtime Handle request/response、internal Cancel/Timeout、一時directory、restartを定義する。
 
-## 2. 基本原則
-
-1. Runnerは親起動時に常駐。
-2. RunnerはJobをpullしWorkflow Runへ固定しない。
-3. Runner管理ProcessとAction実行Processを分離。
-4. HeartbeatはRunner管理Processの健全性を示す。
-5. Action Runner子ProcessはCore DBへ直接接続しない。
-6. Runnerは内部RunnerService/Repository経由で状態更新。
-7. IPCはJSON Lines。
-8. temp directoryはAttempt終了時削除しsandboxではない。
-
-## 3. Process / Runtime境界
+## 2. Process構成
 
 ```text
 Parent System
@@ -31,43 +20,14 @@ Parent System
       ├─ main loop
       ├─ Heartbeat Thread
       └─ Common Action Runner Process
+         └─ registered Action
 ```
 
-MVPではRunner用HTTP/Brokerを必須にしない。Parent/Runnerは同じDB path/data root/configを使う短命SQLite connectionで内部Serviceを構築する。
+MVPではRunner用HTTP/Brokerを必須にしない。Parent/Runnerは同じDB/data root/configを使い、Action Runner childにはDB pathを渡さない。
 
-Action RunnerにはDB pathを渡さない。
+## 3. Runner lifecycle / identity
 
-## 4. Runner lifecycle
-
-SupervisorはPool `runner_count`分を起動。Parent->Runner lifecycle pipe/handleを持ち、Parent消失時はEOFを検知してnew claimを止めRunner自身も終了する。
-
-旧RuntimeからのDB更新は `runtime_instance_id` fencingでも拒否。
-
-## 5. Pool default
-
-```text
-heartbeat_interval_seconds = 5
-runner_lost_after_seconds = 20
-main_loop_stale_after_seconds = 15
-```
-
-validation:
-
-```text
-runner_lost_after_seconds >= heartbeat_interval_seconds * 2
-main_loop_stale_after_seconds >= heartbeat_interval_seconds * 2
-```
-
-Restart default:
-
-```text
-mode=on_failure
-max_restarts=5
-window_seconds=300
-backoff=1s -> max30s, multiplier2
-```
-
-## 6. Runner identity/status
+Identity:
 
 ```text
 runner_id
@@ -75,87 +35,114 @@ runner_instance_id
 runtime_instance_id
 pool_name
 pid
-started_at
-last_heartbeat_at
-status
 ```
 
-status:
+Status:
 
 ```text
 starting|idle|claiming|running|stopping|stopped|lost|restart_suppressed
 ```
 
-## 7. main loop / liveness
+Parent->Runner lifecycle pipe/handleを持ち、Parent消失時はnew claimを止める。旧Runtime更新はfencingで拒否。
+
+## 4. Heartbeat / main-loop liveness
+
+Default:
 
 ```text
-register -> heartbeat -> idle -> claim -> spawn child -> monitor -> reflect terminal -> cleanup -> idle
+heartbeat_interval_seconds = 5
+runner_lost_after_seconds = 20
+main_loop_stale_after_seconds = 15
 ```
 
-1 Runnerは同時に1Job。
+main loopはbounded cycleごとにmonotonic tick更新。Heartbeat Threadはmain loop tickがfreshな場合だけheartbeat更新する。
 
-main loopはbounded cycleごとにmonotonic tick更新。Heartbeat Threadはtickが `main_loop_stale_after_seconds` 内のときだけheartbeat更新する。
+重いActionは別Processなのでheartbeatを止めない。
 
-Actionは別Processなので長時間Actionでもmain loop/heartbeatを継続できる。
+## 5. Atomic claim
 
-## 8. Atomic claim
+Runnerは `runtime_instance_id/runner_id/runner_instance_id/pool` でclaim。`03/08`のtransactionでcandidate選択 + Job running + new Attempt + ownershipを確定する。
 
-`runtime_instance_id/runner_id/runner_instance_id/pool`を渡し、`03/08`のtransactionでcandidate選択 + Job running + new Attempt + Runner ownershipを確定。
+1 Runnerは同時に1 Job。
 
-競合時は候補再選択/none。
-
-## 9. Common Action Runner
-
-共通entry point:
+## 6. Common Action Runner
 
 ```text
 bootstrap parent Action Registry
 -> action_id + version exact match
--> callable execute
+-> Action execute
 ```
 
 Windows spawn前提。Callableをpickle転送しない。
 
-Version mismatchは `action_version_mismatch`, retryable=false。
-
-## 10. Action / Runtime Handle
+Action:
 
 ```python
-def action(input_data) -> dict: ...
-def action(input_data, runtime) -> dict: ...
+def action(input_data) -> AnyJson: ...
+def action(input_data, runtime) -> AnyJson: ...
 ```
 
-sync/async対応。
+sync/async対応。ReturnはJSON-compatible value全般。
 
-Runtime Handle:
+## 7. IPC v1 transport
 
-```text
-log/progress
-step_start/step_end
-artifact register
-state get/set
-cancel_requested
-work_dir
-```
-
-Core変更要求はIPCでRunnerへ送信しRunnerServiceがtransactionを行う。
-
-## 11. IPC v1
+Structured channelは専用bidirectional pipe。stdout/stderrとは分離。
 
 ```text
 UTF-8
-1 JSON object / LF line
+1 JSON object / LF
 protocol=jobrunner.action-ipc.v1
 ```
 
-Runner -> child:
+全message:
+
+```text
+protocol
+type
+payload
+request_id optional
+```
+
+Malformed/unknown protocol/typeは `ipc_protocol_error`。
+
+## 8. Runner -> Action Runner messages
+
+Control:
 
 ```text
 start
 cancel_requested
+runtime_response
 ```
 
-Child -> Runner:
+`start`:
+
+- action id/version
+- workflow/job/attempt id
+- persisted Input
+- work_dir
+- runtime metadata
+- runtime-only materialized Secrets
+
+`runtime_response` はChildからのRuntime Handle requestへ対応する。
+
+```json
+{
+  "type": "runtime_response",
+  "request_id": "req_...",
+  "payload": {"ok": true, "result": {}}
+}
+```
+
+Failure:
+
+```json
+{"ok": false, "error": {"code": "...", "message": "..."}}
+```
+
+## 9. Action Runner -> Runner messages
+
+Async event:
 
 ```text
 ready
@@ -163,129 +150,189 @@ log
 progress
 step_started
 step_finished
-artifact_registered
-state_get
-state_set
 result
 error
 exiting
 ```
 
-Malformed/unknown protocol/typeは `ipc_protocol_error`。
-
-## 12. Channel分離
-
-Structured IPCは専用pipe。Action stdout/stderrは別captureしてExecution Logへ。`print()`でprotocolを壊さない。
-
-`start` payload:
-
-- action id/version
-- workflow/job/attempt id
-- persisted Input
-- work_dir
-- runtime metadata
-- runtime-only materialized Secret
-
-Runnerはcurrent AttemptでmaterializeしたSecret値のredaction setを保持し、`12`のSecretGuardをLog/structured persistence入口へ適用する。
-
-## 13. Log / Progress / Step / Artifact / State
-
-Progressは `current>=0`, totalありなら `total>0 && current<=total`。
-
-Step sequenceはRunner側で確定。open StepはAttempt異常終了時に閉じる。
-
-Artifactはmetadata referenceのみ。State操作はcurrent Workflow Run namespaceだけ。Structured persistenceはSecretGuardを通す。
-
-## 14. temp directory
+Runtime Handle request:
 
 ```text
-jobrunner-data/runs/<workflow_run_id>/tmp/<job_run_id>/<attempt_no>/
+state_get
+state_set
+artifact_put_file
+artifact_register_external
+artifact_materialize
 ```
 
-内部opaque IDを使いYAML/Dynamic keyをpathへ使わない。
+Runtime requestは一意 `request_id`必須。Runnerはexactly one `runtime_response`を返す。Childはresponse待ち中もcancel messageを処理できるreader loopを持つ。
 
-削除失敗はJob conclusionを変更せずwarning/Event。
+## 10. Runtime Handle semantics
 
-## 15. Internal Action completion
+### State
 
-正常候補:
+```text
+state_get(name)
+state_set(name,value)
+```
 
-- result受信
+current Workflow Run namespaceのみ。`state_set`はSecretGuard + transaction。
+
+### Managed Artifact put
+
+```text
+artifact_put_file(name, relative_work_path, media_type?, metadata?)
+```
+
+Runnerはpathをcurrent work_dir内へcanonicalizeし、`09`のArtifactStoreへ保存する。成功responseはArtifactRef。
+
+### External Artifact
+
+```text
+artifact_register_external(name, uri, ...)
+```
+
+CoreはURI fetchしない。
+
+### Artifact materialize
+
+```text
+artifact_materialize(artifact_id)
+```
+
+Managed Artifactをcurrent work_dir内のCore生成destinationへmaterializeしlocal relative pathを返す。External Referenceはunsupported。
+
+## 11. Large Action Result protocol
+
+Action Returnを巨大なJSON Lines messageとして送らない。
+
+Common Action RunnerはAction return後:
+
+1. JSON-compatible validation
+2. reserved result directory `work_dir/.jobrunner/` を作成
+3. canonical JSONを `result.json.tmp` へstream/write
+4. close後 `result.json` へatomic rename
+5. size + SHA-256 digestを計算
+6. small `result` IPC messageを送る
+
+```json
+{
+  "type": "result",
+  "payload": {
+    "relative_path": ".jobrunner/result.json",
+    "size_bytes": 123456,
+    "sha256": "..."
+  }
+}
+```
+
+Runnerは:
+
+1. pathがwork_dir内のreserved result pathであることを確認
+2. size/digest確認
+3. JSON deserialize
+4. JSON Schema / `success_if`
+5. SecretGuard
+6. `08` PayloadStoreへinline/spill保存
+
+これによりOutput sizeに関係なくIPC messageは小さい。
+
+## 12. stdout / stderr / Log
+
+stdout/stderrはRunnerがcaptureしてExecution Logへ。Known Secretはwrite前redact。
+
+Progress:
+
+```text
+current >=0
+total optional; presentなら >0 and current<=total
+```
+
+Open StepはAttempt異常終了時に閉じる。
+
+## 13. Temp / result cleanup
+
+```text
+runs/<workflow_run_id>/tmp/<job_run_id>/<attempt_no>/
+```
+
+Action result fileもtemp配下。PayloadStore commit完了後、Attempt cleanupで削除。
+
+Managed Artifactはput時にdurable ArtifactStoreへcopy済みなのでtemp削除の影響を受けない。
+
+Temp cleanup failureはJob conclusionを変更しない。
+
+## 14. Internal Action completion
+
+Success候補:
+
+- valid result reference
 - child exit code 0
-- Output validation / success_if通過
-- SecretGuard通過
+- result file size/digest/JSON valid
+- Schema / success_if
+- SecretGuard
+- PayloadStore commit
 
-failure:
+Failure:
 
-- non-zero exit
-- result無し終了
-- malformed IPC
-- Action exception
-- Output validation/success_if failure
-- `secret_value_persistence_blocked`
+```text
+action_exception
+action_process_exit
+ipc_protocol_error
+result_file_invalid
+output_validation_failed
+secret_value_persistence_blocked
+payload_storage_failed
+```
 
-## 16. **Internal Job timeout**
+## 15. Internal Job timeout
 
-本節のtimeoutは `executor: internal` の `timeout-minutes` だけを扱う。
+`timeout-minutes`はinternalのみ。未指定無期限。
 
-未指定は無期限。
+期限:
 
-期限到達:
-
-1. `cancel_requested(reason=timeout)`
-2. graceful grace default 10秒、configurable
-3. child未終了ならAction子Process terminate
-4. Attempt `job_timeout` failure
+1. cancel_requested(reason=timeout)
+2. grace default10秒 configurable
+3. child未終了ならterminate
+4. `job_timeout`
 5. Retry policy
 
-Runner Process自体はkillしない。
+## 16. Workflow Cancel vs Parent shutdown
 
-External/Human/Reusableに `timeout-minutes` は無く、それぞれ `07/06` の規則に従う。
+Workflow Cancelはcurrent childへcancelを送りJob conclusion=`cancelled`。
 
-## 17. Workflow Cancel
+Parent正常shutdownはWorkflow cancelではない。new claim停止後Runner/childをboundedにreapし、Workflow `cancel_requested`を立てない。旧Runtimeの未完了running Attemptは次回起動時に通常 `runner_lost` Recoveryへ渡す。
 
-current internal Jobへcancel request。Workflow cancel由来でActionが協調終了した場合もJob conclusion=`cancelled`。
+## 17. Restart policy
 
-公開force-kill APIは無し。
+Default:
 
-## 18. Runner lost / fencing
+```text
+mode=on_failure
+max_restarts=5
+window_seconds=300
+backoff initial1/max30/multiplier2
+```
 
-Heartbeat/liveness消失後、`10`がowned running Attemptを `runner_lost` へ確定。
+Crash loopは`restart_suppressed`。
 
-旧Runtime/Runner/Attemptのlate completionは拒否。
+## 18. 非目標
 
-## 19. Graceful Parent shutdown
+CPU/RAM/GPU quota、本格sandbox、arbitrary shellはCore MVPなし。
 
-Parentの正常shutdownをWorkflow user cancelと混同しない。
+## 19. 受入条件
 
-既定:
-
-1. new claim停止
-2. Runnerへstop request
-3. running Action childへ終了要求し、bounded grace後は必要ならchild/Runner Processをreap
-4. **Workflow `cancel_requested` は立てない**
-5. shutdown中にrunning Attemptを`cancelled`や`failure`へ確定することを必須にしない
-6. 次回Runtime起動時、旧 `runtime_instance_id` に属する未完了running Attemptを通常のorphan/`runner_lost` Recovery対象として扱う
-
-これにより親アプリrestartは既存のRunner lost/Retry policyに一本化する。
-
-## 20. 非目標
-
-CPU/RAM/GPU quota、cgroup、Windows Job Object sandboxはMVPなし。任意code隔離は親専用Action内のDocker等。
-
-## 21. 受入条件
-
-1. broker不要same SQLite internal service
-2. parent EOF Runner終了
-3. heartbeat/main-loop stale
-4. heavy Action中heartbeat継続
-5. atomic claim
-6. spawn/bootstrap/version
-7. dedicated IPC + stdout/stderr
-8. state/artifact proxy + SecretGuard
-9. internal timeoutのみ
-10. Workflow cancel vs Parent shutdown区別
-11. Parent restart -> runner_lost Recovery
-12. child crash/fencing
-13. restart suppression
-14. temp cleanup
+1. heartbeat/main-loop stall
+2. heavy Action中heartbeat
+3. atomic claim
+4. Windows spawn/bootstrap
+5. stdout/protocol分離
+6. Runtime Handle request/response correlation
+7. Runtime request待ち中cancel処理
+8. managed Artifact put/materialize
+9. large JSON result file protocol
+10. result path traversal/digest mismatch reject
+11. transparent PayloadStore handoff
+12. timeout/cancel
+13. Parent restart runner_lost
+14. old Runner fencing/restart suppression
