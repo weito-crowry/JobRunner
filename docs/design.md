@@ -1,6 +1,6 @@
 # JobRunner 基本設計
 
-- Status: Draft v1.6
+- Status: Draft v1.7
 - 対象: MVP
 - WebUI: 画面構成のみ後続
 - 用語: GitHub Actions に対応概念がある場合は可能な限り合わせる
@@ -57,6 +57,8 @@ jmespath >=1.1,<2
 - Canonical JSON = `jobrunner.canonical-json.v1`
 - Core typed modelはstrict/no-coercion
 - SQLite / process / JSON / UUID / hashlib等はPython標準libraryを優先
+
+JSON SchemaはMVPでは自己完結型。`$defs`等のdocument内参照は許可するが、HTTP/file/relative URI等の外部`$ref/$dynamicRef`取得は行わずDefinition load時にrejectする。
 
 ## 3. Package / optional dependency
 
@@ -158,7 +160,7 @@ paused    = pause済み。wait_reason=concurrencyならwaiterでslot無し、そ
 completed = conclusion確定
 ```
 
-Pauseしたadmitted holderはslot保持。PauseしたConcurrency waiterはwake候補外で、Resumeするとqueued/concurrencyへ戻る。
+Concurrency待ち順にはRunの古い`created_at`ではなく、**実際に待ち行列へ入った`concurrency_queued_at`**を使う。順序は `priority DESC -> concurrency_queued_at ASC -> ID ASC`。Pause/Resumeではwaiterの元queue時刻を保持し、completed RunのManual Retryで新たにqueueへ入る場合はRetry時刻を新しいqueue時刻にする。
 
 Internal scheduling軸:
 
@@ -226,7 +228,9 @@ Default=`heartbeat 5s / runner_lost 20s / main_loop_stale 15s`。
 
 IPC=JSON Lines v1。Handshake=`ready -> start -> result|error -> exit`。stdout/stderrはExecution Log。
 
-Cancel/timeout terminalizationが先ならlate Action resultを採用しない。Timeout graceはcleanup猶予であり成功猶予ではない。
+`timeout-minutes`はinternal Jobのみでhidden default無し。指定時は**Attempt claim直後からterminal DB commitまで**を対象にし、Action Runner spawn/bootstrap/handshake、Action本体、result validation/PayloadStoreまで含む。Deadline後のgraceはcleanup猶予であり成功猶予ではない。
+
+Cancel/timeout terminalizationが先ならlate Action resultを採用しない。
 
 stdout/stderrはraw bytes段階でstreaming Secret redactionし、chunk境界をまたぐ既知Secretもraw保存しない。
 
@@ -251,7 +255,7 @@ Maintenance Loop=内部deadline/housekeeping専用。Cron Schedulerではない�
 
 Default max sleep5秒、busy loop無し。
 
-`timeout-minutes`はinternalのみ。Hidden default無し。
+Retry backoffはAttempt番号が非常に大きくてもoverflow/NaN/Infinityを発生させず、`max-seconds`へ飽和する計算を使う。
 
 Orphan cleanup=`orphan_cleanup_grace_seconds` default300、finite > 0。Operational housekeepingでRun snapshot対象外。
 
@@ -326,12 +330,15 @@ External:
 
 - Attempt + Task
 - Job external override > Run effective lease setting
-- fixed Lease、renew/heartbeat無し
+- fixed Lease、renew/heartbeat/transfer無し
 - claim順はTask `available_at`を使用
 - Lease requeueで`available_at`更新
 - atomic claim/submit
 - `task_submit(claim_next=true)`はsubmit + optional next claim + idempotency resultを同一transaction
-- `task_info`は他claimantのlease_idを公開しない。SubmitはLease ID + claimant ownershipを再確認
+- Lease claimantは `actor_type + actor_id + AccessScope` のcanonical principalからCoreが導出
+- claim/submitはnon-empty actor_id必須。claimant keyはrequest bodyへ露出しない
+- `task_info`は同principalだけactive lease_idを復元可。他principalへlease_idを公開しない
+- SubmitはLease IDだけでなくclaimant principal exact一致を確認
 
 Human:
 
@@ -350,7 +357,7 @@ Retry=new Attempt。ただしrequest/schedule時点ではAttemptを作らずpend
 
 Manual Retryはfailed Attempt/Input必須。Pre-Attempt failureはnew Run要求。
 
-Completed failure Run reopen時はConcurrency slot再取得。Rejectなら変更無し、QueueならRun `queued/concurrency`、Admissionなら`running`。Reopen commitでRun conclusion/completed/failureとcurrent Workflow Outputをclearする。
+Completed failure Run reopen時はConcurrency slot再取得。Rejectなら変更無し、QueueならRun `queued/concurrency` + **新しいqueue-entry時刻**、Admissionなら`running`。Reopen commitでRun conclusion/completed/failureとcurrent Workflow Outputをclearする。
 
 Successful descendantはcurrent dependency contextから`if` / expected Input / Artifact / versions / stored Output validationを再確認。Mismatchならsame Runでchanged Input再実行せずnew Workflow Run要求。
 
@@ -362,7 +369,7 @@ Dynamic expansionもdigest mismatchならnew Run要求。
 
 Admitted Run Pauseはrunning internal継続、新claim/expansion停止、existing submit/review/Child継続、Lease/Retention継続、Concurrency slot保持。
 
-Concurrency waiter Pauseはslot無しでwake対象外。Resumeでqueued/concurrencyへ戻る。
+Concurrency waiter Pauseはslot無しでwake対象外。元`concurrency_queued_at`を保持し、Resumeでqueued/concurrencyへ戻る。
 
 Cancel=new activation禁止、queued/waiting cancel、Lease invalidation、internal graceful cancel、Child propagation。Cancel terminalization後のlate resultは採用しない。
 
@@ -398,7 +405,7 @@ Standard SQLite。MVP table=18。
 重要:
 
 - System baseline/effective settings snapshot
-- Workflow Run queued/running/paused + concurrency holder/waiter invariant
+- Workflow Run queued/running/paused + concurrency holder/waiter + `concurrency_queued_at` invariant
 - one running internal / Run
 - one open Step / Attempt
 - Dynamic expansion unique
@@ -407,6 +414,8 @@ Standard SQLite。MVP table=18。
 - pending/Attempt Input snapshot整合
 - state current+history atomic
 - canonical UTC timestamp=`YYYY-MM-DDTHH:MM:SS.ffffffZ`
+
+External Lease `claimant_key`とIdempotency actor isolationは同じcanonical `actor_principal_key`を使う。Principal keyにはAccessScopeを含め、Idempotency scopeへ同じAccessScopeを二重追加しない。
 
 Idempotency=completed resultのみ保存、reserved row無し。Commit transaction内でkey/hash再確認。Replayは初回result/HTTP status。
 
@@ -436,11 +445,11 @@ wf_event_list
 wf_runner_info
 ```
 
-`wf_run_info(include_jobs=true)` はconcrete JobsとDynamic group summaryを別配列で返す。Attempt/Step/Artifactをoptional include可能。External/Human/Reusable Jobはactive Task/Review/Child Run IDを辿れる。
+`wf_run_info(include_jobs=true)` はconcrete JobsとDynamic group summaryを別配列で返す。Attempt/Step/Artifactをoptional include可能。Run start/list/info/retryはConcurrency待ち時に`concurrency_queued_at`を返す。
 
 Workflow State public APIはread-only。State mutationはRuntime Handle/親内部Service経由だけ。
 
-存在しないAPI=Lease renew/heartbeat、manual Job skip/success override、Review rewrite、public State mutation。
+存在しないAPI=Lease renew/heartbeat/transfer、manual Job skip/success override、Review rewrite、public State mutation。
 
 MCP=`<namespace>_wf_*`。HTTP prefix=`/api/jobrunner/v1`。Core Service modelはstrict/no-coercionでHTTP query文字列だけAdapterが明示parseする。
 
