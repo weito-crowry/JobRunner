@@ -1,6 +1,6 @@
 # 03. Runtime / Scheduling 詳細設計
 
-- Status: Draft v1.3
+- Status: Draft v1.4
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `02`, `04`, `05`, `06`, `08`, `09`, `10`
@@ -264,9 +264,16 @@ PriorityはScheduling metadataでresult semanticsではないためreuse identit
 
 ## 15. Reuse eligibility
 
-原則eligible。ただしRuntime `state.get`、persistent Input/direct upstream以外Artifact materialize、executor extension falseでineligible。
+Successful Attemptは原則eligible。ただし、Coreが観測できる以下のruntime依存/副作用を1回でも使ったAttemptは`reuse_eligible=false`へ落とす。
 
-Expression stateがwithならInput digest、ifならcurrent再評価へ反映するのでそれだけでineligibleではない。
+- Runtime Handle `state.get`
+- Runtime Handle `state.set`
+- persistent Input/direct upstream Artifact以外のArtifactを`artifact.materialize`
+- executor extensionが明示`reuse_eligible=false`
+
+`state.set` は即時永続副作用であり、成功結果だけを再利用してActionを再実行しないとstate writeを再現できないため、自動reuse対象にしない。
+
+Expressionの`state`利用は、それが`with`ならInput digestへ入り、`if`なら§16でcurrent再評価されるため、それだけでineligibleにはしない。
 
 ## 16. Manual Retry後successful Job strict reuse
 
@@ -355,5 +362,7 @@ Completed RunはRecoveryだけでreopenしない。
 13. stored Output revalidation
 14. no changed-input rerun
 15. Dynamic expansion reuse
-16. state.get/non-input Artifact ineligible
-17. concurrency/recovery idempotency
+16. state.get marks reuse ineligible
+17. state.set marks reuse ineligible
+18. non-input Artifact materialize marks reuse ineligible
+19. concurrency/recovery idempotency
