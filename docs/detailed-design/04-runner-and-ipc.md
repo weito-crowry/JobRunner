@@ -1,6 +1,6 @@
 # 04. Runner / IPC 詳細設計
 
-- Status: Draft v1.5
+- Status: Draft v1.6
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `02`, `03`, `08`, `09`, `10`, `12`
@@ -392,7 +392,7 @@ Rules:
 - DB `job_steps.name = provided name or step_key`
 - display nameはredact後保存
 - `step_key`自体はcorrelation用で、DBに専用columnは持たない
-- metadataはJSON objectのみ。redact後にstart metadataとして保存
+- metadataはJSON objectのみ。redact後に`start_metadata_json`へ保存
 
 Runnerがsequence/DB Step ID採番し、open key -> Step ID mapをAttempt memoryに持つ。
 
@@ -406,20 +406,11 @@ conclusion=success|failure|cancelled
 metadata JSON object optional
 ```
 
-Unknown/closed key=protocol error。Finish metadataはredact後保存。
+Unknown/closed key=protocol error。Finish metadataはredact後に`finish_metadata_json`へ保存する。Finish時にstart metadataを上書きしない。
 
-Canonical DB `metadata_json` shape:
+Start/finish metadata未指定なら対応DB column=`NULL`。
 
-```json
-{
-  "start": {"...": "..."},
-  "finish": {"...": "..."}
-}
-```
-
-Start/finish metadata未指定なら対応value=`null`。Finish時にstart metadataを上書きしない。
-
-Open StepがAction process異常終了/timeout/cancelで正常finishされなかった場合、Runnerが`conclusion=incomplete`へ閉じ、`finish=null`を保持する。
+Open StepがAction process異常終了/timeout/cancelで正常finishされなかった場合、Runnerが`conclusion=incomplete`へ閉じ、`finish_metadata_json=NULL`を保持する。
 
 ## 15. Terminal `error`
 
@@ -545,7 +536,7 @@ CPU/RAM/GPU quota、本格sandbox、arbitrary shell、Pool global pause、Pool A
 16. state_set immediate nonrollback + reuse ineligible
 17. Artifact operations
 18. progress telemetry redaction
-19. Step key/name/start-finish metadata exact semantics
+19. Step key/name/start-finish metadata exact columns
 20. open Step incomplete close
 21. result file/exit matrix
 22. timeout deadline result discard
