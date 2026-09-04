@@ -1,6 +1,6 @@
 # 04. Runner / IPC 詳細設計
 
-- Status: Draft v1.9
+- Status: Draft v2.0
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `02`, `03`, `08`, `09`, `10`, `12`
@@ -377,7 +377,7 @@ Request=`name,relative_work_path,media_type?,metadata?`。Response=canonical Art
 
 ### 13.4 `artifact_register_external`
 
-Request=`name,uri,media_type?,size_bytes?,digest?,metadata?`。Response=External ArtifactRef。Core fetch無し。
+Request=`name,uri,media_type?,size_bytes?,digest?,metadata?)`。Response=External ArtifactRef。Core fetch無し。
 
 ### 13.5 `artifact_materialize`
 
@@ -610,7 +610,7 @@ Exit code 0でもplanned stopでなければunexpected exitとしてfailure扱�
 - §22.2 failure時のみautomatic restart候補
 - planned stop/normal shutdownではrestartしない
 
-### 22.4 Rolling restart window
+### 22.4 Rolling restart window / one decision per failure
 
 Budgetは同じ:
 
@@ -620,24 +620,33 @@ runtime_instance_id + pool_name + runner_id
 
 のlogical slot単位。
 
-Failure時刻を`now`とし、`runner_restarts.created_at > now - window_seconds` の**過去のautomatic restart launch/suppression判定記録**をwindow内履歴として扱う。
+**1つのRunner failureにつきrestart decision rowはexactly 1件**作る。同じfailureをSupervisor scan/recoveryが再度観測しても追加decision rowを作らない。Failure identityは`exited_runner_instance_id`を基本とし、spawn前失敗等でinstance IDが無い場合はSupervisor内部の一意failure/decision IDでfenceする。
+
+Failure時刻を`now`とし、`runner_restarts.created_at > now - window_seconds` の過去decision rowをwindow内履歴として扱う。
 
 `max_restarts`はそのwindow内で許すautomatic restart **launch回数**。
 
-- `max_restarts=0` -> 最初のfailureからrestartせずsuppressed
-- window内の既存`suppressed=0` restart launch数 `< max_restarts` -> 次restart可
-- 既存launch数 `>= max_restarts` -> restartせず`suppressed=1, reason=restart_limit_exceeded`
-- 古いrestart recordがrolling window外へ出れば自然にbudgetが回復する
+```text
+k = window内の suppressed=0 decision row数
+next_restart_ordinal = k + 1
+```
+
+- `restart_ordinal`は**許可/抑止に関係なく `next_restart_ordinal` を必ず保存**する
+- `max_restarts=0` -> 最初のfailureで `restart_ordinal=1, suppressed=1`
+- mode=never -> `restart_ordinal=next_restart_ordinal, suppressed=1`
+- `k < max_restarts` -> restart許可、`restart_ordinal=next_restart_ordinal, suppressed=0`
+- `k >= max_restarts` -> restart抑止、`restart_ordinal=next_restart_ordinal, suppressed=1, reason=restart_limit_exceeded`
+- suppressed rowはlaunch数`k`へ数えない
+- 古いdecision rowがrolling window外へ出れば自然にbudgetが回復する
 - stable uptimeによる別のmanual reset counterは持たない
 
 Parent Runtime再起動はruntime_instance_idが変わるため新budgetとなる。
 
-### 22.5 Restart ordinal / backoff
+### 22.5 Restart backoff
 
-Restartを許可する場合、window内の既存successful launch record数を`k`として:
+Restartを許可するdecision rowでは:
 
 ```text
-restart_ordinal = k + 1
 raw_delay = initial_seconds * multiplier ** (restart_ordinal - 1)
 delay = min(max_seconds, raw_delay)
 scheduled_for = now + delay
@@ -645,7 +654,9 @@ scheduled_for = now + delay
 
 Retry backoffと同様、overflow-safe saturating calculationを使いNaN/Infinity/OverflowErrorを出さない。
 
-`runner_restarts` rowを先に作り、`scheduled_for`を保存する。Delay経過前にParent shutdownした場合は新Runnerを起動せず、そのrecordはhistorical scheduleとして残してよい。新Parent Runtimeでは再利用しない。
+Suppressed decision rowは`scheduled_for=NULL`、`started_runner_instance_id=NULL`。
+
+Restart許可decision rowは`runner_restarts`へ先に保存し、`scheduled_for`を設定する。Delay経過前にParent shutdownした場合は新Runnerを起動せず、そのrecordはhistorical scheduleとして残してよい。新Parent Runtimeでは再利用しない。
 
 Scheduled time到達後:
 
@@ -655,7 +666,7 @@ Scheduled time到達後:
 
 を確認してnew `runner_instance_id`をspawnする。Spawn開始成功時`started_runner_instance_id`を記録する。
 
-Spawn自体が即失敗/新instanceがstartup_lostした場合も新しいfailureとして同じrolling windowへ入り、次のbudget/backoff判定を行う。
+Spawn自体が即失敗/新instanceがstartup_lostした場合も新しいfailureとして同じrolling windowへ入り、次のdecisionをexactly once作る。
 
 ### 22.6 Restart suppressed visibility
 
@@ -686,31 +697,33 @@ CPU/RAM/GPU quota、本格sandbox、arbitrary shell、Pool global pause、Pool A
 9. heartbeat/main-loop stale liveness
 10. planned shutdown vs unexpected exit classification
 11. restart mode never/on_failure exact behavior
-12. max_restarts=0 and rolling window budget
-13. stable elapsed window naturally restores restart budget
-14. restart ordinal/backoff saturating calculation
-15. scheduled restart cancelled by Parent shutdown/no cross-runtime reuse
-16. restart_suppressed visibility/reason
-17. claim ready_at + pending snapshot
-18. timeout origin starts immediately after claim before child spawn
-19. timeout covers bootstrap/handshake/action/result validation until terminal commit
-20. pre-ready timeout/cancel cleanup
-21. unique Secret resolution exactly once/name/Attempt
-22. same Secret multiple bindings exact same value
-23. non-empty Secret binding reuse ineligible
-24. ready->start/IPC errors
-25. cancel while Action/request waits
-26. Runtime Handle correlation
-27. state_get found/missing both reuse ineligible
-28. state_set immediate nonrollback + current Step producer association
-29. Artifact operations
-30. progress telemetry redaction
-31. at most one open Step / nested start reject
-32. Step key/name/start-finish metadata exact columns
-33. open Step incomplete close
-34. result file/exit matrix
-35. deadline-before-terminal-commit result discard
-36. cancel commit result discard
-37. stdout/stderr streaming byte redaction across chunks
-38. no raw pre-redaction sink
-39. fencing/temp/restart
+12. exactly one restart decision row per Runner failure
+13. suppressed decision has defined restart_ordinal and NULL schedule/start instance
+14. max_restarts=0 and rolling window launch budget
+15. stable elapsed window naturally restores restart budget
+16. restart ordinal/backoff saturating calculation
+17. scheduled restart cancelled by Parent shutdown/no cross-runtime reuse
+18. restart_suppressed visibility/reason
+19. claim ready_at + pending snapshot
+20. timeout origin starts immediately after claim before child spawn
+21. timeout covers bootstrap/handshake/action/result validation until terminal commit
+22. pre-ready timeout/cancel cleanup
+23. unique Secret resolution exactly once/name/Attempt
+24. same Secret multiple bindings exact same value
+25. non-empty Secret binding reuse ineligible
+26. ready->start/IPC errors
+27. cancel while Action/request waits
+28. Runtime Handle correlation
+29. state_get found/missing both reuse ineligible
+30. state_set immediate nonrollback + current Step producer association
+31. Artifact operations
+32. progress telemetry redaction
+33. at most one open Step / nested start reject
+34. Step key/name/start-finish metadata exact columns
+35. open Step incomplete close
+36. result file/exit matrix
+37. deadline-before-terminal-commit result discard
+38. cancel commit result discard
+39. stdout/stderr streaming byte redaction across chunks
+40. no raw pre-redaction sink
+41. fencing/temp/restart
