@@ -1,13 +1,13 @@
 # 04. Runner / IPC 詳細設計
 
-- Status: Draft v1.4
+- Status: Draft v1.5
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `02`, `03`, `08`, `09`, `10`, `12`
 
 ## 1. 目的
 
-Runner Process、Runner Pool、Integration Bootstrap、Action invocation contract、Heartbeat、Supervisor liveness、Common Action Runner、JSON Lines IPC v1、Secret materialization、Runtime Handle、large result、一時directory、timeout/cancel fencing、restartを定義する。
+Runner Process、Runner Pool、Integration Bootstrap、Action invocation contract、Heartbeat、Supervisor liveness、Common Action Runner、JSON Lines IPC v1、Secret materialization、Runtime Handle、Step/telemetry、large result、一時directory、timeout/cancel fencing、restartを定義する。
 
 ## 2. Process構成
 
@@ -283,9 +283,14 @@ work_dir: absolute path
 runtime.cancel_requested: boolean
 ```
 
+Runnerは`12`どおりunique Secret nameをExactly once/nameで解決してAttempt Secret Setを作る。
+
+Rules:
+
 - persistent_input/bindings/digest Source of Truth=Attempt snapshot
 - bindings=`02` RFC6901 canonical form
 - `secrets` key集合=bindings Secret name集合exact一致
+- same Secret nameの複数bindingは同じAttempt Secret Set valueを使う
 - Secret value=`12` non-empty string
 - binding pointer先persistent value=canonical `${{ secrets.NAME }}` string
 - unbound marker-like literal=通常string
@@ -295,7 +300,7 @@ ChildはAction呼出直前にpersistent_inputをmemory copyしbinding pointerだ
 
 Execution input/Secret値をfile/log/debug dumpへ保存しない。
 
-RunnerはSecret missing/invalidをChild spawn前に検出可能。
+Non-empty Secret bindingを持つAttemptは最初からResult Reuse不適格として扱う。
 
 ## 12. `cancel_requested`
 
@@ -348,27 +353,73 @@ Request=`artifact_ref`。Response=`relative_work_path`。DB re-resolve + `09/12`
 
 ## 14. Observation messages
 
-`log`:
+Persistent telemetry strings/metadataは`12`のredactionを通してから保存する。Known Secretを含む表示fieldは`[REDACTED]`化し、telemetryだけを理由にAttempt failureにはしない。
+
+### 14.1 `log`
 
 ```text
 level=debug|info|warning|error
 message string
 ```
 
-`progress`:
+### 14.2 `progress`
 
 ```text
 current finite>=0
 total finite>0 optional
-message optional
-unit optional
+message string optional
+unit string optional
 ```
 
 Totalありならcurrent<=total。`09` progress mode。
 
-`step_started`: `step_key` unique/name/metadata?。Runnerがsequence/DB Step ID採番。
+`message/unit`はredact後保存。
 
-`step_finished`: existing open `step_key`, conclusion=`success|failure|cancelled`, metadata?。Unknown/closed=protocol error。Crash時incomplete。
+### 14.3 `step_started`
+
+Payload:
+
+```text
+step_key non-empty string
+name non-empty string optional
+metadata JSON object optional
+```
+
+Rules:
+
+- `step_key`はAttempt内unique correlation key
+- 同じkeyの2回目startは`ipc_protocol_error`
+- DB `job_steps.name = provided name or step_key`
+- display nameはredact後保存
+- `step_key`自体はcorrelation用で、DBに専用columnは持たない
+- metadataはJSON objectのみ。redact後にstart metadataとして保存
+
+Runnerがsequence/DB Step ID採番し、open key -> Step ID mapをAttempt memoryに持つ。
+
+### 14.4 `step_finished`
+
+Payload:
+
+```text
+step_key existing open
+conclusion=success|failure|cancelled
+metadata JSON object optional
+```
+
+Unknown/closed key=protocol error。Finish metadataはredact後保存。
+
+Canonical DB `metadata_json` shape:
+
+```json
+{
+  "start": {"...": "..."},
+  "finish": {"...": "..."}
+}
+```
+
+Start/finish metadata未指定なら対応value=`null`。Finish時にstart metadataを上書きしない。
+
+Open StepがAction process異常終了/timeout/cancelで正常finishされなかった場合、Runnerが`conclusion=incomplete`へ閉じ、`finish=null`を保持する。
 
 ## 15. Terminal `error`
 
@@ -421,7 +472,17 @@ Optional `exiting.reason=result|error`。Source of Truthではない。
 
 ## 18. stdout/stderr / Execution Log
 
-Child stdout/stderrは別pipeでAttempt Logへ。Known Secret write前redact。IPC parserへ渡さない。Log policy=`09`。
+Child stdout/stderrは別pipeの**raw bytes**でRunnerへ渡す。
+
+Runnerは`12`のAttempt Secret Set byte streaming redactorを適用する。
+
+- Secretがpipe chunk境界をまたいでも検出
+- redactionはUTF-8 decode前のbytes段階
+- redaction後bytesだけをdecoder/Execution Log writerへ渡す
+- EOFでmatcher suffix flush
+- raw pre-redaction sink/file無し
+
+IPC parserへstdout/stderrを渡さない。Log policy=`09`。
 
 ## 19. Terminal fencing
 
@@ -441,13 +502,13 @@ Payload commit後削除。Managed Artifactはput時durable copy済み。Cleanup 
 
 `timeout-minutes` internalのみ、未指定無期限。
 
-DeadlineはAction実行開始時点から計測し、Runner monotonic clockを使う。deadline到達時にtimeout flagを成立させる。
+DeadlineはAction実行開始時点からRunner monotonic clockで計測。deadline到達時にtimeout flag成立。
 
 1. deadline到達
 2. timeout flag
 3. cancel(timeout)
 4. grace default10秒
-5. grace中result/errorはcleanup完了signalとして受けられるが**success resultは採用しない**
+5. grace中result/errorはcleanup signalとして受けられるがsuccess resultは採用しない
 6. 未終了ならterminate
 7. Attempt=`job_timeout`
 8. Retry policy
@@ -474,16 +535,21 @@ CPU/RAM/GPU quota、本格sandbox、arbitrary shell、Pool global pause、Pool A
 6. ActionFailure contract validation
 7. Pool config/liveness/restart
 8. claim ready_at + pending snapshot
-9. ready->start/IPC errors
-10. Secret binding materialization
-11. cancel while Action/request waits
-12. Runtime Handle correlation
-13. state_get found/missing both reuse ineligible
-14. state_set immediate nonrollback + reuse ineligible
-15. Artifact operations
-16. progress/Step
-17. result file/exit matrix
-18. timeout deadline result discard
-19. cancel commit result discard
-20. stdout/redaction/common Log
-21. fencing/temp/restart
+9. unique Secret resolution exactly once/name/Attempt
+10. same Secret multiple bindings exact same value
+11. non-empty Secret binding reuse ineligible
+12. ready->start/IPC errors
+13. cancel while Action/request waits
+14. Runtime Handle correlation
+15. state_get found/missing both reuse ineligible
+16. state_set immediate nonrollback + reuse ineligible
+17. Artifact operations
+18. progress telemetry redaction
+19. Step key/name/start-finish metadata exact semantics
+20. open Step incomplete close
+21. result file/exit matrix
+22. timeout deadline result discard
+23. cancel commit result discard
+24. stdout/stderr streaming byte redaction across chunks
+25. no raw pre-redaction sink
+26. fencing/temp/restart
