@@ -1,6 +1,6 @@
 # 07. External / Human Executor 詳細設計
 
-- Status: Draft v0.5
+- Status: Draft v0.6
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `02`, `03`, `08`, `09`, `10`, `11`, `12`
@@ -14,6 +14,8 @@
 5. activation時にAttempt作成。
 6. Retryはnew Attempt。
 7. state changeはService/Authorization/idempotency経路。
+8. failed/cancelled Jobを管理操作で直接successへ書き換えない。
+9. YAMLで定義されていない手動skip操作は提供しない。
 
 ## 2. External LLM
 
@@ -69,6 +71,22 @@ active|expired|released|invalidated
 
 Atomic exactly-one claim。
 
+### 4.1 Lease feature boundary
+
+MVP Leaseはclaim時に固定expiryを発行する単純ownership window。
+
+MVPでは以下を提供しない:
+
+```text
+lease heartbeat
+lease renew / extend
+lease ownership transfer
+```
+
+長い外部処理はJob/Workflow側で十分な`lease-minutes`を設定する。
+
+将来renewを追加する場合もcurrent `lease_id` ownerだけが延長可能な別Service operationとして追加し、既存submit ownership規則を弱めない。
+
 ## 5. Lease expiry
 
 `requeue`:
@@ -114,7 +132,7 @@ Result validation order:
 2. optional `outputs.schema`
 3. optional Custom Validator
 4. optional `success_if`
-5. SecretGuard（ExternalにSecret注入は無いがmetadata/result共通guard）
+5. SecretGuard
 6. PayloadStore
 
 ### 6.1 Custom Validator
@@ -212,6 +230,23 @@ Human lease/timeout無し。Concurrent submit first-wins。
 
 標準Job Outputは `null`。Review metadataは`wf_review_info`。
 
+### 9.1 Human control boundary
+
+Human Reviewで許可するstate changeはpending Reviewへの`approve|reject` submitのみ。
+
+MVPでは以下を提供しない:
+
+```text
+failed Job -> success override
+cancelled Job -> success override
+manual Job skip
+completed Review outcome rewrite
+```
+
+失敗後にやり直す場合は`wf_retry`でnew Attempt + new Reviewを作る。
+
+Workflow側で許容failure/skipを表現したい場合は`continue-on-error`/`if`等をDefinitionへ事前記述する。
+
 ## 10. Human Pause / Cancel / Retry
 
 Pause中review submit受理。
@@ -235,9 +270,13 @@ All read/write Authorization。
 5. concurrent claim exactly one
 6. claim/claim_next same ordering
 7. lease expiry without client traffic
-8. paused lease expiry
-9. lease requeue/fail
-10. stale/cancel submit reject
-11. Recovery overdue lease
-12. Human output null / first-wins / retry
-13. idempotency/authorization
+8. no lease heartbeat/renew endpoint
+9. paused lease expiry
+10. lease requeue/fail
+11. stale/cancel submit reject
+12. Recovery overdue lease
+13. Human output null / first-wins / retry
+14. Human failed->success override reject
+15. manual skip operation不存在
+16. completed Review rewrite reject
+17. idempotency/authorization
