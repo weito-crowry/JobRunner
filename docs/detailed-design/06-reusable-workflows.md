@@ -1,6 +1,6 @@
 # 06. Reusable Workflows 詳細設計
 
-- Status: Draft v1.4
+- Status: Draft v1.5
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `02`, `03`, `05`, `08`, `09`, `10`, `11`, `12`
@@ -16,13 +16,14 @@ Reusable Workflow の参照、親子Workflow Run、Input/Output/ArtifactRef、De
 3. 親子mutable stateは共有しない。
 4. Data flowはInput/Outputへ明示mapping。
 5. Artifact実体は暗黙共有せずArtifactRefを明示的に渡す。
-6. Child Definitionを最初のbinding作成時にsnapshot。
-7. Child System workflow defaults / effective runtime settings / Retentionをbinding時にsnapshot。
-8. Cycle禁止。固定depth limit無し。
-9. Parent Job Retryは最初のChild bindingを再利用。
-10. BindingはChild Action/Validator version固定。
-11. Child Run priorityはroot Workflow Run priorityを継承する。
-12. Child ConcurrencyはChild `workflow_id + group` scopeで通常Workflow Runと同じ規則を使う。
+6. `wf_start`ではReusable graphを事前検証するがbindingは作らない。
+7. Child DefinitionをParent concrete Jobの最初のactivation時にfresh readしてbindingへsnapshotする。
+8. Child System workflow defaults / effective runtime settings / Retentionをbinding時にsnapshot。
+9. Cycle禁止。固定depth limit無し。
+10. Parent Job Retryは最初のChild bindingを再利用。
+11. BindingはChild Action/Validator version固定。
+12. Child Run priorityはroot Workflow Run priorityを継承する。
+13. Child ConcurrencyはChild `workflow_id + group` scopeで通常Workflow Runと同じ規則を使う。
 
 ## 3. YAML
 
@@ -69,17 +70,47 @@ Relative reference基準=caller Workflow sourceの`filesystem_base_dir`。
 
 Non-filesystem callerはrelative不可。URL/HTTP/Git direct fetch無し。
 
-## 5. Binding creation / fresh Child source read
+## 5. Run-start Reusable preflight
+
+Root `wf_start`では、その時点で解決できるcurrent sourceを使って**Reusable graph全体を再帰的に事前検証**する。
+
+目的は明らかに実行不能なWorkflowをRun row作成前にrejectすることであり、Child Definitionのbinding固定ではない。
+
+Preflight:
+
+1. Root source snapshotから`uses` Jobを列挙
+2. 各referenceをResolverでcurrent source bytesへ解決
+3. source unavailable/path escape/reference invalidをreject
+4. current Child bytesをstrict parse/validate
+5. canonical workflow_idでrecursive ancestor cycle検出
+6. Child内`uses`も同様に再帰検証
+7. current Child Action/Validator IDがRegistryに存在することを検証
+8. resolved internal Runner Poolが登録済みであることを検証
+9. JSON Schema/Expression/static Definition constraintsを通常どおり検証
+
+Preflight中に:
+
+- `reusable_bindings` rowを作らない
+- Child Workflow Runを作らない
+- Child Definition/version/settingsをParent Run snapshotへbindingとして固定しない
+
+したがってRoot Run start後、Reusable Job activation前にChild sourceが変更されることは許容される。**first binding時のfresh readが実際に使うChild DefinitionのSource of Truth**である。
+
+Preflightでpassした後でもfirst binding時にsourceがinvalid/unavailable/version不整合になっていればParent activationをfail-closedする。逆にpreflight後の変更をold preflight結果で黙って通さない。
+
+## 6. Binding creation / fresh Child source read
 
 Parent concrete Job最初のactivation時にreferenceを解決し、`reusable_bindings`へ1回だけ固定する。
 
-**新binding作成時はWorkflowResolver cacheだけを使わず、`01 §19.2`と同じexecution-time source readを行う。**
+**新binding作成時はRun-start preflight結果やWorkflowResolver cacheだけを使わず、`01 §19.2`と同じexecution-time source readを必ずやり直す。**
 
 1. reference resolve
 2. current Child UTF-8 YAML source bytesを1 logical readで取得
 3. そのbytesをparse/strict validate/hash
 4. source YAML + typed Definition/hashを同じbytesから作る
-5. invalid/source unavailableならold cacheへfallbackせずParent activation failure
+5. canonical workflow_idでcurrent ancestor chain cycle check
+6. current Action/Validator versions・Runner Poolを再検証
+7. invalid/source unavailableならold cache/preflight結果へfallbackせずParent activation failure
 
 Binding作成後はChild sourceを再読込しない。Parent Retry/new Child Runはbinding snapshotを使う。
 
@@ -100,7 +131,7 @@ child_retention_policy_json
 created_at
 ```
 
-### 5.1 Child System baseline / settings resolution
+### 6.1 Child System baseline / settings resolution
 
 Current System configをbinding時に読み直さない。
 
@@ -115,11 +146,11 @@ Child effective Retention=`Child Workflow retention > inherited System baseline 
 
 Root Run開始後にSystem configが変わっても同一Run lineageのChild/Nested Child挙動は変わらない。
 
-### 5.2 Binding validation
+### 6.2 Binding validation
 
 1. reference/current source bytes resolve
 2. canonical child_workflow_id
-3. ancestor cycle check
+3. current ancestor cycle check
 4. Child strict static validation
 5. Child Action current versions resolve
 6. Child Validator current versions resolve
@@ -127,31 +158,32 @@ Root Run開始後にSystem configが変わっても同一Run lineageのChild/Nes
 8. Child Runner Pool availability検証
 9. binding persist
 
-## 6. Child Run作成 / Concurrency admission
+## 7. Child Run作成 / Concurrency admission
 
 Parent Attempt作成時にsame bindingからChild Run開始を試みる。
 
 Child concurrency expressionはChild Input/envで評価し、scope=`(child_workflow_id, resolved group)`。
 
-### 6.1 Concurrencyなし / slotあり
+### 7.1 Concurrencyなし / slotあり
 
 1 transactionでParent Attempt -> waiting_child、Child Run `status=running`、parent/child relation、static Job rows、Event/Execution Logを作る。
 
 Childはresolver/System configを再読込せずbinding snapshotを使う。
 
-### 6.2 `on-limit=queue`
+### 7.2 `on-limit=queue`
 
 Child Runを作成し:
 
 ```text
 Child status=queued
 Child wait_reason=concurrency
+Child concurrency_queued_at=current time
 Parent Job/Attempt=waiting_child
 ```
 
-slot取得後にChild `status=running, wait_reason=NULL`へ変更して通常Scheduling開始。
+slot取得後にChild `status=running, wait_reason=NULL, concurrency_queued_at=NULL`へ変更して通常Scheduling開始。
 
-### 6.3 `on-limit=reject`
+### 7.3 `on-limit=reject`
 
 slot取得不可なら:
 
@@ -163,7 +195,7 @@ slot取得不可なら:
 
 Parent Job Retry policyで明示Retry可能。Retry時same bindingからChild admissionだけ再試行する。
 
-## 7. Child Run snapshot
+## 8. Child Run snapshot
 
 Child Runへcopy:
 
@@ -175,7 +207,7 @@ Child Runへcopy:
 - Parent ActorContext/AccessScope
 - current root Workflow Run priority
 
-## 8. Priority
+## 9. Priority
 
 Child Definition top-level priorityはReusable invocation時のChild Run priorityには使わない。
 
@@ -185,7 +217,7 @@ Child Run priority = current root Workflow Run priority
 
 Root `wf_priority_update` はroot + 全non-terminal descendant Child Runへ同値を伝播。Future Childもupdated root priorityを継承。Child direct priority update禁止。
 
-## 9. Parent/Child identity
+## 10. Parent/Child identity
 
 Child:
 
@@ -200,7 +232,7 @@ reusable_binding_id
 
 Root=parent null, root=self, depth0。
 
-## 10. Input / ArtifactRef / State / Actor
+## 11. Input / ArtifactRef / State / Actor
 
 Parent `with`をChild Workflow Input Schemaでstrict検証し、そのJSON objectをReusable Parent Attempt persistent Inputとしても保存する。
 
@@ -212,7 +244,7 @@ Child state独立。Parent state直接read/write無し。
 
 ActorContext/AccessScopeは継承し権限拡大禁止。
 
-## 11. Child Output -> Parent Job Output
+## 12. Child Output -> Parent Job Output
 
 Child top-level `outputs`をChild success確定直前に評価しJSON objectとして永続化する。
 
@@ -230,7 +262,7 @@ Schema failure=`output_validation_failed`。
 
 Artifactを返したい場合はChild Workflow Output fieldへArtifactRefを明示。Child ArtifactをParent artifacts namespaceへ自動mirrorしない。
 
-## 12. Conclusion / Progress propagation
+## 13. Conclusion / Progress propagation
 
 | Child Run | Parent Job |
 | --- | --- |
@@ -243,7 +275,7 @@ Concurrency rejectでChild未作成ならParent=`failure(child_workflow_start_fa
 
 Parent `continue-on-error`は通常規則。Reusable progress autoはcurrent Child Workflow fractionを使う。Concurrency queue中Childは0扱い。
 
-## 13. Retry
+## 14. Retry
 
 Parent Retry:
 
@@ -257,7 +289,7 @@ Parent Retry:
 
 Current Registryがbinding Action/Validator versionsとexact一致必須。Child sourceはRetry時に再読込しない。
 
-## 14. Result Reuse identity
+## 15. Result Reuse identity
 
 Reusable Parent executor identity:
 
@@ -272,7 +304,7 @@ child_retention_policy_json
 
 Root priority/Concurrency wait timingはidentity外。Parent persistent Input ArtifactRefはInput digestへ含む。
 
-## 15. Cancel / Pause
+## 16. Cancel / Pause
 
 Parent cancel -> current Child cancel。
 
@@ -282,23 +314,25 @@ Child public direct pause/resume/cancel/retry/priority updateは禁止=`child_ru
 
 Read/info/input/output/log/event/artifact/stateはAuthorization範囲内で許可。
 
-## 16. Cycle / depth
+## 17. Cycle / depth
 
 Canonical workflow_id ancestor chainでcycle検出。固定depth無し。call_depth保存。
 
-## 17. Dynamic Job
+Run-start preflightではcurrent graph全体のcycleを検出し、first bindingでもcurrent ancestor chainを再検証する。
+
+## 18. Dynamic Job
 
 Reusable Dynamic template可。Generated concrete Jobごとbinding/Child Run。
 
 Parent generated上限=Parent Run、Child内=Child Run effective setting。
 
-## 18. Child concurrency
+## 19. Child concurrency
 
 Child Definition concurrencyをChild Input/envから評価。Parent group自動継承無し。Scope/Capacity/queue/reject=`01/08`。
 
 Child concurrency wait中Parent Job=waiting_child。
 
-## 19. Recovery / uniqueness
+## 20. Recovery / uniqueness
 
 Restart:
 
@@ -316,7 +350,7 @@ DB:
 
 Concurrency rejectでChild未作成のfailed Parent Attemptはrelation無しが正規状態。
 
-## 20. Failure code
+## 21. Failure code
 
 ```text
 workflow_not_found
@@ -336,27 +370,30 @@ artifact_data_unavailable
 child_run_direct_control_forbidden
 ```
 
-## 21. 受入条件
+## 22. 受入条件
 
 1. all executable refs provide UTF-8 YAML source bytes
 2. relative/registered reference/path safety
-3. first binding always reads current Child source bytes
-4. invalid/unavailable Child source never falls back to cache
-5. Retry does not reread Child source
-6. Child System baseline inherits Parent Run snapshot
-7. Child effective settings/Retention snapshot
-8. nested Child same baseline
-9. binding Definition+Action+Validator versions
-10. admitted Child=running / queued only for concurrency wait
-11. Child priority/root update propagation
-12. Child concurrency workflow_id scope
-13. Child queue -> Child queued/Parent waiting
-14. Child reject -> no Child row/Parent failure
-15. Retry after reject same binding
-16. Reusable Parent outputs.schema
-17. Child state isolation
-18. ArtifactRef both directions/no mirror
-19. cross-run Artifact authorization
-20. Parent progress
-21. cycle/depth/direct Child control
-22. Dynamic+Reusable/recovery duplicate prevention
+3. wf_start recursively preflights current reusable graph but creates no binding/Child row
+4. preflight detects current source invalid/missing/cycle/action-validator/pool errors
+5. first binding always re-reads current Child source bytes independent of preflight/cache
+6. source change between wf_start and first activation is allowed and binding-time source wins
+7. invalid/unavailable/current-version mismatch at binding never falls back to preflight/cache
+8. Retry does not reread Child source
+9. Child System baseline inherits Parent Run snapshot
+10. Child effective settings/Retention snapshot
+11. nested Child same baseline
+12. binding Definition+Action+Validator versions
+13. admitted Child=running / queued only for concurrency wait + queue timestamp
+14. Child priority/root update propagation
+15. Child concurrency workflow_id scope
+16. Child queue -> Child queued/Parent waiting
+17. Child reject -> no Child row/Parent failure
+18. Retry after reject same binding
+19. Reusable Parent outputs.schema
+20. Child state isolation
+21. ArtifactRef both directions/no mirror
+22. cross-run Artifact authorization
+23. Parent progress
+24. cycle/depth/direct Child control
+25. Dynamic+Reusable/recovery duplicate prevention
