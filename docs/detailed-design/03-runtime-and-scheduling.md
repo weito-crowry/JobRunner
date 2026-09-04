@@ -1,6 +1,6 @@
 # 03. Runtime / Scheduling 詳細設計
 
-- Status: Draft v1.8
+- Status: Draft v1.9
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `02`, `04`, `05`, `06`, `08`, `09`, `10`
@@ -19,6 +19,7 @@
 10. Job result自動再利用は同一Workflow Run内だけ。
 11. Lease/Retry/Retention等の期限処理はMaintenance Loop。
 12. Concurrency scopeは`workflow_id + group`で、別Workflow IDの同名groupは競合しない。
+13. Concurrency waiting orderの時刻はRun作成時刻ではなく、実際にwaiterになった`concurrency_queued_at`を使う。
 
 ## 2. Runtime起動
 
@@ -70,8 +71,8 @@ Static Jobは最初`status=queued, ready_at=NULL`。
 
 Workflow Run initial status:
 
-- Concurrencyなし、またはslot admission成功 -> `status=running, wait_reason=NULL`
-- `on-limit=queue`でslot不足 -> `status=queued, wait_reason=concurrency`
+- Concurrencyなし、またはslot admission成功 -> `status=running, wait_reason=NULL, concurrency_queued_at=NULL`
+- `on-limit=queue`でslot不足 -> `status=queued, wait_reason=concurrency, concurrency_queued_at=now`
 - `on-limit=reject`でslot不足 -> Run rowを作らずreject
 
 MVPのWorkflow Run `queued` は**Concurrency admission待ち専用**とする。通常のJob dependency/Runner待ちはWorkflow Run自体を`queued`へ戻さず`running`のまま。
@@ -96,7 +97,8 @@ Nested Childも同じbaseline inheritanceを繰り返す。
 
 Child自身のConcurrencyはChild `workflow_id + resolved group` scopeで`08` admissionを行う。Parentとgroup文字列が同じでもWorkflow IDが異なれば競合しない。
 
-Child slot admission成功 -> Child `status=running`。Queue時のみChild `status=queued, wait_reason=concurrency`。
+- Child slot admission成功 -> `status=running, concurrency_queued_at=NULL`
+- Queue時 -> `status=queued, wait_reason=concurrency, concurrency_queued_at=now`
 
 ## 5. Status / readiness
 
@@ -105,16 +107,16 @@ Workflow=`queued|running|paused|completed`、Conclusion=`success|failure|cancell
 Canonical Workflow status invariant:
 
 ```text
-queued    -> wait_reason=concurrency, no concurrency slot
-running   -> admitted non-terminal Run, concurrency設定時はslot holder
+queued    -> wait_reason=concurrency, concurrency_queued_at non-NULL, no concurrency slot
+running   -> admitted non-terminal Run, wait_reason=NULL, concurrency_queued_at=NULL
 paused    -> pause済みnon-terminal Run
-completed -> conclusion non-NULL
+completed -> conclusion non-NULL, concurrency_queued_at=NULL
 ```
 
 Paused Run:
 
-- `wait_reason=concurrency`なら元Concurrency waiterでslot無し
-- それ以外なら元admitted Runでslotを保持
+- `wait_reason=concurrency`なら元Concurrency waiter、`concurrency_queued_at`保持、slot無し
+- それ以外なら元admitted Run、`concurrency_queued_at=NULL`、slot保持
 
 Concrete Job=`queued|running|waiting_external|waiting_review|waiting_child|completed`、Conclusion=`success|failure|cancelled|skipped|blocked`。
 
@@ -278,13 +280,13 @@ Exact contract=`08 §23`。
 - scope=`(workflow_id, group)`
 - active holder countは同じscopeだけ
 - candidate/active holdersの`max-runs`差はconservative minimum capacity
-- `on-limit=queue`は`status=queued, wait_reason=concurrency`
+- `on-limit=queue`は`status=queued, wait_reason=concurrency, concurrency_queued_at=now`
 - `on-limit=reject`はRun startならRun rowを作らずreject、completed Run Manual Retryなら既存Runを変更せずreject
-- release/wakeはpriority -> created_at -> ID順でhead-of-line fairness
+- release/wakeは **priority DESC -> concurrency_queued_at ASC -> ID ASC** でhead-of-line fairness
 
-Waiting candidateは`status=queued, wait_reason=concurrency`だけ。Paused concurrency waiterはwake対象外。
+Waiting candidateは`status=queued, wait_reason=concurrency, concurrency_queued_at non-NULL`だけ。Paused concurrency waiterはwake対象外だが、pause前の`concurrency_queued_at`を保持する。
 
-Slot取得commit時に`status=running, wait_reason=NULL`へ変更する。
+Slot取得commit時に`status=running, wait_reason=NULL, concurrency_queued_at=NULL`へ変更する。
 
 Paused admitted holderはslotを保持する。Cancel/completionでholder解放。
 
@@ -379,10 +381,12 @@ Completed failure Runのreopenは`10`に従う。
 
 - Concurrency scopeを再取得
 - rejectならRun state無変更
-- queueならpending Job Inputを保持したまま`status=queued, wait_reason=concurrency`
-- admittedなら`status=running`
+- queueならpending Job Inputを保持したまま`status=queued, wait_reason=concurrency, concurrency_queued_at=retry request time`
+- admittedなら`status=running, wait_reason=NULL, concurrency_queued_at=NULL`
 - reopen commit時にold Workflow Output current pointerをclear
 - successful descendant reuse check/new Attemptはslot取得後の`running`状態で進める
+
+Manual Retryでqueueへ入るRunは**元のRun `created_at`を待ち順に使わない**。新たにqueueへ入った時刻を使うため、古いRunが新規waiterへ不当に割り込まない。
 
 ## 21. Pause / Resume
 
@@ -391,6 +395,7 @@ Pauseはroot non-terminal Runに適用する。
 ### admitted Run (`running`)
 
 - `status=paused`
+- `wait_reason=NULL, concurrency_queued_at=NULL`
 - running internalは継続
 - new internal claim/noninternal Retry activation/External claim/Dynamic expansion禁止
 - existing submit/review/started Child進行可
@@ -400,14 +405,14 @@ Pauseはroot non-terminal Runに適用する。
 ### concurrency waiter (`queued, wait_reason=concurrency`)
 
 - `status=paused`
-- `wait_reason=concurrency`を保持
+- `wait_reason=concurrency` と元 `concurrency_queued_at`を保持
 - slotは持たない
 - concurrency wake candidateから除外
 - Job/Dynamic activation無し
 
 Resume:
 
-- paused + `wait_reason=concurrency` -> `status=queued`へ戻してslot admission待ち
+- paused + `wait_reason=concurrency` -> `status=queued`へ戻す。**元の`concurrency_queued_at`を保持**してslot admission待ち
 - paused admitted holder -> `status=running`へ戻し同slotで再開
 - ready_at non-NULL queued Jobはpending Input再評価無し
 
@@ -415,7 +420,7 @@ Resume:
 
 queued/waiting cancel、Lease invalidate、running internal cancel、Child cancel、new activation禁止。Cancel後alwaysでもnew Job無し。
 
-Cancel/result raceは`10`。Admitted holderはCancel/completionでConcurrency holder解放。Concurrency waiterはslot無し。
+Cancel/result raceは`10`。Admitted holderはCancel/completionでConcurrency holder解放。Concurrency waiterはslot無し。Run completed化時`concurrency_queued_at=NULL`へclearする。
 
 ## 23. Workflow conclusion
 
@@ -430,7 +435,7 @@ Cancel requestが成立したRunは`cancelled`。
 Restart:
 
 - Bootstrap
-- Workflow status/wait_reason invariant repair
+- Workflow status/wait_reason/concurrency_queued_at invariant repair
 - queued pending snapshots
 - due noninternal Retry
 - running internal recovery
@@ -440,29 +445,35 @@ Restart:
 - concurrency waiting/holder再計算
 - Retention
 
+Recoveryは正しい`concurrency_queued_at`を持つwaiterの順序を保持し、current wall clockへ書き換えない。
+
 Completed RunはRecoveryだけでreopenしない。
 
 ## 25. 受入条件
 
 1. Root system baseline/effective setting snapshot
 2. admitted Run=running / concurrency waiter=queued only
-3. paused holder vs paused waiter slot semantics
-4. Child inherits Parent Run baseline, not current System
-5. root priority resolution/update/descendant propagation
-6. Dynamic template no Job/Attempt
-7. static ready_at NULL
-8. internal pending/claim copy
-9. all-executor Retry pending
-10. Internal order uses ready_at / External order uses task available_at
-11. static stable job_key tie-break / Dynamic order preserved
-12. opaque ID final tie-break semantics
-13. one-running/Pool
-14. Maintenance due boundary
-15. concurrency scope workflow_id+group
-16. mixed max-runs/waiter fairness
-17. Manual Retry concurrency reacquire/output clear linkage
-18. strict current if/Input/Artifact/version validation
-19. Secret-bound/state/non-input Artifact reuse ineligible
-20. Reusable identity includes Child baseline/settings/Retention
-21. Dynamic expansion reuse
-22. recovery idempotency/status repair
+3. concurrency waiter has queued_at / admitted has NULL
+4. initial/Child queue sets concurrency_queued_at
+5. paused holder vs paused waiter slot + queued_at semantics
+6. resume waiter preserves original queue time
+7. Manual Retry reopen queue gets new retry-time queue timestamp
+8. Child inherits Parent Run baseline, not current System
+9. root priority resolution/update/descendant propagation
+10. Dynamic template no Job/Attempt
+11. static ready_at NULL
+12. internal pending/claim copy
+13. all-executor Retry pending
+14. Internal order uses ready_at / External order uses task available_at
+15. static stable job_key tie-break / Dynamic order preserved
+16. opaque ID final tie-break semantics
+17. one-running/Pool
+18. Maintenance due boundary
+19. concurrency scope workflow_id+group
+20. mixed max-runs/head-of-line fairness uses concurrency_queued_at
+21. Manual Retry concurrency reacquire/output clear linkage
+22. strict current if/Input/Artifact/version validation
+23. Secret-bound/state/non-input Artifact reuse ineligible
+24. Reusable identity includes Child baseline/settings/Retention
+25. Dynamic expansion reuse
+26. recovery idempotency/status/queue-time repair
