@@ -1,9 +1,9 @@
 # 12. Security / Secrets 詳細設計
 
-- Status: Draft v1.1
+- Status: Draft v1.2
 - 対象: MVP
 - 上位仕様: `docs/design.md`
-- 関連: `01`, `02`, `04`, `08`, `09`, `11`
+- 関連: `01`, `02`, `03`, `04`, `08`, `09`, `11`
 
 ## 1. 基本原則
 
@@ -14,10 +14,11 @@
 5. Runtime Handleのresource read/writeもAuthorizationを迂回しない。
 6. Secret valueをCore persistent storageへ平文保存しない。
 7. Secret materializeはinternal Action Job `with`だけ。
-8. 本格sandbox/arbitrary code標準実行無し。
-9. Runner fencing。
-10. Cross-run Artifact accessもAuthorization必須。
-11. Provider/RegistryはProcess-local Integration Bootstrapで再構築。
+8. Secret bindingを持つSuccessful AttemptはResult Reuse不適格。
+9. 本格sandbox/arbitrary code標準実行無し。
+10. Runner fencing。
+11. Cross-run Artifact accessもAuthorization必須。
+12. Provider/RegistryはProcess-local Integration Bootstrapで再構築。
 
 ## 2. Actor / AccessScope
 
@@ -47,19 +48,23 @@ authorize(actor, operation, resource, scope) -> allowed/filtered decision
 
 Public Service operationは`11`どおり全件hookを通す。
 
-RunnerServiceがAction Runtime Handle requestを処理する場合も同じActor/Scopeで以下のlogical operationをauthorizeする。
+RunnerServiceがAction Runtime Handle requestを処理する場合も同じActor/Scopeで:
 
 ```text
-state_get                 -> workflow_state.read
-state_set                 -> workflow_state.write
-artifact_put_file         -> artifact.create
-artifact_register_external-> artifact.create
-artifact_materialize      -> artifact.read
+state_get                  -> workflow_state.read
+state_set                  -> workflow_state.write
+artifact_put_file          -> artifact.create
+artifact_register_external -> artifact.create
+artifact_materialize       -> artifact.read
 ```
+
+をauthorizeする。
+
+Public state inspection API (`wf_state_list/read/history`) は `workflow_state.read`。
 
 Denied -> Runtime Handle `runtime_response(ok=false)` で`forbidden`等を返し、resource stateを変更しない。
 
-Action `log/progress/step` messageはcurrent Attempt ownershipでfenceされたtelemetryであり、別resource Service read/writeではないため個別Authorization callは必須にしない。ただしcurrent Attempt ownership不一致なら拒否する。
+Action `log/progress/step`はcurrent Attempt ownershipでfenceされたtelemetryであり個別Authorization callは必須にしない。ただしcurrent Attempt ownership不一致なら拒否する。
 
 Default AllowAllでもhook invocation自体を省略しない。
 
@@ -154,25 +159,30 @@ Secret valueの代わりに`02` persistent Inputへcanonical reference stringを
 
 Persistence=`job_runs.pending_secret_bindings_json` / `job_attempts.secret_bindings_json`。
 
+Non-empty `secret_bindings_json` のSuccessful Attemptは`03`どおり`reuse_eligible=false`。
+
 ## 9. Attempt Secret materialization
 
 Internal Attempt実行直前:
 
 1. binding list read
-2. current Actor/ScopeでSecretsProvider.get
-3. value contract検証
-4. Attempt Secret Set
-5. `04 start`へpersistent_input + bindings + required name->valueだけ送信
-6. Action Runnerがmemory上execution input作成
+2. unique Secret name集合を作成
+3. **各unique nameにつきExactly once** `SecretsProvider.get(name, actor, scope)`
+4. value contract検証
+5. Attempt Secret Set (`name -> value`) を作成
+6. `04 start`へpersistent_input + bindings + exact Secret Setを送信
+7. Action Runnerがmemory上execution input作成
+
+同じSecret名が複数pointerで使われてもProviderへ複数回問い合わせない。Attempt中のbinding materialization/log redaction/Artifact scanは全て同じAttempt Secret Setを使う。
 
 Secret Set:
 
 - persist無し
 - debug/Event metadata無し
 - Attempt終了時reference破棄
-- UTF-8 bytesをManaged Artifact scan用に保持
+- UTF-8 encodeしたbyte sequenceもstream redaction/Managed Artifact scan用に保持
 
-Retryではbinding固定、Provider value rotation許容。
+Retryではbinding固定、**新Attempt開始時に再度Exactly once/nameでProvider解決**するためvalue rotationを許容する。
 
 Custom Validatorはpersistent input/reference stringだけを受ける。
 
@@ -198,7 +208,11 @@ Persistent Secret reference string/nameはSecret valueではないため保存�
 
 ## 11. Managed Artifact content guard
 
-`put_file` durable finalize前にcurrent Attempt known Secret UTF-8 bytesをstream scan。Chunk境界match対応。
+`put_file` durable finalize前にcurrent Attempt Secret SetのUTF-8 byte sequenceをstream scanする。
+
+- chunk境界をまたぐmatchを検出する
+- 空SecretはそもそもProvider contractで禁止
+- 複数Secretが重なる場合もどれか1つがmatchすれば拒否
 
 Match -> save reject/temp cleanup/metadata無し=`secret_value_persistence_blocked`。
 
@@ -221,27 +235,60 @@ External ArtifactはCore materialize無し。
 
 `artifact_put_file/register_external`も`artifact.create` Authorizationを通す。
 
-## 13. Execution Log redaction
+## 13. Execution Log / telemetry redaction
 
-stdout/stderr/logはknown Secret substringを`[REDACTED]`へ置換してwrite。Raw pre-redaction別sink無し。
+### 13.1 Structured `log` / metadata
 
-All executor共通Log policy=`09`。
+Action `log.message`、progress message/unit、Step display name/start metadata/finish metadata等のpersistent telemetry stringはcurrent Attempt Secret Setでredactしてから保存する。
 
-## 14. 検出限界
+Telemetry表示fieldにKnown Secretが含まれていた場合は`[REDACTED]`へ置換し、Action自体をfailureにはしない。Output/state/Artifact等のbusiness dataは§10どおりfail-closed。
+
+### 13.2 stdout/stderr streaming redactor
+
+stdout/stderrは**raw chunk単位で単純replaceしてはいけない**。Secretがpipe read chunk境界をまたいでも漏れないstreaming redactorを通す。
+
+Canonical requirement:
+
+- Attempt Secret Setの各SecretをUTF-8 bytes化
+- raw stdout/stderr bytesを受ける
+- matcher stateまたは最大Secret byte長-1以上の未確定suffixを保持
+- chunk境界をまたぐSecret byte sequenceを検出
+- match部分をUTF-8 `[REDACTED]` bytesへ置換
+- redaction後bytesだけをLog decoder/writerへ渡す
+- EOF時に未確定suffixをflush
+- raw pre-redaction bytesを別sink/fileへ保存しない
+
+UTF-8 decode errorの扱いはExecution Log実装policyに従ってreplacement可能だが、**redactionはdecodeより前のbytes段階**で行う。
+
+## 14. Result ReuseとSecret
+
+Secret valueを保存・hashしないため、後からcurrent Secretと過去成功時Secretの同一性をCoreは判定できない。
+
+したがって:
+
+```text
+secret_bindings_json != [] -> reuse_eligible=false
+```
+
+Target Job Retry自体は禁止しない。RetryではActionを再実行し、そのAttempt開始時のcurrent Secret valueを使う。
+
+Secretを結果再利用可能にしたい高度な仕組み（Secret version identity/provider generation token等）はMVP外。
+
+## 15. 検出限界
 
 完全検出保証外:
 
 - Base64/hash/encryption
-- fragment分割
+- SecretをAction側で断片へ加工後に別々に出力
 - current Attemptへmaterializeされていない別機密
 
-保証=current AttemptでCoreが知るexact substring/UTF-8 bytes。
+保証=current AttemptでCoreが知るexact Secret string/UTF-8 byte sequence。
 
-## 15. Process environment
+## 16. Process environment
 
 Parent全environmentをAction childへ無条件継承しない。Python/processに必要な最小非Secret環境を基本とし、provider credentialをenvironmentへ一括コピーしない。
 
-## 16. YAML / Reusable security
+## 17. YAML / Reusable security
 
 Safe YAML:
 
@@ -249,38 +296,45 @@ Safe YAML:
 - arbitrary include/fetch無し
 - Reusable URL fetch無し
 
-## 17. Arbitrary code / Sandbox
+## 18. Arbitrary code / Sandbox
 
 Coreに`shell:`/arbitrary Python source無し。必要なら親専用Action + Docker等。
 
 Temp directory=sandboxではない。
 
-## 18. MCP / information leakage
+## 19. MCP / information leakage
 
 Tool非公開はAuthorization代替ではない。Namespace必須。
 
 Providerはforbidden/not_found policyを選べる。Error detailsもSecretGuard。
 
-## 19. 受入条件
+Public state historyで`include_values=true`を使う場合もAuthorization + response size policy適用。SecretGuard済みstateのみが保存される前提だが、AccessScopeによるread制限を省略しない。
+
+## 20. 受入条件
 
 1. Bootstrap/provider boundary
 2. all public read/write Authorization
-3. Runtime Handle state/artifact operations each invoke Authorization hook
-4. denied Runtime Handle operation has no side effect
-5. telemetry fenced by current Attempt ownership
-6. Secret name/non-empty str
-7. full-scalar-only placement
-8. canonical binding/no value persistence
-9. unbound marker literal
-10. Retry binding fixed/value rotation
-11. Action Runner in-memory materialization
-12. Validator no Secret value
-13. Structured SecretGuard targets
-14. Payload spill pre-guard
-15. Managed Artifact byte guard
-16. External Artifact no content scan
-17. Log redaction
-18. transformed Secret non-guarantee
-19. same/cross-run Artifact authorization
-20. Reusable scope non-escalation
-21. Runner fencing/path safety
+3. public state read uses workflow_state.read
+4. Runtime Handle state/artifact operations each invoke Authorization hook
+5. denied Runtime Handle operation has no side effect
+6. telemetry fenced by current Attempt ownership
+7. Secret name/non-empty str
+8. full-scalar-only placement
+9. canonical binding/no value persistence
+10. unique Secret name resolved exactly once per Attempt
+11. same Secret multiple bindings use same value
+12. Retry re-resolves Secret once/name and can rotate
+13. non-empty Secret binding marks reuse ineligible
+14. Action Runner in-memory materialization
+15. Validator no Secret value
+16. Structured SecretGuard targets
+17. Payload spill pre-guard
+18. Managed Artifact byte guard with chunk-boundary match
+19. stdout/stderr byte streaming redaction across chunk boundaries
+20. structured log/progress/Step telemetry redaction
+21. no raw pre-redaction sink
+22. External Artifact no content scan
+23. transformed Secret non-guarantee
+24. same/cross-run Artifact authorization
+25. Reusable scope non-escalation
+26. Runner fencing/path safety
