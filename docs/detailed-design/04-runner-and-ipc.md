@@ -1,13 +1,13 @@
 # 04. Runner / IPC 詳細設計
 
-- Status: Draft v1.3
+- Status: Draft v1.4
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `02`, `03`, `08`, `09`, `10`, `12`
 
 ## 1. 目的
 
-Runner Process、Runner Pool、Integration Bootstrap、Action invocation contract、Heartbeat、Supervisor liveness、Common Action Runner、JSON Lines IPC v1、Secret materialization、Runtime Handle、large result、一時directory、restartを定義する。
+Runner Process、Runner Pool、Integration Bootstrap、Action invocation contract、Heartbeat、Supervisor liveness、Common Action Runner、JSON Lines IPC v1、Secret materialization、Runtime Handle、large result、一時directory、timeout/cancel fencing、restartを定義する。
 
 ## 2. Process構成
 
@@ -76,32 +76,30 @@ Registry semanticsは`01`。各Processで1 IDにつき1 current version。同じ
 
 ### 3.1 Action invocation
 
-`uses_runtime` はboolean required/default falseで、Coreがcallable signatureを推測して切り替えない。
+`uses_runtime` はboolean、default false。Coreがcallable signatureを見てRuntime Handle要否を推測しない。
 
 ```text
 uses_runtime=false -> callable(execution_input)
 uses_runtime=true  -> callable(execution_input, runtime_handle)
 ```
 
-- positional callで実行するためparameter nameは契約に含めない
-- callableは上記argument countで呼出可能でなければbootstrap/registration validation error
-- varargs等で受けられても`uses_runtime`がSource of Truth
+- positional callで実行
+- callableは指定argument countで呼出可能でなければregistration/bootstrap error
+- varargsでも`uses_runtime`がSource of Truth
 - returnはJSON-compatible valueまたはawaitable producing JSON-compatible value
-- returnがawaitableならAction Runner専用event loopで完了までawait
+- awaitableはAction Runner専用event loopで完了までawait
 - sync callableがawaitableを返す形も許可
-- Action child内で既存parent event loopを継承しない
-
-したがって親はdecorator/callable object等でsignature introspectionが不安定な場合も、必要ならwrapper callableを登録して契約を満たす。
+- Action child内でparent event loopを継承しない
 
 ### 3.2 Validator invocation
 
-ValidatorはMVPでは**同期・軽量**callableだけ。
+ValidatorはMVPでは同期・軽量callableだけ。
 
 ```python
 validator(result_value, persistent_input) -> ValidationResult
 ```
 
-Awaitableを返した場合は`validator_contract_error`。重い/非同期validationは通常Job Actionへ分離する。
+Awaitable return=`validator_contract_error`。重い/非同期validationは通常Job Actionへ分離。
 
 Canonical `ValidationResult`:
 
@@ -113,7 +111,7 @@ retryable: boolean default false
 details: JSON-compatible optional
 ```
 
-`valid=false`かつcode省略時はCore code=`domain_validation_failed`。`valid=true`ではcode/message/retryable/detailsはresult判定へ影響しない。
+`valid=false`かつcode省略時はCore code=`domain_validation_failed`。`valid=true`側の補助fieldはresult判定へ影響しない。
 
 ### 3.3 Role
 
@@ -213,7 +211,14 @@ raise ActionFailure(
 )
 ```
 
-Unhandled exception=`action_exception`, retryable=false。
+Contract:
+
+- code=non-empty string
+- message=string
+- retryable=boolean
+- details=nullまたはJSON-compatible
+
+Contract違反=`action_contract_error`, retryable=false。Unhandled exception=`action_exception`, retryable=false。
 
 ## 9. IPC transport v1
 
@@ -259,7 +264,7 @@ Envelope:
 
 ready前message/start重複/terminal重複=`ipc_protocol_error`。
 
-`ready`: `pid integer`, `protocol_version=1`。
+`ready`: `pid integer>0`, `protocol_version=1`。
 
 ## 11. `start` / Secret materialization
 
@@ -294,9 +299,19 @@ RunnerはSecret missing/invalidをChild spawn前に検出可能。
 
 ## 12. `cancel_requested`
 
-Payload=`reason=workflow_cancel|timeout`, `requested_at`。
+Payload:
 
-Child reader loopはAction中も受信しRuntime Handle cancel flag更新。Parent normal shutdownはcancel messageではない。
+```text
+reason=workflow_cancel|timeout
+requested_at canonical UTC timestamp
+```
+
+Child reader loopはAction中も受信しRuntime Handle cancel flag更新。
+
+- workflow_cancel -> graceful cancellation request
+- timeout -> timeout deadline already成立済み、graceful cleanup request
+
+Parent normal shutdownはcancel messageではない。
 
 ## 13. Runtime Handle request/response
 
@@ -304,7 +319,7 @@ Child requestはunique non-empty `request_id`。Runnerはexactly one response。
 
 ### 13.1 `state_get`
 
-Request=`name` non-empty。Response=`found/value/revision`。成功利用でAttempt `reuse_eligible=false`。
+Request=`name` non-empty。Response=`found/value/revision`。Callが正常処理された時点でfound true/falseに関係なくAttempt `reuse_eligible=false`。
 
 ### 13.2 `state_set`
 
@@ -376,27 +391,33 @@ Child:
 
 Payload=`relative_path=".jobrunner/result.json"`, `size_bytes`, `sha256 lowercase hex64`。
 
-Runner:
+Runner result validation前にcurrent ownership + timeout/cancel fenceを再確認する。
 
-1. reserved path/symlink escape
-2. existence/size/digest
-3. JSON deserialize
-4. Output Schema
-5. Validator with persistent_input
-6. success_if
-7. SecretGuard
-8. PayloadStore
+1. timeout deadline成立済み -> result破棄、`10` job_timeoutへ
+2. Workflow cancel commit済み -> result破棄、cancelledへ
+3. 上記無し -> reserved path/symlink escape
+4. existence/size/digest
+5. JSON deserialize
+6. Output Schema
+7. Validator with persistent_input
+8. success_if
+9. SecretGuard
+10. PayloadStore
+
+Result commit transactionでもcancel/current ownershipを再確認し、validation中にCancelがcommitしたraceでsuccessを確定しない。
 
 ## 17. `exiting` / exit matrix
 
 Optional `exiting.reason=result|error`。Source of Truthではない。
 
-- result + exit0 + validation success -> success候補
+- result + exit0 + validation success + fence clear -> success候補
 - result + nonzero -> action_process_exit, result非採用
 - error + any exit -> error failure採用、exit0 diagnostic
 - no terminal + nonzero -> action_process_exit
 - no terminal + exit0 -> action_result_missing
 - result+error -> ipc_protocol_error
+- timeout flag成立後は上記より`job_timeout`が優先
+- Workflow cancel commit済みならsuccess resultよりcancelledが優先
 
 ## 18. stdout/stderr / Execution Log
 
@@ -404,7 +425,11 @@ Child stdout/stderrは別pipeでAttempt Logへ。Known Secret write前redact。I
 
 ## 19. Terminal fencing
 
-State updateはcurrent runtime/runner/job/attempt ownership条件。Attempt terminal/Runner lost後late messageはDB変更不可。
+State updateはcurrent runtime/runner/job/attempt ownership条件。
+
+Attempt terminal/Runner lost後late messageはDB変更不可。
+
+Workflow cancel/result raceとtimeout/result raceは`10`のcommit/deadline境界を使う。
 
 ## 20. Temp lifecycle
 
@@ -414,7 +439,20 @@ Payload commit後削除。Managed Artifactはput時durable copy済み。Cleanup 
 
 ## 21. Internal timeout
 
-`timeout-minutes` internalのみ、未指定無期限。Deadline -> cancel(timeout) -> grace default10s -> terminate -> job_timeout -> Retry。
+`timeout-minutes` internalのみ、未指定無期限。
+
+DeadlineはAction実行開始時点から計測し、Runner monotonic clockを使う。deadline到達時にtimeout flagを成立させる。
+
+1. deadline到達
+2. timeout flag
+3. cancel(timeout)
+4. grace default10秒
+5. grace中result/errorはcleanup完了signalとして受けられるが**success resultは採用しない**
+6. 未終了ならterminate
+7. Attempt=`job_timeout`
+8. Retry policy
+
+Graceは成功猶予ではない。Deadline前にsuccess commit済みならtimeout処理しない。
 
 ## 22. Parent shutdown / restart
 
@@ -433,17 +471,19 @@ CPU/RAM/GPU quota、本格sandbox、arbitrary shell、Pool global pause、Pool A
 3. sync/async/returned-awaitable Action
 4. invalid Action arity registration reject
 5. Validator sync-only/awaitable reject/ValidationResult defaults
-6. Pool config/liveness/restart
-7. claim ready_at + pending snapshot
-8. ready->start/IPC errors
-9. Secret binding materialization
-10. cancel while Action/request waits
-11. Runtime Handle correlation
-12. state_get reuse ineligible
-13. state_set immediate nonrollback + reuse ineligible
-14. Artifact operations
-15. progress/Step
-16. ActionFailure/error
+6. ActionFailure contract validation
+7. Pool config/liveness/restart
+8. claim ready_at + pending snapshot
+9. ready->start/IPC errors
+10. Secret binding materialization
+11. cancel while Action/request waits
+12. Runtime Handle correlation
+13. state_get found/missing both reuse ineligible
+14. state_set immediate nonrollback + reuse ineligible
+15. Artifact operations
+16. progress/Step
 17. result file/exit matrix
-18. stdout/redaction/common Log
-19. fencing/timeout/temp/restart
+18. timeout deadline result discard
+19. cancel commit result discard
+20. stdout/redaction/common Log
+21. fencing/temp/restart
