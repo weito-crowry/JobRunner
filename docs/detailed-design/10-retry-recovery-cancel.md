@@ -1,6 +1,6 @@
 # 10. Retry / Recovery / Cancel 詳細設計
 
-- Status: Draft v1.1
+- Status: Draft v1.2
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `02`, `03`, `04`, `05`, `07`, `08`, `11`
@@ -120,15 +120,17 @@ input_digest
 
 をJob `pending_*`へexact copyする。
 
-さらに:
+同じtransactionでJobをnon-terminal queued stateへ戻す:
 
 ```text
+status = queued
+conclusion = NULL
+completed_at = NULL
 ready_at = retry schedule/request time
 retry_not_before = due time or NULL
-status = queued
 ```
 
-とする。
+`current_attempt_id` はnew Attempt作成までは基準となったlatest failed Attemptを指してよい。前Attemptのfailure詳細はAttempt履歴と`current_failure_json`へ残してよく、queued Jobの`conclusion`とは別物として扱う。
 
 **new Attemptはまだ作らない。**
 
@@ -152,7 +154,7 @@ Failed Attempt terminal時:
 3. Retry `if`を`failure` contextで評価
 4. false -> Job completed/failure
 5. true -> delay計算
-6. §5 pending snapshot作成
+6. §5 pending snapshot + non-terminal Job state作成
 7. `retry_not_before`保存
 8. Maintenance notify
 9. `retry_scheduled` Event/Execution Log
@@ -188,7 +190,7 @@ Runが既にnon-terminalならConcurrency holder状態は変更しない。
 1 transactionで:
 
 1. eligibility/idempotency
-2. target Jobへ§5 pending snapshot、`retry_not_before=NULL`
+2. target Jobへ§5 pending snapshot + non-terminal state、`retry_not_before=NULL`
 3. blocked/skipped descendantsをactivation再評価対象へ戻す
 4. successful descendants `reuse_check_pending=1`
 5. successful Dynamic group/expanded rowsを`05` reuse check対象
@@ -216,7 +218,7 @@ Reopenをcommitする場合、同じtransactionで:
 4. `failure_json=NULL`
 5. Workflow Output storage fieldsを全てNULLにして旧Workflow Outputをcurrent公開対象から外す
 6. `cancel_requested=0`, `pause_requested=0`
-7. target Jobへ§5 pending snapshot、`retry_not_before=NULL`
+7. target Jobへ§5 pending snapshot + non-terminal state、`retry_not_before=NULL`
 8. blocked/skipped descendants activation再評価対象
 9. whole-skipped Dynamic expansionは`05`規則でreset可能
 10. successful descendants `reuse_check_pending=1`
@@ -359,20 +361,21 @@ Reopened Runが`wait_reason=concurrency`なら通常のConcurrency waitingとし
 1. retry absent/default/backoff + `now >= retry_not_before`
 2. core retryable map/parent override
 3. pending snapshot exact copy all executors
-4. no new Attempt at retry scheduling/request
-5. due executor-specific Attempt creation
-6. External validation failure follows scheduler retry flow
-7. Manual Retry Input/version eligibility
-8. non-terminal Run retry does not increment run_attempt
-9. completed Run retry increments run_attempt
-10. completed Run concurrency reacquire queue/reject/available
-11. reject leaves Run unchanged
-12. reopen clears conclusion/completed/failure/current Workflow Output
-13. target no with/item/version re-eval
-14. Secret value re-materializes but binding fixed
-15. descendant blocked/skipped reactivation
-16. successful Job current-context reuse
-17. Dynamic expansion strict reuse
-18. timeout result-after-deadline discarded
-19. cancel/result commit ordering
-20. runner_lost/pause/cancel/recovery idempotency
+4. Retry queued clears Job conclusion/completed_at
+5. no new Attempt at retry scheduling/request
+6. due executor-specific Attempt creation
+7. External validation failure follows scheduler retry flow
+8. Manual Retry Input/version eligibility
+9. non-terminal Run retry does not increment run_attempt
+10. completed Run retry increments run_attempt
+11. completed Run concurrency reacquire queue/reject/available
+12. reject leaves Run unchanged
+13. reopen clears conclusion/completed/failure/current Workflow Output
+14. target no with/item/version re-eval
+15. Secret value re-materializes but binding fixed
+16. descendant blocked/skipped reactivation
+17. successful Job current-context reuse
+18. Dynamic expansion strict reuse
+19. timeout result-after-deadline discarded
+20. cancel/result commit ordering
+21. runner_lost/pause/cancel/recovery idempotency
