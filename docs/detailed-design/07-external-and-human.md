@@ -1,26 +1,21 @@
 # 07. External / Human Executor 詳細設計
 
-- Status: Draft v0.3
+- Status: Draft v0.4
 - 対象: MVP
 - 上位仕様: `docs/design.md`
-- 関連: `01-workflow-definition.md`, `02-expression-and-inputs.md`, `03-runtime-and-scheduling.md`, `10-retry-recovery-cancel.md`
+- 関連: `01`, `02`, `03`, `08`, `09`, `10`, `11`, `12`
 
-## 1. 目的
-
-`external_llm` / `human` executor の activation、claim/lease/submit、review、Cancel、Retry、Recoveryを定義する。
-
-## 2. 共通原則
+## 1. 共通原則
 
 1. External/Human JobはRunnerを占有しない。
 2. `action/uses/runs-on/timeout-minutes`は禁止。
-3. `${{ secrets.* }}`は禁止。
+3. Secret参照は禁止。
 4. Job Inputはactivation時snapshot。
-5. activation時にAttemptを作る。
+5. activation時にAttempt作成。
 6. Retryはnew Attempt。
-7. late/stale operationはfail-closed。
-8. Service/Authorization/idempotencyを必ず通す。
+7. state changeはService/Authorization/idempotency経路。
 
-## 3. External LLM YAML
+## 2. External LLM
 
 ```yaml
 jobs:
@@ -33,259 +28,179 @@ jobs:
       on-lease-expiry: requeue
 ```
 
-優先順位:
+Default lease=60分、expiry=`requeue`。
 
-```text
-Job external > Workflow settings > System default
-```
+## 3. External activation
 
-System default: lease 60分、expiry `requeue`。
+1 transaction:
 
-## 4. External activation
+1. final Input/continue-on-error確定
+2. new Attempt
+3. External Task
+4. Job=`waiting_external`
+5. Event
 
-ready時1transaction:
+One Task / Attempt。
 
-1. final Input確定
-2. continue-on-error snapshot
-3. new Attempt
-4. External Task作成
-5. Job -> `waiting_external`
-6. Event
-
-one task / Attempt。
-
-## 5. Task / Lease状態
+## 4. Task / Lease
 
 Task:
 
 ```text
-available | leased | completed | cancelled
+available|leased|completed|cancelled
 ```
 
 Lease:
 
 ```text
-active | expired | released | invalidated
+active|expired|released|invalidated
 ```
 
-Job statusはclaim中も `waiting_external`。
+`task_claim` candidate順:
 
-## 6. `task_claim`
-
-Atomic transactionでcandidateを1件選びLease発行。
-
-### 6.1 candidate selection order
-
-External taskの選択順はinternal Job schedulingと同じ軸を使う。
-
-1. Workflow Run priority DESC
+1. Workflow priority DESC
 2. Job priority DESC
-3. Dynamic `order_rank` ASC
-4. `source_order` ASC
-5. `ready_at` ASC
-6. Job Run ID deterministic tie-break
+3. Dynamic order rank ASC
+4. source order ASC
+5. ready_at ASC
+6. Job Run ID
 
-さらに以下を満たすもののみ:
+Atomic exactly-one claim。
 
-- Task `available`
-- Workflow Run pause/cancel無し
-- Attempt non-terminal
-- active lease無し
-- Authorizationでclaim許可
+## 5. Lease expiry
 
-これにより `claim_next` でも通常 `task_claim` でも順序を統一する。
+`requeue`:
 
-### 6.2 lease
+- same Attempt
+- Lease expired
+- Task available
 
-```text
-lease_id
-external_task_id
-attempt_id
-claimed_by
-claimed_at
-expires_at
-released_at nullable
-status
-```
+`fail`:
 
-同一Task active leaseは最大1。
+- Attempt failure `external_lease_expired`
+- Retry policy
 
-## 7. Lease expiry
+Pause中もlease clockは進む。
 
-### `requeue`
+## 6. `task_submit`
 
-- Lease -> expired
-- Task -> available
-- same Attempt維持
-- new Attemptを作らない
-
-### `fail`
-
-- Lease -> expired
-- Task terminal
-- Attempt -> failure `external_lease_expired`
-- Retry policyへ
-
-Lease expiryはWall Clockで進み、Workflow Pauseで停止しない。
-
-## 8. `task_submit`
-
-request:
+Request:
 
 ```text
 task_id
 lease_id
-result
-artifacts optional
+result                 # 任意JSON-compatible value
+artifacts optional     # External Reference Artifact metadataのみ
 claim_next optional
 request_id optional
 ```
 
-受理条件:
+Resultはobjectに限定しない。scalar/list/object/nullを許可し、optional JSON Schema / `success_if` を適用する。
 
-- current task/Attempt
-- current active unexpired lease
-- Workflow cancel無し
-- result JSON/schema/size validation
-- `success_if`
-- artifact metadata validation
+### 6.1 Output persistence
 
-1transactionで:
+Resultは`02/08`のPayloadStoreへ保存する。
 
-- Artifact metadata登録
+- <= threshold: SQLite inline
+- > threshold: filesystem blob
+- sizeによるhidden failure無し
+
+SecretはExternal Jobへ注入されない。
+
+### 6.2 Artifact
+
+`task_submit.artifacts` は `storage_kind=external` の参照登録だけ。URI/metadataを受け、Coreは実体fetch/uploadしない。
+
+MVP external task protocolからmanaged ArtifactStoreへbinary uploadする機能は持たない。
+
+### 6.3 Atomic submit
+
+1 transaction相当のService operationで:
+
+- current Lease validation
+- result validation / PayloadStore準備
+- external Artifact metadata
 - Attempt/Job terminal
-- Lease release
-- Task complete
-- Event
-- idempotency result
+- Lease release / Task complete
+- Event / idempotency result
 
-## 9. `claim_next`
+Payload blobのfilesystem/DB crash consistencyは`08`。
 
-submit transaction成功後、別transactionで通常 `task_claim` と同じselection/order/authorizationを使う。
+## 7. `claim_next`
 
-next claim failureはsubmit成功をrollbackしない。
+Submit成功後、別transactionで通常`task_claim`と同じselection/authorizationを使用。Next claim failureでsubmitをrollbackしない。
 
-## 10. Pause / Cancel
+## 8. Pause / Cancel / Recovery
 
 Pause:
 
 - new claim禁止
 - existing Lease submit受理
-- expiry clock継続
+- lease expiry継続
 
 Cancel:
 
-- available Task -> cancelled
-- active Lease -> invalidated
-- Attempt/Job -> cancelled
-- late submit拒否
-
-## 11. External Retry / Recovery
-
-Retry:
-
-- new Attempt + new Task
-- old Task/Lease/Attempt保持
-
-`requeue` expiryはRetryではない。
+- available Task cancelled
+- active Lease invalidated
+- Attempt/Job cancelled
+- late submit reject
 
 Recovery:
 
 - active unexpired Lease維持
-- expiredへpolicy適用
-- available Task維持
-- terminal/cancelled AttemptへLease発行禁止
+- expiredへpolicy
+- terminal Attemptへnew Lease不可
 
-## 12. Human YAML
+## 9. Human Review
 
 ```yaml
 jobs:
   approve:
     executor: human
     with:
-      summary: ${{ needs.analyze.outputs.summary }}
+      summary: ${{ needs.analyze.outputs }}
 ```
 
-Human Jobは `action/uses/runs-on/success_if/external/timeout-minutes/secrets` 禁止。
+Humanは`action/uses/runs-on/success_if/external/timeout-minutes/secrets`禁止。
 
-## 13. Human activation
+Activation: new Attempt + one pending Review + Job=`waiting_review`。
 
-ready時1transaction:
-
-1. review Input snapshot
-2. continue-on-error snapshot
-3. new Attempt
-4. Human Review `pending`
-5. Job -> `waiting_review`
-6. Event
-
-one review / Attempt。
-
-## 14. Human Review model
+Outcome:
 
 ```text
-review_id
-job_run_id
-attempt_id
-status = pending | completed | cancelled
-outcome nullable = approve | reject
-comment nullable
-actor_context nullable
-created_at
-completed_at nullable
+approve|reject
 ```
 
-Human lease / review timeoutはMVPなし。
+Approve -> success。
+Reject -> failure `human_rejected`, retryable=false default。
 
-## 15. `review_submit`
+Human lease/timeout無し。Concurrent submitはfirst-wins。
 
-Atomic first-wins。
+Reviewの標準Job OutputはMVPでは `null` とする。Review metadataは`wf_review_info`から取得し、Job Outputへ自動混入しない。
 
-Approve -> Job success。
+## 10. Human Pause / Cancel / Retry
 
-Reject -> Job failure `human_rejected`, retryable=false default。
+Pause中review submit受理。
 
-failed Jobを人間操作で直接successへ変更するAPIはない。
+Cancel後late submit reject。
 
-## 16. Human Pause/Cancel/Retry
+Reject後Retryはnew Attempt + new pending Review。
 
-Pause: pending review維持、submit受理。
+## 11. Idempotency / Authorization
 
-Cancel: review -> cancelled、late submit拒否。
+`task_claim/task_submit/review_submit` はoptional `request_id`。共通scope/TTLは`08/11`。
 
-Reject後Retry: new Attempt + new pending review。
+All read/write Authorization。
 
-## 17. Idempotency / Authorization
+## 12. 受入条件
 
-claim/submit/review read/writeはAuthorizationProviderを通す。
-
-`task_claim`, `task_submit`, `review_submit` は optional `request_id`。
-
-Idempotency scope/hash/TTLは `08` / `11` の共通規則に従う。
-
-## 18. Events
-
-```text
-external_task_created
-external_task_claimed
-external_lease_expired
-external_task_submitted
-external_submit_rejected
-external_task_cancelled
-human_review_requested
-human_review_submitted
-human_review_cancelled
-```
-
-## 19. 受入条件
-
-1. external/human timeout拒否
-2. External activation one task/Attempt
-3. task_claim scheduling order
+1. arbitrary JSON External result
+2. large result transparent spill
+3. external Artifact reference only
 4. concurrent claim exactly one
-5. lease requeue/fail
-6. stale/cancel submit拒否
-7. claim_next同一selection rule
-8. Human first-wins
-9. Human timeout無し
-10. retry/recovery/idempotency/authorization
+5. claim/claim_next同順序
+6. lease requeue/fail
+7. pause/cancel/recovery
+8. Human output null + review info separation
+9. Human first-wins/retry
+10. idempotency/authorization
