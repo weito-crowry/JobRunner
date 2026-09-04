@@ -1,6 +1,6 @@
 # 02. Expression / Inputs / Outputs 詳細設計
 
-- Status: Draft v0.3
+- Status: Draft v0.4
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01-workflow-definition.md`
@@ -243,8 +243,9 @@ Job/template `if` は condition dependency set がすべてterminalになった�
 Dependencyが effective success:
 
 - conclusion=`success`
-- conclusion=`skipped`
 - conclusion=`failure` かつそのdependencyの snapshotted `continue-on-error=true`
+
+**`skipped` は effective success に含めない。** GitHub Actions寄りに、通常Jobがskipされた場合、そのJobに依存する後段Jobは明示条件がない限り既定 `success()` がfalseとなりskipする。
 
 Helper:
 
@@ -261,9 +262,13 @@ Helper:
 
 - cancel由来 -> `cancelled`
 - non-allowed failure/blocked -> `blocked`
-- それ以外でsuccess() false -> `skipped`
+- upstream `skipped` が原因 -> `skipped`
 
 明示 `if` がfalseなら `skipped`。ただし Workflow cancel 時は `cancelled`。
+
+### 18.2 Dynamic groupとの違い
+
+Dynamic template groupは、個別generated Jobの一部が`skipped`でも `05` のgroup集約規則によりgroup conclusionが`success`になり得る。後段がtemplate groupを`needs`する場合は、その**group conclusion**に対して通常helperを評価する。
 
 ## 19. `success_if`
 
@@ -308,8 +313,10 @@ criterionは non-null string または number。同一criterion内は全candidat
 3. Dynamic group status/conclusion
 4. Nested parent edgeがcondition helperへ含まれる
 5. parent + declared needs混在
-6. helper 4種
-7. explicit if false
-8. missing/null/type strictness
-9. full logical job_key参照
-10. order_by型検証
+6. skipped dependencyでdefault downstream skip
+7. continue-on-error failureでeffective success
+8. helper 4種
+9. explicit if false
+10. missing/null/type strictness
+11. full logical job_key参照
+12. order_by型検証
