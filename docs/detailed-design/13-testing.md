@@ -1,6 +1,6 @@
 # 13. Testing 詳細設計
 
-- Status: Draft v1.1
+- Status: Draft v1.2
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`〜`12`
@@ -167,11 +167,26 @@ Known Secret:
 - managed Artifact byte match/chunk boundary reject
 - transformed Secretは保証外
 
-## 8. Scheduling / Claim / Maintenance
+## 8. Scheduling / Runner Pool / Maintenance
+
+Runner Pool:
+
+- only registered Pool accepted by `runs-on`
+- missing `runs-on` resolves configured `default_runner_pool`
+- unknown Pool rejected before Run start
+- `runner_count=N` starts exactly N logical Runner slots/processes
+- `runner_count<1` reject
+- heartbeat/lost/main-loop relation validation
+- restart mode `on_failure|never`
+- restart suppression after configured window count
+- no per-Pool Action allow-list: same registered Action can run on any Pool selected by YAML
+- no Pool global pause API/state
+
+Scheduling:
 
 - Workflow/Job priority
 - Dynamic order/source
-- Pool routing
+- Pool-matched claim only
 - one internal running / Run
 - multiple Runs parallel
 - pause/resume
@@ -286,14 +301,18 @@ Manual:
 - binding Definition+Action+Validator versions
 - Retry same binding
 - missing Validator version fail-closed
-- Parent/Child Output/state isolation
+- Parent/Child state isolation
+- parent -> child ArtifactRef via `with`
+- child -> parent ArtifactRef via top-level Workflow Output
+- Child Artifact not automatically mirrored into Parent Job artifacts namespace
+- cross-run ArtifactRef fixed on Parent Retry
 - cycle
 - direct Child control reject
 - Dynamic+Reusable
 - restart duplicate
 - Child Output spill
 
-## 14. ArtifactStore
+## 14. ArtifactStore / ArtifactRef
 
 Managed:
 
@@ -301,13 +320,24 @@ Managed:
 - workdir traversal reject
 - immutable generations
 - materialize destination safety
-- Retry current generation
 - store finalize DB failure orphan cleanup
+
+ArtifactRef:
+
+- canonical `type=jobrunner_artifact` shape
+- caller metadata re-resolved from artifact_id
+- same-run materialize positive
+- cross-run materialize requires ref in current persistent Input + Authorization
+- raw cross-run artifact_id only reject
+- forged/mismatched ref metadata reject
+- retained/deleted managed data materialize reject
+- persistent Input ArtifactRef changes Input digest/reuse key
+- Input外dynamic materialize marks reuse ineligible
 
 External:
 
 - URI metadata
-- no fetch
+- no Core fetch/materialize
 - External LLM reference only
 
 ## 15. External / Human
@@ -332,16 +362,18 @@ Human:
 
 ## 16. Same-Run Result Reuse
 
-Scope same Run only, no cross-Run。
+Scope same Run only, no cross-Run automatic reuse。
 
 Key includes persistent Input / direct upstream Artifact / Definition hash / executor+Action / Validator identity。
+
+Explicit prior/cross-run ArtifactRef in persistent Input is allowed and therefore fixed by Input digest; implicit lookup is not reuse。
 
 Negative:
 
 - changed component
 - Payload missing/digest
 - state.get
-- undeclared Artifact materialize
+- persistent Input外Artifact materialize
 
 Manual Retry descendant:
 
@@ -424,6 +456,8 @@ Maintenance:
 - Definition list/info authorize
 - log path safety
 - Artifact URI no fetch
+- cross-run Artifact materialize explicit ref + authorization
+- Reusable Child does not widen AccessScope
 - arbitrary shell無し
 
 ## 21. Platform / CI
@@ -446,19 +480,20 @@ platform-matrix
 2. dependencies/package extras Python3.10 Windows/Linux
 3. YAML reload/canonical JSON/JSON Schema
 4. Validator contract
-5. migrations/FK/Retention
-6. process integration
-7. claim/concurrency/deadline races
-8. PayloadStore
-9. Service/MCP/HTTP contract
-10. ArtifactStore
-11. External/Human E2E
-12. Dynamic1000/nested/rollback
-13. Reusable binding/cycle/version
-14. SecretGuard
-15. Retry failure policy
-16. same-run Result Reuse
-17. idempotency scope/status replay
-18. Retention sweep/audit/orphan cleanup
+5. Runner Pool contract
+6. migrations/FK/Retention
+7. process integration
+8. claim/concurrency/deadline races
+9. PayloadStore
+10. Service/MCP/HTTP contract
+11. ArtifactStore/ArtifactRef scope
+12. External/Human E2E
+13. Dynamic1000/nested/rollback
+14. Reusable binding/cycle/version/artifact mapping
+15. SecretGuard/Authorization
+16. Retry failure policy
+17. same-run Result Reuse
+18. idempotency scope/status replay
+19. Retention sweep/audit/orphan cleanup
 
 WebUI E2Eは後続。
