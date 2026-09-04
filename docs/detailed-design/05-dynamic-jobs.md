@@ -1,6 +1,6 @@
 # 05. Dynamic Jobs 詳細設計
 
-- Status: Draft v0.5
+- Status: Draft v0.6
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `02`, `03`, `08`
@@ -19,6 +19,7 @@
 6. identityはparent path込みfull `job_key`。
 7. 同一Run internal Job同時最大1。
 8. `foreach=[]` の正常0件と `if=false` のskipを区別する。
+9. Nested parentが0件の場合はparent group conclusionを失わず伝播する。
 
 ## 3. Root Dynamic Job
 
@@ -88,11 +89,35 @@ JSON array必須。null/object/scalar -> `dynamic_foreach_type_error`。
 - expansion=`expanded`
 - generated count=0
 - 正常な「仕事なし」
-- rootであればtemplate groupはsuccess
+- Rootならtemplate groupはsuccess
 
 source arrayはexpansion時snapshot。
 
-## 7. `item` / `iteration`
+## 7. Nested zero-parent propagation
+
+Nested templateのparent groupがterminalになった時点でgenerated parent Jobが0件なら、per-parent expansion instanceは作れないため `iteration.parent` を使った`if/foreach`を評価しない。
+
+代わりにparent group conclusionを基準にNested template groupを直接terminal化する。
+
+| parent group | nested group (generated parent=0) |
+| --- | --- |
+| `success` | `success` |
+| `skipped` | `skipped` |
+| `failure` | `blocked` |
+| `blocked` | `blocked` |
+| `cancelled` | `cancelled` |
+
+したがって:
+
+- parent `foreach=[]` -> parent success -> nested success
+- parent Root `if=false` -> parent skipped -> nested skipped
+- parent expansion failure before any generated Job -> nested blocked
+
+このzero-parent propagationは`if: always()`等で「存在しないparent item」を人工的に作る機能ではない。Parent itemが0件ならNested Actionは0件のまま。
+
+Declared global `needs` にfailure/cancelがある場合は通常dependency規則を合わせて、より強い `cancelled > blocked/failure > skipped > success` の方向へterminal化する。
+
+## 8. `item` / `iteration`
 
 `iteration.current`:
 
@@ -110,7 +135,7 @@ outputs/artifacts
 
 ancestors outermost -> parent。Retryで再評価無し。
 
-## 8. raw key / full job key
+## 9. raw key / full job key
 
 key result string|integer。integerはbase10 string。empty string禁止。
 
@@ -127,7 +152,7 @@ raw keyはUTF-8 percent-encode。safe=`A-Z a-z 0-9 . _ -`、他はuppercase `%HH
 
 Full logical `job_key` fixed byte limit無し。DB TEXT、filesystem pathはopaque ID。
 
-## 9. 生成数上限
+## 10. 生成数上限
 
 System default1000。Workflow `settings.max-dynamic-jobs` override。
 
@@ -135,7 +160,7 @@ Countは当該Workflow Run generated Job。ChildはChild Runで別count。
 
 超過時expansion全体0件登録でfailure。truncate禁止。
 
-## 10. Expansion identity
+## 11. Expansion identity
 
 ```text
 workflow_run_id
@@ -145,7 +170,7 @@ parent_generated_job_run_id nullable
 
 Root parent null、Nestedはparent generated Jobごと。
 
-## 11. Atomic expansion preflight
+## 12. Atomic expansion preflight
 
 全candidateをmemory上で構築し、DB insert前に全件検証:
 
@@ -168,18 +193,20 @@ Action/Validator versionはWorkflow Run snapshotと一致。Expansion中Registry
 
 1件でも失敗ならgenerated Jobを残さない。
 
-## 12. `if`
+## 13. `if`
 
 Root: declared needs terminal後1回。
-Nested: parent+needs terminal後parentごと。
+Nested: parent generated Job + declared needs terminal後parentごと。
 
 - true -> foreach評価へ
 - false -> そのexpansion instance=`skipped`、foreachは評価しない、generated Job 0
 - expression error -> expansion=`failed`
 
+Nested parent generated Jobが0件の場合は§7を使い、per-parent `if`は評価しない。
+
 Workflow cancel後は新規if/foreach activationを開始しない。
 
-## 13. `order_by` canonical schema
+## 14. `order_by` canonical schema
 
 未指定時はsource array order。
 
@@ -211,7 +238,7 @@ non-empty array of {expr, direction}
 
 各criterionは全candidateで同一型のstringまたはfinite number。null/bool/object/array/NaN/Infinity/criterion内混在型は`dynamic_order_type_error`。
 
-Sortはcriterionを左からlexicographic適用し、全criterion同値ならsource_order ASCでstable tie-break。最終的な整数`order_rank`をexpansion内で0..N-1としてsnapshotする。
+Sortはcriterionを左からlexicographic適用し、全criterion同値ならsource_order ASCでstable tie-break。最終整数`order_rank`をexpansion内0..N-1でsnapshot。
 
 Runner選択:
 
@@ -224,7 +251,7 @@ Runner選択:
 
 Different expansion/template間でもorder_rankは同じ整数軸として比較する。Job priorityをまたいでorder_byが優先することはない。
 
-## 14. Template group status / conclusion
+## 15. Template group status / conclusion
 
 `needs: [evaluate]` 等で参照するTemplate groupは、そのtemplateに属する全expansion instance + generated Jobを集約する。
 
@@ -238,20 +265,24 @@ Conclusion優先順位:
 1. cancel由来あり -> `cancelled`
 2. expansion failure / non-allowed generated failureあり -> `failure`
 3. required generated blockedあり -> `blocked`
-4. **全expansion instanceが`skipped`でgenerated Jobが0件 -> `skipped`**
+4. 全expansion instanceが`skipped`でgenerated Job 0 -> `skipped`
 5. それ以外で全generated Jobがeffective success/skipped、または正常empty expansion -> `success`
+
+Nested parent Job 0件の場合は§7の直接propagationを優先する。
 
 例:
 
 - Root `if=false` -> group `completed/skipped`
 - Root `foreach=[]` -> group `completed/success`
-- Nested parentが0件のためexpansion instance自体が0件 -> group `completed/success`
+- Nested parent success+0 jobs -> nested `completed/success`
+- Nested parent skipped+0 jobs -> nested `completed/skipped`
+- Nested parent failure+0 jobs -> nested `completed/blocked`
 - Nested parent10件の全てで`if=false` -> group `completed/skipped`
-- 一部parentでskip、一部でsuccess -> group `completed/success`（failure/blocked/cancel無しの場合）
+- 一部parentでskip、一部でsuccess -> group `completed/success`（failure/blocked/cancel無し）
 
-このgroup conclusionを`02`の`success()/failure()/cancelled()`が通常dependencyと同様に使う。
+このgroup conclusionを`02`のcondition helperが通常dependencyと同様に使う。
 
-## 15. Output / Artifact aggregation
+## 16. Output / Artifact aggregation
 
 ```text
 needs.<template>.jobs[full_job_key]
@@ -263,7 +294,7 @@ raw keyだけでindexしない。
 
 Generated Job 0件なら各mapはempty object。
 
-## 16. Retry / Recovery
+## 17. Retry / Recovery
 
 Generated Job Retryはsame Job Run new Attempt。
 
@@ -282,23 +313,24 @@ Recovery:
 - committed expansion再生成無し
 - uncommittedはcurrent dependenciesから再評価
 - committed outcome (`expanded|skipped|failed|cancelled`)を重複確定しない
+- zero-parent direct propagationもidempotent
 - success generated Job保持
 - running Runner recovery
 - queued維持
 
-## 17. Reusable / External / Human
+## 18. Reusable / External / Human
 
 Dynamic templateにReusable/External/Human可。Field/Validator constraintsは`01`。
 
 External generated Jobもoptional Validator可。Human/Reusable generated JobはValidator禁止。
 
-## 18. Pause / Cancel
+## 19. Pause / Cancel
 
 Pause中new expansion無し。commit済み保持。
 
 Cancel後new expansion無し。未実行generatedは通常cancel。
 
-## 19. Failure code
+## 20. Failure code
 
 ```text
 dynamic_foreach_type_error
@@ -313,7 +345,7 @@ dynamic_expansion_validation_failed
 dynamic_expansion_storage_failed
 ```
 
-## 20. 受入条件
+## 21. 受入条件
 
 1. Root/Nested/3+ depth
 2. parent cycle
@@ -324,10 +356,14 @@ dynamic_expansion_storage_failed
 7. Action+Validator version preflight before insert
 8. atomic recovery
 9. `order_by` source_order/list schema/asc/desc/stable tie
-10. `if=false` group skipped
-11. `foreach=[]` group success
-12. zero-parent nested group success
-13. mixed skipped/success group success
-14. group failure/blocked/cancel precedence
-15. full-key output/artifact
-16. Retry Action+Validator/item/order snapshot固定
+10. Root `if=false` group skipped
+11. Root `foreach=[]` group success
+12. nested parent success+0 -> success
+13. nested parent skipped+0 -> skipped
+14. nested parent failure/blocked+0 -> blocked
+15. nested parent cancelled+0 -> cancelled
+16. no parent item synthesis by always()
+17. mixed skipped/success group success
+18. group failure/blocked/cancel precedence
+19. full-key output/artifact
+20. Retry Action+Validator/item/order snapshot固定
