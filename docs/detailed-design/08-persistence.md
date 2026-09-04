@@ -1,6 +1,6 @@
 # 08. Persistence 詳細設計
 
-- Status: Draft v2.6
+- Status: Draft v2.7
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - Canonical JSON: `01` の `jobrunner.canonical-json.v1`
@@ -164,6 +164,7 @@ source_identity TEXT NULL
 concurrency_group TEXT COLLATE BINARY NULL
 concurrency_max_runs INTEGER NULL
 concurrency_on_limit TEXT NULL
+concurrency_queued_at TEXT NULL
 actor_context_json TEXT NOT NULL
 access_scope_json TEXT NOT NULL
 parent_workflow_run_id TEXT NULL REFERENCES workflow_runs(id) ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED
@@ -186,14 +187,16 @@ Enums/invariants:
 status=queued|running|paused|completed
 conclusion=NULL|success|failure|cancelled
 wait_reason=NULL|concurrency
-queued    -> conclusion NULL, wait_reason=concurrency, concurrency slot無し
-running   -> conclusion NULL, wait_reason=NULL, concurrency設定時はslot holder
+queued    -> conclusion NULL, wait_reason=concurrency, concurrency_queued_at non-NULL, slot無し
+running   -> conclusion NULL, wait_reason=NULL, concurrency_queued_at NULL, concurrency設定時はslot holder
 paused    -> conclusion NULL, wait_reason=NULL|concurrency
-             wait_reason=NULLならadmitted holder、concurrencyならwaiterでslot無し
-completed -> conclusion non-NULL, completed_at non-NULL, wait_reason=NULL
+             wait_reason=NULLならadmitted holderかつconcurrency_queued_at NULL
+             wait_reason=concurrencyならwaiterかつconcurrency_queued_at non-NULL、slot無し
+completed -> conclusion non-NULL, completed_at non-NULL, wait_reason=NULL, concurrency_queued_at NULL
 non-completed -> conclusion NULL
 source_identity NULL or non-empty
 concurrency_group NULL <=> max/on_limit NULL
+concurrency_group NULL -> concurrency_queued_at NULL
 concurrency_max_runs NULL or >=1
 concurrency_on_limit NULL|queue|reject
 root: parent_workflow_run_id NULL,depth=0,root_workflow_run_id=id
@@ -201,6 +204,15 @@ child: parent ids/binding non-empty,depth>=1
 ```
 
 MVPではWorkflow Run `queued` はConcurrency admission待ち専用。Job dependency待ちやRunner待ちだけを理由にWorkflow Runをqueuedへしない。
+
+`concurrency_queued_at`は**実際にConcurrency待ちへ入った時刻**。Run `created_at`の代用にしない。
+
+- initial/Child queue -> queue admission失敗時のcurrent canonical UTC time
+- Manual Retry completed Run reopen + queue -> retry request transaction time
+- paused waiter ->値を保持
+- waiter Resume ->値を保持
+- slot admission/completion/cancel terminalization -> NULL
+- Recovery ->保存済み値を保持し、current timeへ書き換えない
 
 `system_workflow_defaults_json` exact shape=`01 §11.1`。
 
@@ -237,6 +249,9 @@ CREATE INDEX ix_workflow_runs_status ON workflow_runs(status,priority DESC,creat
 CREATE INDEX ix_workflow_runs_concurrency
 ON workflow_runs(workflow_id,concurrency_group,status)
 WHERE concurrency_group IS NOT NULL AND status!='completed';
+CREATE INDEX ix_workflow_runs_concurrency_wait
+ON workflow_runs(workflow_id,concurrency_group,priority DESC,concurrency_queued_at ASC,id ASC)
+WHERE wait_reason='concurrency' AND status='queued';
 CREATE INDEX ix_workflow_runs_root_active ON workflow_runs(root_workflow_run_id,status,call_depth,id)
   WHERE status!='completed';
 CREATE UNIQUE INDEX uq_child_run_per_parent_attempt ON workflow_runs(parent_attempt_id)
@@ -506,8 +521,8 @@ Child Run作成時:
 - `effective_settings_json` <- binding child_effective_settings_json
 - `retention_policy_json` <- binding child_retention_policy_json
 - priority <- current root Run priority
-- slot admitted -> status=running
-- concurrency queue -> status=queued, wait_reason=concurrency
+- slot admitted -> `status=running, concurrency_queued_at=NULL`
+- concurrency queue -> `status=queued, wait_reason=concurrency, concurrency_queued_at=current time`
 
 Concurrency `on-limit=reject`でChildを作らない場合もbinding/Parent Attempt failureは保存してよいが、`workflow_runs` Child rowは作らない。
 
@@ -714,6 +729,8 @@ invalidated_at TEXT NULL
 created_at TEXT NOT NULL
 ```
 
+`claimant_key` exact semantics=`12 §2.1 actor_principal_key`。Client requestから任意文字列を保存せず、Service caller ActorContext/AccessScopeからCoreが算出する。
+
 Status=`active|expired|released|invalidated`。
 
 ```sql
@@ -725,7 +742,7 @@ ON external_leases(expires_at)
 WHERE status='active';
 ```
 
-Heartbeat/renew/transfer column無し。`now >= expires_at`ならLeaseはsubmit不可でexpiry処理対象。
+Heartbeat/renew/transfer column無し。`now >= expires_at`ならLeaseはsubmit不可でexpiry処理対象。Submitはactive Lease IDに加えてcurrent caller `actor_principal_key == claimant_key`を必須確認する。
 
 ## 21. `human_reviews`
 
@@ -774,7 +791,17 @@ PRIMARY KEY(scope,operation,request_key)
 
 `request_hash`=SHA-256(canonical-json-v1(Service request excluding request_id/transport-only fields))。
 
-Scope=`namespace + operation_resource_key + actor_principal_key + access_scope`をcanonical化/hashしたopaque key。
+`actor_principal_key` exact definition=`12 §2.1`でAccessScopeを既に含む。
+
+Idempotency `scope` source:
+
+```text
+namespace
+operation_resource_key
+actor_principal_key
+```
+
+をcanonical-json-v1でserialize/hashしたopaque key。AccessScopeを別fieldとして二重追加しない。
 
 Flow=optional fast read -> prepare -> `BEGIN IMMEDIATE` -> key/hash再確認 -> domain state再確認 -> side effect + result row commit。
 
@@ -804,8 +831,8 @@ Canonical holder/waiter:
 ```text
 holder = status='running'
       OR (status='paused' AND wait_reason IS NULL)
-waiter = status='queued' AND wait_reason='concurrency'
-paused waiter = status='paused' AND wait_reason='concurrency'   # holderではなくwake対象外
+waiter = status='queued' AND wait_reason='concurrency' AND concurrency_queued_at IS NOT NULL
+paused waiter = status='paused' AND wait_reason='concurrency' AND concurrency_queued_at IS NOT NULL
 ```
 
 Concurrency groupがNULLのRunはslot count対象外。
@@ -826,19 +853,21 @@ holderが0件ならcandidate.max_runs。
 
 ### 23.3 Waiting order
 
-Waiting Run=`status=queued, wait_reason=concurrency`。
+Waiting Run=`status=queued, wait_reason=concurrency, concurrency_queued_at non-NULL`。
 
 Release時:
 
 ```text
 priority DESC
-created_at ASC
+concurrency_queued_at ASC
 id ASC
 ```
 
-先頭から順に現在のholder集合でcapacityを再計算し、admitできない先頭waiterがあれば後続を追い越させない。Paused waiterはResumeするまで候補外。
+`created_at`はwaiting orderへ使わない。特にManual Retryで古いRunをreopenした場合、reopen時に新しい`concurrency_queued_at`を与えるため既存waiterへ割り込まない。
 
-Slot取得commitで`status=running, wait_reason=NULL`へ変更。
+先頭から順に現在のholder集合でcapacityを再計算し、admitできない先頭waiterがあれば後続を追い越させない。Paused waiterはResumeするまで候補外で、元のqueue timestampを保持する。
+
+Slot取得commitで`status=running, wait_reason=NULL, concurrency_queued_at=NULL`へ変更。
 
 Workflow start/slot release/Manual Retry reopenは`BEGIN IMMEDIATE`で判定する。
 
@@ -900,20 +929,20 @@ Runner current pointerはrepair後。FK無効化禁止。
 
 1 DB transaction:
 
-- Workflow Run start + System/effective snapshot + concurrency admission + optional idempotency
+- Workflow Run start + System/effective snapshot + concurrency admission/queue timestamp + optional idempotency
 - root priority update + descendant propagation + idempotency
 - internal claim + Attempt + pending copy + Runner ownership
 - Dynamic expansion
 - state current+history
-- External Lease claim + idempotency
-- External submit + optional claim_next Lease + full idempotency
+- External Lease claim with canonical claimant_key + idempotency
+- External submit + claimant ownership check + optional claim_next same claimant Lease + full idempotency
 - Human review first-wins + idempotency
-- Reusable binding + Parent Attempt transition + Child concurrency admission; admit/queue時だけChild Run作成、reject時はChild row無しでParent Attempt failure
+- Reusable binding + Parent Attempt transition + Child concurrency admission/queue timestamp; admit/queue時だけChild Run作成、reject時はChild row無しでParent Attempt failure
 - Manual Retry non-terminal: Job terminal fields clear + pending snapshot + descendant/reuse bookkeeping + idempotency
-- Manual Retry reopen: concurrency reacquire + Run/Job terminal fields clear + Workflow Output clear + pending snapshot + idempotency
-- concurrency holder release/wake
+- Manual Retry reopen: concurrency reacquire + fresh queue timestamp when queued + Run/Job terminal fields clear + Workflow Output clear + pending snapshot + idempotency
+- concurrency holder release/wake + admission clears queue timestamp
 
-Completed failure Run Manual Retryで`on-limit=reject`かつslot不可の場合はtransactionを変更せずconflictとして終了する。Queueの場合はRunをnon-terminalへreopenし`status=queued, wait_reason=concurrency`でpending Inputを保持する。
+Completed failure Run Manual Retryで`on-limit=reject`かつslot不可の場合はtransactionを変更せずconflictとして終了する。Queueの場合はRunをnon-terminalへreopenし`status=queued, wait_reason=concurrency, concurrency_queued_at=retry transaction time`でpending Inputを保持する。
 
 Payload/Artifact filesystem=prepare/finalize + DB transaction + orphan cleanup。Distributed exactly-once無し。
 
@@ -929,29 +958,31 @@ Tests use`sqlite_master`/PRAGMA for exact table/column/index/FK/check。
 
 1. 全18 table exact schema
 2. canonical timestamp fixed UTC format / lexical order
-3. Workflow queued/running/paused/completed + wait_reason/slot invariant
-4. Dynamic template no job_runs
-5. system_workflow_defaults/effective_settings exact shape
-6. Root System baseline snapshot / Child copy
-7. explicit/omitted runs_on stored resolved
-8. static source_order=0 + job_key stable ordering
-9. all-executor queued pending invariant + retry clears terminal Job fields
-10. Attempt Secret bindings/input digest + secret-bound reuse_eligible=0
-11. one-open-Step partial unique + start/finish metadata split
-12. Dynamic expansion digest/unique
-13. Reusable binding Child System baseline/settings/Retention + reject no Child row
-14. Child priority=root priority + update propagation
-15. State immediate nonrollback + open Step producer association
-16. Artifact schema has no metadata soft-delete column
-17. Runner invariants/indexes
-18. External Task lease finite/config snapshot + expiry boundary
-19. Human immutable
-20. Idempotency request hash/scope/no-reserved/recheck/expiry boundary
-21. concurrency scope=(workflow_id,group)
-22. mixed max-runs conservative capacity + waiter ordering/paused waiter exclusion
-23. Manual Retry concurrency reacquire/output clear atomicity
-24. submit+claim_next atomic
-25. Result Reuse identities
-26. Child-first Retention
-27. migration verification
-28. Payload/Artifact crash consistency
+3. Workflow queued/running/paused/completed + wait_reason/slot/concurrency_queued_at invariant
+4. initial/Child/Manual-Retry queue timestamp + admission clear + pause/resume preservation
+5. Dynamic template no job_runs
+6. system_workflow_defaults/effective_settings exact shape
+7. Root System baseline snapshot / Child copy
+8. explicit/omitted runs_on stored resolved
+9. static source_order=0 + job_key stable ordering
+10. all-executor queued pending invariant + retry clears terminal Job fields
+11. Attempt Secret bindings/input digest + secret-bound reuse_eligible=0
+12. one-open-Step partial unique + start/finish metadata split
+13. Dynamic expansion digest/unique
+14. Reusable binding Child System baseline/settings/Retention + reject no Child row
+15. Child priority=root priority + update propagation
+16. State immediate nonrollback + open Step producer association
+17. Artifact schema has no metadata soft-delete column
+18. Runner invariants/indexes
+19. External Task lease finite/config snapshot + expiry boundary
+20. Lease claimant_key exact actor principal + submit ownership check
+21. Human immutable
+22. Idempotency request hash/scope/no-reserved/recheck/expiry boundary + canonical actor principal
+23. concurrency scope=(workflow_id,group)
+24. mixed max-runs conservative capacity + waiter ordering by concurrency_queued_at/paused waiter exclusion
+25. Manual Retry concurrency reacquire/output clear atomicity
+26. submit+claim_next atomic same claimant
+27. Result Reuse identities
+28. Child-first Retention
+29. migration verification
+30. Payload/Artifact crash consistency
