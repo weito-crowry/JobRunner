@@ -1,12 +1,12 @@
 # 01. Workflow Definition 詳細設計
 
-- Status: Draft v1.2
+- Status: Draft v1.3
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 
 ## 1. 目的
 
-JobRunner の Workflow YAML、型、JSON Schema、canonical serialization、Action/Validator定義、設定継承、priority、reload、Job fieldの正規契約を定義する。
+JobRunner の Workflow YAML、型、JSON Schema、canonical serialization、Action/Validator定義、設定継承、priority、concurrency、reload、Job fieldの正規契約を定義する。
 
 ## 2. MVP Python / OSS依存
 
@@ -184,6 +184,10 @@ concurrency:
 - case-sensitive exact
 - max-runs 1..signed64 max
 - on-limit queue|reject
+- scope key=`(workflow_id, resolved group)`
+- **別Workflow IDの同じgroup文字列は競合しない**
+- 同じWorkflow ID/groupのactive Runだけをmax-runs対象にする
+- Definition更新でactive Runとcandidateのmax-runsが異なる場合は`08`のconservative capacity規則を使う
 
 ## 11. System Workflow Defaults / Workflow `settings`
 
@@ -248,7 +252,7 @@ retention:
 
 Root Run effective runtime settings/RetentionはこのSystem baseline snapshot + Workflow Definition settingsから算出する。
 
-Reusable Childは**binding作成時のcurrent System configを読み直さず、Parent Workflow Runの `system_workflow_defaults_json` を継承**してChild settings/Retentionを算出する。これにより、Root Run開始後のSystem config変更で同一Run lineageのChild挙動が変わらない。Exact rules=`06`。
+Reusable Childはbinding時のcurrent System configを読み直さず、Parent Workflow Runの `system_workflow_defaults_json` を継承してChild settings/Retentionを算出する。Exact rules=`06`。
 
 ### 11.2 Effective runtime setting
 
@@ -311,21 +315,24 @@ YAMLはAction/Validator **IDだけ**を指定し、versionは親RegistryからRu
 MVP Registryは各Processで:
 
 ```text
-action_id -> exactly one current {version, callable, metadata}
+action_id -> exactly one current {version, callable, uses_runtime, metadata}
 validator_id -> exactly one current {version, callable}
 ```
 
 - ID/versionはnon-empty string
+- `uses_runtime` boolean、default false
 - 同一Processで同じIDの二重登録はreject
 - Coreは同一IDの複数historical callableを自動保持しない
 - Run start時にcurrent versionをsnapshot
 - Retry/Resume/Runner executionはsnapshot versionとcurrent Registry versionのexact一致を要求
+- `uses_runtime`や実装を同じversionのまま変更した場合は親責任
 - version不一致は`action_version_mismatch|validator_version_mismatch`
-- 同じversionのまま実装を変えた場合は親責任
+
+Action invocation exact contract=`04`。CoreはsignatureからRuntime Handle要否を推測しない。
 
 同時に旧/new implementationを提供したい親は別Action/Validator IDを使う。Multi-version RegistryはMVP外。
 
-Validator:
+ValidatorはMVPでは同期・軽量 callable:
 
 ```python
 def validate_result(value, input_data) -> ValidationResult: ...
@@ -333,7 +340,7 @@ def validate_result(value, input_data) -> ValidationResult: ...
 
 ValidationResult=`valid`, optional code/message/details, retryable defaultfalse。
 
-Read-only、Secret/Runtime Handle無し、heavy validationはnormal Job、exception=`validator_exception`。
+Read-only、Secret/Runtime Handle無し、heavy/async validationはnormal Job、exception=`validator_exception`。
 
 ## 14. Job共通field
 
@@ -437,7 +444,7 @@ Reusable:
 4. Parent Attempt PayloadStore
 5. Parent Job success
 
-Human: approve時Output=`null`をそのままParent Attempt Outputとして保存し、Schema/Validator/success_ifは持たない。
+Human: approve時Output=`null`をParent Attempt Outputとして保存し、Schema/Validator/success_ifは持たない。
 
 ## 16. Executor constraints
 
@@ -500,8 +507,10 @@ Allowed keysはこの2つだけ。
 Effective:
 
 ```text
-Job external value > Workflow effective settings > Run system baseline > canonical default
+Job external value > Workflow Run effective setting
 ```
+
+Workflow Run effective settingはWorkflow setting > Run system baseline > canonical defaultで既にsnapshot済み。
 
 - lease-minutes finite positive
 - on-lease-expiry requeue|fail
@@ -561,7 +570,7 @@ Run start:
 - System workflow defaults snapshot
 - default/explicit Runner Pool
 - priority resolution
-- concurrency
+- concurrency scope/admission
 - Reusable refs
 - effective settings/retention
 - Authorization
@@ -580,14 +589,15 @@ FailureならRun row無し。
 8. default_runner_pool snapshot/runs-on resolution
 9. root priority request override/definition default
 10. Child priority inheritance/root update propagation
-11. Job outputs.schema exact shape + Human/Reusable boundary
-12. Registry one-current-version/duplicate reject/version mismatch
-13. runtime setting inheritance
-14. External lease hierarchy
-15. progress/log setting validation
-16. Secret full-scalar
-17. retention inheritance
-18. reload valid/invalid/refresh
-19. concurrency identity
-20. arbitrary Output/spill
-21. deterministic hash
+11. concurrency scope=(workflow_id,group)
+12. mixed max-runs delegates to `08` conservative admission
+13. Job outputs.schema exact shape + Human/Reusable boundary
+14. Registry one-current-version/uses_runtime metadata/version mismatch
+15. runtime setting inheritance
+16. External lease hierarchy
+17. progress/log setting validation
+18. Secret full-scalar
+19. retention inheritance
+20. reload valid/invalid/refresh
+21. arbitrary Output/spill
+22. deterministic Definition hash
