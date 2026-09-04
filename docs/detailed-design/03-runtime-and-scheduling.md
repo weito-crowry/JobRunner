@@ -1,6 +1,6 @@
 # 03. Runtime / Scheduling 詳細設計
 
-- Status: Draft v1.1
+- Status: Draft v1.2
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `02`, `04`, `05`, `08`, `09`, `10`
@@ -47,11 +47,11 @@ Start transaction:
 - Run Definition/Input/effective settings/Retention snapshot
 - Action/Validator version snapshot
 - concurrency snapshot
-- **static non-dynamic Jobの`job_runs` rowだけ**作成
+- static non-dynamic Jobの`job_runs` rowだけ作成
 - Event
 - optional idempotency result
 
-Dynamic templateはDefinition snapshotに存在する仮想groupであり、Run startでは`job_runs` rowを作らない。Expansion時にgenerated concrete Jobだけを作る。Group stateは`05/08`から導出。
+Dynamic templateはDefinition snapshotに存在する仮想group。Run startで`job_runs` rowを作らず、Expansion時にgenerated concrete Jobだけを作る。Group stateは`05/08`から導出。
 
 Static Job rowは最初`status=queued, ready_at=NULL`。Runner取得可能ではない。
 
@@ -59,31 +59,11 @@ Concurrency `queue|reject` は`08`。
 
 ## 4. Status / readiness
 
-Workflow:
+Workflow=`queued|running|paused|completed`、Conclusion=`success|failure|cancelled`。
 
-```text
-queued|running|paused|completed
-```
+Concrete Job=`queued|running|waiting_external|waiting_review|waiting_child|completed`、Conclusion=`success|failure|cancelled|skipped|blocked`。
 
-Conclusion:
-
-```text
-success|failure|cancelled
-```
-
-Concrete Job:
-
-```text
-queued|running|waiting_external|waiting_review|waiting_child|completed
-```
-
-Conclusion:
-
-```text
-success|failure|cancelled|skipped|blocked
-```
-
-Dynamic template groupのstatus/conclusionは`05`で別途導出し、Job rowへ保存しない。
+Dynamic template groupのstatus/conclusionは`05`で導出しJob rowへ保存しない。
 
 Queued concrete Job:
 
@@ -101,65 +81,56 @@ Queued concrete Job:
 4. condition dependency set terminal
 5. current contextでJob `if`評価
 
-### `if=false`
+`if=false` -> Attempt無しで`completed/skipped`。
 
-Attempt無しでJob=`completed/skipped`。
+`if=true`:
 
-### `if=true`
-
-1. `continue-on-error`評価/snapshot
-2. `with` -> `02` persistent Input/bindings/digest
+1. continue-on-error snapshot
+2. `with` -> persistent Input/bindings/digest
 3. executor別activation
 
 Internal:
 
-- pending snapshotをJob rowへ保存
-- `ready_at=now`
+- pending snapshotをJob row
+- ready_at=now
 - status queued
 - Attempt無し
 
 External:
 
-- Attemptへsnapshot
-- Task作成
-- Attempt Execution Log
+- Attempt snapshot
+- Task + Log
 - waiting_external
 
 Human:
 
-- Attemptへsnapshot
-- Review作成
-- Log
+- Attempt snapshot
+- Review + Log
 - waiting_review
 
 Reusable:
 
-- binding確定
-- Attemptへsnapshot
-- Child Run作成
-- Log
+- binding
+- Attempt snapshot
+- Child + Log
 - waiting_child
 
 Pre-Attempt Input/condition failureはJob-level failure。Input snapshot無しならManual Retry不可。
 
 ## 6. Dynamic template activation
 
-RuntimeはDefinition snapshotから未確定Dynamic templateを探索する。
+RuntimeはDefinition snapshotから未確定Dynamic templateを探索。
 
-Activation単位:
-
-- Root: template + Workflow Run
+- Root: template + Run
 - Nested: template + each parent generated Job
 
-Dependencies terminal後、`05`どおり `if -> foreach -> key/order -> atomic expansion`。
+Dependencies terminal後`05`のif/foreach/key/order/atomic expansion。
 
-Dynamic template自身のAttempt/Execution Log/Retry targetは作らない。Expansion failureは`dynamic_expansions.failure_json` + Workflow failureで表現し、Attempt無しなので`wf_retry`直接対象にはならない。
-
-Generated concrete Jobは通常§5のJob activationへ進む。
+Template自身のAttempt/Execution Log/Retry target無し。Expansion failureは`dynamic_expansions.failure_json` + Workflow failure。Generated concrete Jobは通常§5へ。
 
 ## 7. Selection order
 
-Internal/External共通ordering軸:
+Internal/External共通:
 
 1. Workflow priority DESC
 2. Job priority DESC
@@ -172,25 +143,13 @@ InternalはPool exact一致。External claimも同ordering。
 
 ## 8. Atomic internal claim
 
-Candidate:
+Candidate=`internal + queued + ready_at + due + pending snapshot + same Run running internal無し + Pool一致`。
 
-```text
-executor=internal
-status=queued
-ready_at non-NULL
-retry_not_before NULL or <=now
-pending snapshot present
-same Run running internal無し
-Pool一致
-```
-
-1 transactionでJob running + new Attempt snapshot copy + Runner ownership + Log/Event。
-
-Attempt作成後pending snapshotをclear。
+1 transactionでJob running + new Attempt snapshot copy + Runner ownership + Log/Event。Attempt後pending clear。
 
 ## 9. Queued Retry activation for non-internal executor
 
-External/Human/Reusable Retryは`10`により:
+External/Human/Reusable Retryは:
 
 ```text
 status=queued
@@ -199,49 +158,32 @@ pending snapshot present
 retry_not_before NULL or <=now
 ```
 
-となる。
+SchedulerはPause/Cancel gate後、`with`を再評価せずpending snapshot exact copyでnew Attempt。
 
-Runtime schedulerはPause/Cancel gateとdueを確認し、**`with`/Inputを再評価せずpending snapshotをexact copy**してnew Attemptを作る。
+- external -> Task/waiting_external
+- human -> Review/waiting_review
+- reusable -> same binding Child/waiting_child
 
-- external -> new Task, waiting_external
-- human -> new Review, waiting_review
-- reusable -> same bindingでnew Child Run, waiting_child
-
-Attempt作成後pending snapshot clear。
-
-これらはRunner Poolを消費しない。
+Attempt後pending clear。Runner非消費。
 
 ## 10. Maintenance Loop
 
 Workflow Scheduler/Cronではなく期限/housekeeping専用。
 
-対象:
+対象=`retry_not_before`, Lease expiry, concurrency wake, Retention, orphan cleanup, idempotency cleanup。
 
-```text
-retry_not_before
-external lease expires_at
-concurrency wake
-retention due
-orphan cleanup
-expired idempotency cleanup
-```
+Nearest deadline + condition/event wait。Default max sleep5秒。
 
-Nearest deadline + condition/event wait。Busy loop禁止。
-
-Default `maintenance_max_sleep_seconds=5`、finite positive configurable。
-
-Retry dueはJobを新Attempt無しでwake。External LeaseはPause中もclock継続。Retentionは`01/08/09`。
-
-Restart時overdue Retry/Lease、consistency cleanup、due Retentionを先処理。
+Pause中Lease/Retention継続。Restart時overdue/cleanup/Retention先処理。
 
 ## 11. Terminal後activation
 
-Terminal transition後idempotentに:
+Idempotentに:
 
-- downstream concrete Job activation
-- Dynamic expansion/group propagation
-- Reusable parent propagation
-- Result Reuse pending check
+- downstream concrete Job
+- Dynamic group/expansion
+- Reusable parent
+- Result Reuse pending
 - Workflow Output/conclusion
 - concurrency release
 - Workflow progress再計算
@@ -261,69 +203,54 @@ validator_identity
 reuse_eligible
 ```
 
-Direct Artifact identity=`artifact_id + optional digest`、dependency/name順canonicalization。
+Direct Artifact identity=`artifact_id + optional digest`をdependency/name順canonicalize。
 
 Executor identity:
 
 - internal: Action ID/version
 - external: `jobrunner.external_llm.v1`
 - human: `jobrunner.human.v1`
-- reusable: Child Definition hash + Child Action/Validator versions
+- reusable:
+  - Child Definition hash
+  - Child Action versions
+  - Child Validator versions
+  - Child effective settings JSON
+  - Child retention policy JSON
 
 Validator identity=none null or ID/version。
 
+Reusable bindingのSystem-derived settingsもidentityへ含めるため、同じChild Definitionでも実行条件が違うbindingを同一結果扱いしない。
+
 ## 13. Reuse eligibility
 
-原則eligible。ただし:
+原則eligible。ただしRuntime `state.get`、persistent Input/direct upstream以外Artifact materialize、executor extension falseでineligible。
 
-- Runtime Handle `state.get`
-- persistent Input/direct upstream以外Artifact materialize
-- executor extension explicit false
-
-ならineligible。
-
-Expression `state`が`with`ならinput digestへ、`if`ならcurrent再評価へ反映するのでそれだけでineligibleではない。
+Expression stateがwithならInput digest、ifならcurrent再評価へ反映するのでそれだけでineligibleではない。
 
 ## 14. Manual Retry後successful Job strict reuse
 
-保存済みInputだけ比較しない。Current dependenciesから副作用無しで再計算:
+Current dependenciesから副作用無しで:
 
-1. dependency set terminal待ち
-2. current Job `if`、true必須
-3. current `with` -> expected persistent Input/bindings/digest（Secret value未materialize）
-4. expected digest == stored successful Attempt digest
-5. current direct upstream Artifact identities一致
+1. dependency terminal
+2. current if=true
+3. current with -> expected persistent Input/bindings/digest
+4. digest一致
+5. direct Artifact一致
 6. Definition/executor/Validator identity一致
-7. current Registry snapshot version exact提供
-8. stored Payload/required Managed Artifact integrity/availability
-9. reuse_eligible=true
-10. stored OutputをSchema -> Validator -> success_if -> SecretGuardで再検証
+7. current Registry snapshot version exact
+8. Payload/required Artifact integrity
+9. eligible
+10. stored Output Schema -> Validator -> success_if -> SecretGuard再検証
 
 Pass -> success維持 + `job_result_reused`。
 
-Fail -> same Runでsuccessful Jobを新Input再実行しない。`successful_job_result_not_reusable`, retryable=false, new Workflow Run要求。
-
-Reason detail例:
-
-```text
-condition_changed
-input_changed
-artifact_changed
-validation_changed
-storage_unavailable
-version_unavailable
-ineligible
-```
-
-Secret materialized valueは比較しない。
+Fail -> `successful_job_result_not_reusable`, retryable=false, new Workflow Run要求。Same Runでsuccessful Jobをnew Input自動再実行しない。
 
 ## 15. Dynamic expansion reuse
 
-Manual Retry後completed/success Dynamic groupはGenerated Job reuseより先に`05` expansion reuse check。
+Manual Retry後completed/success Dynamic groupはGenerated Job reuseより前に`05` expansion digest check。Exact matchのみ保持。Mismatch=`dynamic_expansion_not_reusable`。
 
-Exact matchのみ既存expansion保持。Mismatch/error=`dynamic_expansion_not_reusable`, new Run要求。
-
-Whole skipped groupのみ`05/10`規則で未実行として再評価可能。
+Whole skipped groupのみ未実行として再評価可能。
 
 ## 16. Pause / Resume
 
@@ -331,44 +258,24 @@ Pause:
 
 - running internal継続
 - new internal claim/noninternal Retry activation/External claim/Dynamic expansion禁止
-- existing External submit/Human review/started Child進行可
-- Lease expiry/Retention継続
+- existing submit/review/started Child進行可
+- Lease/Retention継続
 
 Resume:
 
-- unactivated `ready_at=NULL` Job/Dynamicをcurrent dependencyから再評価
-- `ready_at!=NULL` queued Jobは**全executorでpending Inputを再評価しない**
-- dueなら§8/§9へ
+- ready_at NULL concrete Job/Dynamicをcurrent dependencyから再評価
+- ready_at non-NULL queued Jobは全executorでpending Input再評価無し
+- dueなら§8/§9
 
 ## 17. Cancel
 
-- cancel_requested
-- queued/waiting cancel
-- External Lease invalidate
-- running internal cancel request
-- Child cancel
-- new activation禁止
-
-`always()`でもcancel後new Job開始無し。
+queued/waiting cancel、Lease invalidate、running internal cancel、Child cancel、new activation禁止。Cancel後alwaysでもnew Job無し。
 
 ## 18. Workflow conclusion
 
-Success:
+Success=required concrete Jobs/groups success、intentional skip、allowed continue-on-error、reuse pending無し。
 
-- required concrete Jobs/groups success
-- intentionally skipped
-- allowed continue-on-error failure
-- reuse pending無し
-
-Failure:
-
-- non-allowed failure/blocked
-- Dynamic expansion/group failure
-- dynamic_expansion_not_reusable
-- Child failure
-- Workflow Output failure
-- successful_job_result_not_reusable
-- engine fatal
+Failure=non-allowed failure/blocked、Dynamic failure/not-reusable、Child failure、Workflow Output failure、successful Job not reusable、engine fatal。
 
 Cancel由来=cancelled。
 
@@ -379,30 +286,30 @@ Concurrency=`08` BINARY group。
 Restart:
 
 - Bootstrap
-- queued pending snapshots復元
-- `ready_at=NULL` concrete Jobだけ通常activation再評価
-- due noninternal Retryを§9で再開
-- running internal -> runner recovery
+- queued pending snapshots
+- ready_at NULL concrete Jobだけ通常activation再評価
+- due noninternal Retry
+- running internal recovery
 - Lease/Review/Child
-- Dynamic expansion/group
-- reuse pending
+- Dynamic/reuse pending
 - Retention
 
 Completed RunはRecoveryだけでreopenしない。
 
 ## 20. 受入条件
 
-1. Dynamic template has no job_runs/Attempt
-2. static job start ready_at NULL
-3. internal initial pending snapshot/claim copy
-4. all-executor Retry queued pending snapshot
-5. noninternal due Retry creates Attempt without with re-eval
-6. Resume preserves all ready pending snapshots
+1. Dynamic template no Job/Attempt
+2. static ready_at NULL
+3. internal pending/claim copy
+4. all-executor Retry pending
+5. noninternal Retry no with re-eval
+6. Resume pending invariant
 7. one-running/ordering/Pool
-8. Maintenance deadlines
-9. strict successful current if/Input/Artifact/version validation
-10. stored Output revalidation
-11. no automatic changed-input rerun
-12. Dynamic expansion reuse gate
-13. state.get/non-input Artifact ineligible
-14. concurrency/recovery idempotency
+8. Maintenance
+9. strict current if/Input/Artifact/version validation
+10. Reusable identity includes Child settings/Retention
+11. stored Output revalidation
+12. no changed-input rerun
+13. Dynamic expansion reuse
+14. state.get/non-input Artifact ineligible
+15. concurrency/recovery idempotency
