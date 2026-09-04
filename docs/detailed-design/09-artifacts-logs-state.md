@@ -1,248 +1,222 @@
 # 09. Artifact / Log / Workflow State 詳細設計
 
-- Status: Draft v0.3
+- Status: Draft v0.4
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `02-expression-and-inputs.md`, `04-runner-and-ipc.md`, `08-persistence.md`
 
 ## 1. 目的
 
-Artifact参照管理、Execution/Event Log、Workflow state、Progress/Step、Run directory、Retentionを定義する。
+ArtifactStore、Artifact参照、Execution/Event Log、Workflow state、Progress/Step、Run directory、Retentionを定義する。
 
-## 2. Artifact責務
+## 2. Artifactの2種類
 
-1. Artifact実体の保存はAction/親システム責任。
-2. Coreはmetadata/生成元/history/referenceを管理。
-3. Artifactは論理immutable。
-4. CoreはURIをfetch/uploadしない。
-5. 小さいJob Output JSONはCore保存。大きいデータはArtifactへ。
+### Managed Artifact
 
-## 3. Artifact model
+ActionがJobRunnerへ明示的に保存を依頼した成果物。Coreの`ArtifactStore`が実体を管理する。
+
+### External Reference Artifact
+
+親システム等が既に保存した成果物へのURI参照。Coreはmetadataのみ管理し実体をfetch/deleteしない。
+
+**Attempt temp directory内のファイルを自動的にArtifact化しない。** 残したいものはActionが明示的に`put_file`するか、親側へ保存してexternal reference登録する。
+
+## 3. ArtifactStore interface
+
+概念:
+
+```text
+put_file(artifact_id, source_path) -> store_key,size,digest
+materialize(store_key, destination_path)
+delete(store_key)
+exists(store_key)
+```
+
+Standard MVP backendは`LocalArtifactStore`。data root配下のdurable `artifacts/`へ保存する。
+
+Backend interfaceは将来S3等へ交換可能。
+
+## 4. Runtime Handle
+
+Internal Action:
+
+```text
+runtime.artifact.put_file(name, relative_work_path, media_type?, metadata?)
+runtime.artifact.register_external(name, uri, media_type?, size?, digest?, metadata?)
+runtime.artifact.materialize(artifact_ref) -> local_path
+```
+
+### `put_file`
+
+- sourceはAttempt work_dirからのrelative path
+- canonicalize後work_dir外へ出るpathはreject
+- RunnerがArtifactStoreへcopyし、size/digestを確定
+- 保存成功後metadata/Eventをcommit
+
+### `register_external`
+
+CoreはURIをfetchしない。
+
+### `materialize`
+
+Managed ArtifactだけをActionのAttempt work_dir配下へmaterializeしlocal pathを返す。Store backendがremoteでも同じAPIを維持する。
+
+External referenceはCore標準でmaterializeせず、Action/親側がURIを解釈する。
+
+## 5. External LLM Artifact
+
+`task_submit.artifacts` はExternal Reference Artifactのみ登録可能。MVP task protocolにbinary uploadを持たせない。
+
+将来Web upload等を追加する場合もArtifactStoreへ明示putする別APIとする。
+
+## 6. Artifact reference shape
 
 ```text
 artifact_id
-workflow_run_id
-job_run_id
-attempt_id
 name
-uri
+storage_kind = managed | external
 media_type optional
 size_bytes optional
 digest optional
-metadata optional
-created_at
-deleted_at optional
+uri optional  # externalのみ
 ```
 
-## 4. 登録
+Managed artifactの`store_key`やfilesystem pathはpublic referenceへ露出しない。
 
-Internal ActionはRuntime Handle、Externalは`task_submit.artifacts`から登録。
+## 7. Current Artifact / generations
 
-CoreはURI実体を必須検査しない。実体保存成功後に登録する責任はAction/親側。
-
-## 5. Current Artifact
+Artifactはimmutable。Retry/re-executionで同じnameを登録してもnew artifact_id。
 
 `needs.<job>.artifacts.<name>`:
 
-1. Jobのcurrent successful Attempt
-2. そのAttemptの非deleted同名Artifactから `created_at, artifact_id` 最新
+1. current successful Attempt
+2. そのAttemptの非deleted同名Artifactから最新
 
-failed/cancelled AttemptのArtifactはcurrentにしない。履歴APIでは全世代参照可能。
+old generationは履歴に残す。
 
-## 6. Dynamic Artifact
+Dynamic groupはfull logical `job_key` map。
 
-full logical `job_key` mapを使う。
+## 8. Artifact retention
 
-```text
-needs.evaluate.artifacts["evaluate[candidate_a]"]["report"]
-```
+Managed:
 
-## 7. Artifact retention
+- retention時ArtifactStore実体をdelete
+- metadataに`data_deleted_at`
+- 必要な履歴metadataは設定に従い保持可能
 
-Core retention対象はmetadata。Artifact実体削除は親責任。
+External:
 
-metadata削除前に `retention_deleted` Event。必要なら `deleted_at` で論理削除後に物理row削除。
+- Coreは外部実体をdeleteしない
+- metadata retentionのみ
 
-## 8. Run directory
+削除Eventを残す。
+
+## 9. Output Payloadとの違い
+
+Job/Workflow JSON Outputは`02/08`のPayloadStoreが自動inline/spillする。
+
+ArtifactはActionが明示的に作る別概念。大きなJSON OutputをActionが手動Artifactへ変換する必要はない。
+
+## 10. Run directory
 
 ```text
 jobrunner-data/
+├─ artifacts/                    # managed durable artifact store
 └─ runs/<workflow_run_id>/
+   ├─ payloads/                  # durable spilled JSON output
    ├─ logs/
    └─ tmp/
 ```
 
-Actionの永続共有領域ではない。
+Filesystem pathにはopaque internal IDを使用。
 
-## 9. Log / temp path
+## 11. Execution Log
 
-YAML Job ID/full Dynamic keyをfilesystem pathへ使わず内部IDを使う。
+Attemptごとにfile。Runnerがstructured log/stdout/stderr/diagnosticを追記。
 
-```text
-runs/<workflow_run_id>/logs/<job_run_id>/<attempt_no>.log
-runs/<workflow_run_id>/tmp/<job_run_id>/<attempt_no>/
-```
+Periodic flush。全量memory保持禁止。
 
-DBにはdata rootからのrelative path。外部入力pathを連結しない。
-
-## 10. Execution Log
-
-Runnerが:
-
-- structured log
-- stdout
-- stderr
-- 必要最小限execution diagnostic
-
-をAttempt logへ追記。
-
-長時間Job向けにperiodic/size-based flushし、全量memory保持禁止。
-
-## 11. Log read
-
-Service `wf_log_read` はattempt IDで:
-
-```text
-metadata
-full read
-offset read
-tail read
-```
-
-を提供。
-
-**`wf_info`へExecution Log本文を埋め込まない。** 外部filesystem path指定readは不可。
+`wf_log_read`でattempt IDからfull/offset/tail read。`wf_info`に本文を埋め込まない。外部path指定read不可。
 
 ## 12. Event Log
 
-append-only structured audit。
-
-代表:
+Append-only structured audit。代表:
 
 ```text
-workflow_started
-workflow_completed
-workflow_paused
-workflow_resumed
-workflow_cancel_requested
-job_ready
-job_started
-job_completed
-attempt_started
-attempt_completed
-step_started
-step_completed
-artifact_registered
+workflow_started/completed
+job_started/completed
+attempt_started/completed
+artifact_registered/artifact_data_deleted
 state_changed
-runner_lost
-runner_restarted
-external_task_created
-external_task_claimed
-external_task_submitted
-human_review_requested
+runner_lost/restarted
+external_task_claimed/submitted
 human_review_submitted
-reusable_binding_created
-child_workflow_started
-child_workflow_completed
-retry_scheduled
-manual_retry_requested
+child_workflow_started/completed
+retry_scheduled/manual_retry_requested
 retention_deleted
 ```
 
-Progress/全log lineをEvent tableへ複製しない。
+Progress/全log lineはEvent tableへ複製しない。
 
 ## 13. Step
 
-Stepは観測単位。`needs` / Runner割当 / independent Retry/timeout / Artifact ownershipを持たない。
+Stepは観測単位。`needs`/Runner割当/independent Retry/timeout/Artifact ownershipなし。
 
-open Step中にcrashした場合、Attempt終端/Recovery時にfailure/incompleteとして閉じる。
+Open Step中crashはAttempt終端/Recovery時にfailure/incompleteへ閉じる。
 
 ## 14. Progress
 
 ```text
-current >= 0
+current >=0
 total optional
 message/unit optional
 ```
 
-`total`ありなら `total>0 && current<=total`。
+Workflow progressは表示用。Dynamic展開で分母増加を許容。Conclusionには使わない。
 
-Workflow Progressは表示用。Dynamic展開で分母増加により割合が下がることを許容。Conclusionには使わない。
+## 15. Workflow state
 
-## 15. Workflow static/mutable values
+`env`: literal-only immutable static values。Secret禁止。
 
-`env` はRun start snapshot、immutable、Secret参照禁止。
-
-Mutable state:
+Mutable:
 
 ```text
 state.get(name)
-state.set(name, value)
+state.set(name,value)
 ```
 
-Core保証:
+Persistent、last-write-wins、revision/history。CAS/atomic increment/distributed lockなし。
 
-- persistence/restart
-- get/set
-- last-write-wins
-- revision
-- append-only history
-
-保証しない: CAS / atomic increment / distributed lock / read-modify-write race防止。
-
-## 16. State history
-
-`set` 1transactionでcurrent update + history insert。
-
-Expression `state.*`はread-only。Job Inputへ解決した値はsnapshot。
+State persistenceはSecretGuard通過必須。
 
 Child Workflowは独立state namespace。
 
-## 17. Temp lifecycle
+## 16. Temp lifecycle
 
-Attempt execution開始時mkdir、終了後success/failure/cancel問わず削除。
+Attempt execution開始時mkdir、終了後削除。
 
-削除失敗:
-
-- Job conclusion変更なし
-- warning/Event
-- maintenance cleanup候補
+Temp cleanup failureはJob conclusion変更なし、warning/Event/maintenance対象。
 
 Tempはsandboxではない。
 
-## 18. Retention
+## 17. Security
 
-既定無期限。
+- `put_file` source pathはwork_dir内限定
+- Managed store key/pathはCore生成
+- Artifact metadata/URIはSecretGuard対象
+- Artifact external URIをCoreがfetchしない
+- Managed Artifact materialize destinationもcurrent work_dir内限定
 
-対象:
+## 18. 受入条件
 
-```text
-Workflow Run records
-Event metadata
-Execution Logs
-Artifact metadata
-Idempotency expired records
-orphan temp/log metadata
-```
-
-独立Schedulerを必須にせずRuntime起動/maintenance hook/明示Serviceから実行。
-
-## 19. Secret / security
-
-Known Secret redaction hookをwrite pipeline入口で適用。ただし変形Secretの完全検出は保証しない。
-
-Execution Log readはAuthorization対象。Definition/Input/EventへSecret平文を書かない。
-
-## 20. 受入条件
-
-1. Artifact current/history
-2. failed Attempt Artifact非current
-3. Dynamic full-key lookup
-4. safe internal-ID path
-5. `wf_info`にLog本文無し
-6. stdout/stderr/flush/tail
-7. Step crash close
-8. state get/set/history/restart
-9. env Secret拒否
-10. temp cleanup
-11. retention Event
+1. managed put_file + immutable generations
+2. work_dir traversal reject
+3. managed materialize
+4. external reference no fetch/delete
+5. External task artifactはreference only
+6. Output PayloadとArtifactの分離
+7. managed retention data delete
+8. Dynamic full-key reference
+9. Log read/path safety
+10. state/history/SecretGuard
+11. temp cleanup
