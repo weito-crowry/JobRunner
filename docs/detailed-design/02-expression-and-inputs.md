@@ -1,50 +1,33 @@
 # 02. Expression / Inputs / Outputs 詳細設計
 
-- Status: Draft v0.4
+- Status: Draft v0.5
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01-workflow-definition.md`
 
 ## 1. 目的
 
-CEL / JMESPath、`${{ ... }}`、Input / Output / Artifact / state / Secret 参照と条件 helper の正規契約を定義する。
+CEL/JMESPath、`${{ ... }}`、Input/Output/Artifact/state/Secret参照とcondition helperの正規契約を定義する。
 
-## 2. 採用実装
-
-Python 3.10+。
+## 2. Expression実装
 
 - CEL: `cel-python >=0.5,<0.6`
 - JMESPath: `jmespath >=1.1,<2`
 
-独自 Expression DSL や親システム任意 callable の CEL 登録は標準機能にしない。
+独自DSLは作らない。
 
 ## 3. 式記法
 
 ```yaml
 if: ${{ needs.validate.outputs.valid == true }}
 with:
-  count: ${{ needs.scan.outputs.count }}
+  value: ${{ needs.scan.outputs }}
   label: "${{ inputs.symbol }}-${{ inputs.timeframe }}"
 ```
 
-scalar 全体が1式なら型保持。文字列埋め込みは string。object/list の暗黙 stringify はしない。
+scalar全体1式は評価結果の型を保持。文字列埋め込みはstring。object/listを暗黙stringifyしない。
 
-## 4. CEL / JMESPath
-
-CEL:
-
-- Job `if`
-- `success_if`
-- Retry `if`
-- `continue-on-error`
-- `foreach / key / order_by`
-- `with`
-- Workflow concurrency `group`
-- Workflow Output mapping
-
-JMESPath は JSON filter/projection 用で、CEL helper `jmespath(value, expression)` としてのみ公開する。
-
-## 5. Context
+## 4. Context
 
 評価場所に応じて:
 
@@ -64,34 +47,23 @@ job
 jobs
 ```
 
-許可されない context の参照は compile/runtime validation error。
+許可外context参照はerror。
 
-## 6. `inputs` / `env`
+## 5. `inputs` / `env`
 
-`inputs` は Run開始時 snapshot。extra Input reject。`null` と `missing` を区別する。
+`inputs`はRun start snapshot。extra reject、null/missing区別。
 
-`env` は immutable static values。`${{ secrets.* }}` を `env` 内では使用禁止。
+`env`はJSON-compatible **literal only**。Expression/Secret参照禁止。
 
-## 7. `secrets`
+## 6. Secrets
 
-MVPで `${{ secrets.* }}` を許可するのは **internal Action Job の `with` のみ**。
+`${{ secrets.* }}` はinternal Action Job `with`だけ。
 
-禁止:
+Persistent Inputにはreference markerだけ。値は各Attempt Action起動直前materialize。
 
-- `env`
-- external/human/reusable `with`
-- Workflow outputs
-- `if`, `success_if`, `continue-on-error`, retry condition
-- concurrency
-- `foreach/key/order_by`
+## 7. `needs`
 
-永続 Job Input には Secret reference marker のみ保存し、値は各 internal Attempt の Action起動直前に materialize する。RetryでSecret値がrotation後の新値になることは許容する。
-
-## 8. `needs`
-
-式から参照する Job/template は `needs` に宣言されていなければならない。
-
-通常 Job:
+通常Job:
 
 ```text
 needs.<job>.status
@@ -99,6 +71,8 @@ needs.<job>.conclusion
 needs.<job>.outputs
 needs.<job>.artifacts
 ```
+
+`outputs`は任意JSON-compatible value。objectの場合のみfield access可能。
 
 Dynamic group:
 
@@ -110,213 +84,197 @@ needs.<template>.outputs
 needs.<template>.artifacts
 ```
 
-- `jobs`: full logical job_key -> `{status, conclusion, outputs, artifacts}`
-- `outputs`: full logical job_key -> output object
-- `artifacts`: full logical job_key -> artifact map
+- `jobs`: full job_key -> `{status, conclusion, outputs, artifacts}`
+- `outputs`: full job_key -> 任意JSON value
+- `artifacts`: full job_key -> named Artifact map
 
-### 8.1 Dynamic group status
+### Dynamic group status
 
-- group activation/expansionがまだ完了していない、またはgenerated Jobにnon-terminalがある: `running`
-- すべての該当expansionが確定し、generated Jobがすべてterminal: `completed`
+- 未確定/non-terminalあり: `running`
+- 全expansion確定 + 全generated Job terminal: `completed`
 
-0件 expansion も expansion確定後は `completed`。
+0件もcompleted。Conclusionは`05`。
 
-Group conclusion は `05` に従う。
+## 8. Nested Dynamic parent
 
-## 9. Dynamic parent edge と条件 helper
-
-Nested Dynamic template の `foreach.parent` は **暗黙の required dependency** として条件評価に含める。ただし YAML `needs` へ同じ parent を重複記載しない。
-
-Nested templateの condition dependency set は:
+`foreach.parent` は暗黙required dependency。Nested condition dependency set:
 
 ```text
 {foreach.parent} ∪ declared needs
 ```
 
-Root Job/template は declared `needs` のみ。
+同じparentを`needs`へ重複記載しない。
 
-これにより `success()/failure()/cancelled()/always()` は Nested Dynamicでも親generated Jobの状態を含めて一貫して評価する。
+## 9. `state`
 
-## 10. `state`
+read-only expression。`state.set`はRuntime Handle。Job Inputへ解決した値はsnapshot。
 
-Workflow Run current state の read-only参照。Expressionから書込禁止。Job Inputへ取り込んだ値は activation 時 snapshot。
-
-## 11. `item` / `iteration`
-
-Dynamic Jobのみ。
+## 10. `item` / `iteration`
 
 `iteration.current`:
 
 ```text
-template_id
-key
-item
-job_key
-source_order
+template_id/key/item/job_key/source_order
 ```
 
-`iteration.parent`:
-
-Rootではnull。Nestedでは直近 parent generated Job の:
+Nested parent:
 
 ```text
-template_id
-key
-item
-job_key
-source_order
-status
-conclusion
-continue_on_error
-outputs
-artifacts
+template_id/key/item/job_key/source_order
+status/conclusion/continue_on_error
+outputs/artifacts
 ```
 
-`iteration.ancestors` は outermost -> direct parent。
+`outputs`は任意JSON value。
 
-## 12. `failure`
-
-Retry conditionで利用:
+## 11. `failure`
 
 ```text
-failure.category
-failure.code
-failure.message
-failure.retryable
-failure.details
+category/code/message/retryable/details
 ```
 
-## 13. `outputs`
+Retry condition等で利用。
 
-`success_if` のみで current Job Output を参照する。
+## 12. `outputs` context
 
-## 14. Workflow Output 用 `jobs`
+`success_if`内のcurrent result。**scalar/list/object/nullすべて許可**。
 
-トップレベル Workflow `outputs` の評価時だけ使用。
-
-```text
-jobs.<job>.status
-jobs.<job>.conclusion
-jobs.<job>.outputs
-jobs.<job>.artifacts
-```
-
-Dynamic templateはgroup shape。
-
-## 15. Job Input 構築
-
-`with`をJSON-compatible objectへ解決する。
+例:
 
 ```yaml
-with:
-  $base: ${{ needs.prepare.outputs.payload }}
-  threshold: 0.8
+success_if: ${{ outputs == true }}
 ```
 
-- `$base`: 0または1個、object必須
-- shallow copy後、明示fieldで上書き
-- deep mergeなし
+```yaml
+success_if: ${{ outputs.failed_count < 3 }}
+```
 
-Secret valueは永続snapshotから除外。
+後者はobject resultの場合。
 
-## 16. Output
+## 13. Workflow Output用 `jobs`
 
-internal/external resultは JSON-compatible object。
+Workflowトップレベル`outputs`評価時のみ。
 
+```text
+jobs.<job>.status/conclusion/outputs/artifacts
+```
+
+## 14. Job Input構築
+
+最終Job InputはJSON-compatible object。
+
+`$base` optional 1個、object必須。shallow copy + 明示field override。deep merge無し。
+
+Retryはpersistent Input snapshotを再利用。
+
+## 15. Job / Workflow Output
+
+Action/External resultとWorkflow OutputはJSON-compatible value。
+
+Canonical JSON条件:
+
+- UTF-8
 - NaN/Infinity禁止
-- optional JSON Schema
-- `success_if` は schema validation 後
-- canonical UTF-8 JSON byte長が上限超過なら `output_too_large`
+- deterministic object serialization可能
+
+Optional JSON Schema validationを適用可能。
+
+### 15.1 Transparent PayloadStore
+
+永続化時にcanonical JSON bytesを計測する。
+
+```text
+size <= output-inline-threshold-bytes
+  -> SQLite inline JSON
+size > threshold
+  -> durable filesystem PayloadStore blob
+```
+
+default threshold = 4MiB。
+
+**これは保存方式の切替でありvalidation上限ではない。**
+
+`needs.*.outputs`, `jobs.*.outputs`, `success_if`, Service APIのOutput readはstorage kindを意識せず同じJSON valueを取得する。
+
+Payload load時はsize/digestを検証し、blob欠落/破損はstructured storage failure。
+
+### 15.2 Retry / Attempt history
+
+OutputはAttempt単位immutable。Failed/cancelled AttemptのOutputはcurrent Job Outputとして公開しない。最新successful AttemptのOutputをcurrentとする。
+
+## 16. Artifact reference
+
+ArtifactはOutputとは別のimmutable成果物。Reference shapeは`09`。
+
+Managed ArtifactはArtifactStore、External ReferenceはURI metadataとして扱う。
 
 ## 17. `continue-on-error`
 
-activation時に booleanへ評価し snapshot。Retryでは再評価しない。
+activation時booleanへ評価しsnapshot。Retryで再評価しない。
 
 利用可能: `inputs/needs/env/state/item/iteration/workflow/run/job`。
 
-`failure/outputs/secrets/jobs`は禁止。
+## 18. Condition helper
 
-## 18. 条件 helper の正規意味
-
-Job/template `if` は condition dependency set がすべてterminalになった後に評価する。
-
-Dependencyが effective success:
+Effective success:
 
 - conclusion=`success`
-- conclusion=`failure` かつそのdependencyの snapshotted `continue-on-error=true`
+- conclusion=`failure` + dependency `continue-on-error=true`
 
-**`skipped` は effective success に含めない。** GitHub Actions寄りに、通常Jobがskipされた場合、そのJobに依存する後段Jobは明示条件がない限り既定 `success()` がfalseとなりskipする。
+`skipped`はeffective successではない。
 
-Helper:
+- `success()`: dependency set全件effective success。空ならtrue
+- `failure()`: non-allowed failure/blockedあり
+- `cancelled()`: Workflow cancelまたはdependency cancelled
+- `always()`: dependencies terminalならtrue。ただしWorkflow cancel後のnew activationは不可
 
-- `success()`: condition dependency set がすべて effective success。空集合ならtrue。
-- `failure()`: non-allowed `failure` または `blocked` が1件以上。
-- `cancelled()`: Workflow cancel requestあり、または dependencyに`cancelled`あり。
-- `always()`: condition dependency set がすべてterminalならtrue。Workflow cancel後の新規開始を許可するものではない。
+未指定`if`は`success()`。
 
-未指定 `if` は `${{ success() }}`。
+通常Job skipped dependency -> downstream default skip。
 
-### 18.1 default condition false
-
-未指定 `if` の場合:
-
-- cancel由来 -> `cancelled`
-- non-allowed failure/blocked -> `blocked`
-- upstream `skipped` が原因 -> `skipped`
-
-明示 `if` がfalseなら `skipped`。ただし Workflow cancel 時は `cancelled`。
-
-### 18.2 Dynamic groupとの違い
-
-Dynamic template groupは、個別generated Jobの一部が`skipped`でも `05` のgroup集約規則によりgroup conclusionが`success`になり得る。後段がtemplate groupを`needs`する場合は、その**group conclusion**に対して通常helperを評価する。
+Dynamic groupは個別skipをgroup aggregateしgroup conclusionがsuccessになり得る。
 
 ## 19. `success_if`
 
-Output validation後:
+ResultのJSON Schema検証後に評価。
 
 - true -> success
 - false -> `success_condition_failed`
 - expression error -> `expression_evaluation_error`
 
+PayloadStoreへの永続化はSecretGuard通過後。`success_if`評価にはActionから返ったin-memory valueを使ってよい。
+
 ## 20. `order_by`
 
-criterionは non-null string または number。同一criterion内は全candidateで同型。bool/object/array/null/混在型は禁止。
+criterionはnon-null string/number。同一criterion内同型。bool/object/array/null/混在は禁止。
 
-同値なら source order、その後 full logical `job_key`。
+## 21. JMESPath
 
-## 21. JMESPath helper
-
-`jmespath(value, expression)`:
-
-- expressionはstring
-- valueはJSON-compatible
-- 戻り値の型制約は利用field側で検証
+`jmespath(value, expression)`。valueはJSON-compatible、expression string。戻り型制約は利用field側。
 
 ## 22. 評価タイミング
 
 | 対象 | 時点 |
 | --- | --- |
-| concurrency group | Workflow Run start前 |
-| Dynamic foreach/key/order_by | expansion時 |
-| Job/template if | condition dependencies terminal後 |
-| continue-on-error | activation時 |
-| with | activation / Attempt1開始前 |
-| Secret value | 各internal Attempt Action起動直前 |
-| Retry if | failed Attempt確定後 |
-| success_if | Output validation後 |
+| concurrency group | Run start前 |
+| Dynamic foreach/key/order | expansion |
+| if | dependencies terminal後 |
+| continue-on-error | activation |
+| with | activation/Attempt1前 |
+| Secret | 各internal Attempt child起動前 |
+| retry if | failed Attempt後 |
+| success_if | result/schema検証後 |
+| Payload persistence | success_if/SecretGuard後 |
 | Workflow outputs | Workflow success確定直前 |
 
 ## 23. 受入条件
 
-1. Secret利用位置制限
-2. env Secret拒否
-3. Dynamic group status/conclusion
-4. Nested parent edgeがcondition helperへ含まれる
-5. parent + declared needs混在
-6. skipped dependencyでdefault downstream skip
-7. continue-on-error failureでeffective success
-8. helper 4種
-9. explicit if false
-10. missing/null/type strictness
-11. full logical job_key参照
-12. order_by型検証
+1. scalar/list/object/null Output
+2. optional JSON Schema各型
+3. 4MiB境界inline/spill
+4. large Output downstream透過参照
+5. blob欠落/破損fail-closed
+6. skipped/default condition
+7. Nested parent helper
+8. Secret利用位置
+9. missing/null/type strictness
