@@ -1,12 +1,12 @@
 # 01. Workflow Definition 詳細設計
 
-- Status: Draft v0.8
+- Status: Draft v1.0
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 
 ## 1. 目的
 
-JobRunner の Workflow YAML、型、JSON Schema、canonical serialization、Action/Validator定義、reload、Workflow単位settingsの正規契約を定義する。
+JobRunner の Workflow YAML、型、JSON Schema、canonical serialization、Action/Validator定義、設定継承、reload、Job fieldの正規契約を定義する。
 
 ## 2. MVP Python / OSS依存
 
@@ -26,7 +26,7 @@ PyPI `cel-python` は cloud-custodian/cel-python。
 
 `ruamel.yaml 0.19.0` は導入上の既知問題を避け対象外。
 
-Process/SQLite/JSON/UUID/hashlibはPython標準libraryを優先。
+Process/SQLite/JSON/UUID/hashlibはPython標準libraryを優先する。
 
 ## 3. YAML基本原則
 
@@ -159,8 +159,6 @@ Output全体object、PayloadStore利用。
 
 Priority=signed64 integer default0。
 
-Concurrency:
-
 ```yaml
 concurrency:
   group: ${{ inputs.symbol }}
@@ -174,9 +172,22 @@ concurrency:
 - max-runs 1..signed64 max
 - on-limit queue|reject
 
-## 11. Workflow `settings`
+## 11. System Runtime Defaults と Workflow `settings`
 
-MVP exact keys:
+System config canonical defaults:
+
+```text
+max_dynamic_jobs = 1000
+external_lease_minutes = 60
+external_on_lease_expiry = requeue
+output_inline_threshold_bytes = 4194304
+execution_log_level = normal
+workflow_progress_mode = auto
+job_progress_mode = auto
+idempotency_ttl_hours = 24
+```
+
+Workflow YAML:
 
 ```yaml
 settings:
@@ -184,6 +195,9 @@ settings:
   external-lease-minutes: 60
   external-on-lease-expiry: requeue
   output-inline-threshold-bytes: 4194304
+  execution-log-level: normal
+  workflow-progress-mode: auto
+  job-progress-mode: auto
   retention:
     run-history-days: null
     execution-logs-days: null
@@ -192,16 +206,29 @@ settings:
     managed-artifact-data-days: null
 ```
 
-### Runtime settings
+Effective runtime setting:
 
-- `max-dynamic-jobs`: integer >=0 signed64, default1000
-- `external-lease-minutes`: finite positive, default60
-- `external-on-lease-expiry`: requeue|fail, defaultrequeue
-- `output-inline-threshold-bytes`: positive signed64, default4MiB
+```text
+Workflow specified value > System config > canonical default
+```
+
+ただしExternal Jobのlease/expiryは§18のJob overrideが最優先。
+
+Validation:
+
+- `max-dynamic-jobs`: integer >=0 signed64
+- `external-lease-minutes`: finite positive number
+- `external-on-lease-expiry`: requeue|fail
+- `output-inline-threshold-bytes`: positive signed64 integer
+- `execution-log-level`: normal|debug
+- `workflow-progress-mode`: auto|none
+- `job-progress-mode`: auto|explicit|none
 
 4MiBはinline/spill thresholdでmax Outputではない。
 
-### Retention settings
+`idempotency_ttl_hours`はSystem configのみ。Workflowから上書きしない。finite positive number。
+
+### 11.1 Retention settings
 
 各retention値:
 
@@ -212,19 +239,17 @@ integer >=1 = 作成/完了基準の日数
 
 System configも同じ5項目を持ち、System defaultは全て`null`。
 
-Effective policyは **Workflow setting（指定項目のみ） > System config > unlimited default**。Workflow Run開始時にeffective retention policyをsnapshotし、そのRunの後続Retentionに使用する。
+Effective policyは **Workflow setting（指定項目のみ） > System config > unlimited default**。Workflow Run開始時にeffective retention policyをsnapshotする。
 
-- run-history-days: Workflow Run DB履歴とそれに必須従属するデータの最大保持期間
+- run-history-days: Workflow Run DB履歴と必須従属data
 - execution-logs-days: Execution Log file
-- event-days:通常Event row
+- event-days: 通常Event row
 - artifact-metadata-days: Artifact metadata/history
 - managed-artifact-data-days: Managed ArtifactStore data
 
 External Reference Artifactの外部実体はretention対象外。
 
-Run historyが先に期限切れになる場合、FK整合上そのRun所有データもRun削除時に削除される。したがって各componentの実効保持期間はrun-history-daysを超えない。
-
-`idempotency` TTLはRetention settingsと別でSystem default24h。
+Run history expiryは各owned componentの最終保持上限。
 
 Unknown settings/retention key reject。
 
@@ -232,11 +257,30 @@ Unknown settings/retention key reject。
 
 Static Job ID `^[A-Za-z_][A-Za-z0-9_-]*$`。`[]/`はDynamic用予約。
 
-needs missing/self/duplicate/cycle reject。foreach.parentもDAG edge。
+`needs` missing/self/duplicate/cycle reject。`foreach.parent`もDAG edge。
 
-## 13. Action / Validator identity
+## 13. Action / Validator Registry identity
 
-Action/Validator ID+version=non-empty string。Registry親bootstrap。Implicit conversion無し。Run start snapshot。
+YAMLはAction/Validator **IDだけ**を指定し、versionは親RegistryからRun start時に解決する。
+
+MVP Registryは各Processで:
+
+```text
+action_id -> exactly one current {version, callable, metadata}
+validator_id -> exactly one current {version, callable}
+```
+
+を持つ。
+
+- ID/versionはnon-empty string
+- 同一Processで同じIDの二重登録はreject
+- Coreは同一IDの複数historical callableを自動保持しない
+- Run start時にcurrent versionをsnapshot
+- Retry/Resume/Runner executionはsnapshot versionとcurrent Registry versionのexact一致を要求
+- version不一致は`action_version_mismatch|validator_version_mismatch`
+- 同じversionのまま実装を変えた場合は親責任
+
+同時に旧/new implementationを提供したい親は別Action/Validator IDを使う。Multi-version RegistryはMVP外。
 
 Validator:
 
@@ -250,14 +294,17 @@ Read-only、Secret/Runtime Handle無し、heavy validationはnormal Job、except
 
 ## 14. Job共通field
 
+Canonical shape:
+
 ```yaml
 jobs:
   example:
     needs: []
-    runs-on: default
     executor: internal
+    runs-on: default
     action: system.example
     validator: domain.validate_example
+    uses: null
     with: {}
     if: ${{ success() }}
     success_if: ${{ outputs.ok == true }}
@@ -265,24 +312,58 @@ jobs:
     priority: 0
     timeout-minutes: 30
     retry: {}
-    outputs: {}
+    outputs:
+      schema: null
+    progress:
+      mode: auto
     foreach: null
     key: null
     order_by: null
     external: null
 ```
 
-- runs-on internal only/non-empty/default pool
-- action internal required
-- validator internal/external optional, human/reusable forbidden
-- with -> Job Input object
-- if boolean default success()
-- success_if internal/external
-- priority signed64
-- timeout internal finite positive only
-- retry -> `10`
-- outputs.schema Draft2020-12
-- external external_llm only
+Unknown Job field reject。
+
+### 14.1 `executor` resolution
+
+YAML `executor`で明示可能なのは:
+
+```text
+internal|external_llm|human
+```
+
+Resolution:
+
+1. `uses` present -> `executor` fieldは省略必須、resolved executor=`reusable`
+2. `uses` absent + `executor` omitted -> resolved executor=`internal`
+3. `uses` absent + explicit executor ->その値
+
+したがってYAMLで`executor: reusable`は書かない。
+
+### 14.2 Job `outputs`
+
+Job result schema設定は:
+
+```yaml
+outputs:
+  schema:
+    type: object
+```
+
+のみ。`outputs` omittedまたは`outputs: {}`はSchema無し。`outputs`内unknown key reject。
+
+SchemaはDraft2020-12。Job Output本体は任意JSON valueであり、GitHub Actions風のname mappingではない。トップレベルWorkflow `outputs`とは別概念。
+
+### 14.3 Job `progress`
+
+```yaml
+progress:
+  mode: auto|explicit|none
+```
+
+`progress` omitted時はWorkflow `settings.job-progress-mode`、未指定ならSystem/default `auto`。
+
+Exact semanticsは`09`。
 
 ## 15. Result validation order
 
@@ -296,58 +377,136 @@ jobs:
 
 ## 16. Executor constraints
 
-Internal: action required; validator/runs-on/timeout optional。
+Internal:
 
-External: validator/external optional; action/uses/runs-on/timeout forbidden。
+- action required
+- validator/runs-on/timeout optional
+- uses/external forbidden
 
-Human: action/validator/uses/runs-on/success_if/external/timeout forbidden。
+External:
 
-Reusable: uses required; action/validator/executor/runs-on/success_if/external/timeout forbidden。
+- validator/external optional
+- action/uses/runs-on/timeout forbidden
 
-## 17. Workflow reload
+Human:
 
-Workflow Definition sourceは**親Process再起動なしでreload可能**にする。
+- action/validator/uses/runs-on/success_if/external/timeout forbidden
+
+Reusable:
+
+- uses required
+- action/validator/executor/runs-on/success_if/external/timeout forbidden
+
+`with/if/continue-on-error/priority/retry/outputs/progress/foreach/key/order_by` は各Executorで共通規則に従い利用可能。
+
+## 17. Secret expression field restriction
+
+`${{ secrets.NAME }}` はinternal Job `with`だけで利用可能。さらにMVPでは**1 scalar全体がSecret参照式である場合だけ**許可する。
+
+Allowed:
+
+```yaml
+with:
+  token: ${{ secrets.API_TOKEN }}
+```
+
+Rejected:
+
+```yaml
+with:
+  auth: "Bearer ${{ secrets.API_TOKEN }}"
+```
+
+Secretを文字列加工したい場合はAction内部で行う。Persistent表現は`02/08/12`。
+
+## 18. External Job override
+
+External Jobのみ:
+
+```yaml
+external:
+  lease-minutes: 120
+  on-lease-expiry: requeue
+```
+
+Allowed keysはこの2つだけ。
+
+Effective:
+
+```text
+Job external value > Workflow settings > System config > canonical default
+```
+
+- lease-minutes finite positive
+- on-lease-expiry requeue|fail
+
+## 19. Workflow reload
+
+Workflow Definition sourceは親Process再起動なしでreload可能。
 
 Standard filesystem WorkflowResolver:
 
 - `wf_definition_list/info` と `wf_start` でsource metadata (`mtime_ns + size`) を確認
-- metadata変化時はfileを再read/parse/validateしてRegistry cacheをreplace
+- metadata変化時はfile再read/parse/validateしてcache replace
 - metadata同一でも親は`WorkflowResolver.refresh(workflow_ref=None)`を明示call可能
-- invalid new YAMLはcacheのold Definitionで黙って実行せず、そのreferenceをvalidation error状態として扱いnew Run startを拒否
+- invalid new YAMLはold Definitionへsilent fallbackせず、そのreferenceのnew Run startを拒否
 - existing Workflow Runは自身のsnapshotを使い影響無し
 
-File watcher/background hot reloadは必須ではない。Python Action/Validator code reloadもJobRunner専用機構を作らず親development autoreloadに任せる。
+File watcher/background hot reloadは必須ではない。Python Action/Validator code reloadもJobRunner専用機構を作らず親development autoreloadへ任せる。
 
-## 18. Definition Snapshot
+## 20. Definition Snapshot
 
 - workflow id/version/name
 - source YAML
 - typed Definition JSON/hash
 - Workflow Input
 - Action/Validator ID+version
+- effective runtime settings
 - effective retention policy
 - optional source_identity
 
-## 19. 検証
+## 21. 検証
 
-Load: YAML1.2、安全性、Pydantic、JSON Schema draft、Input、cycle、numeric、expression、executor/settings。
+Load:
 
-Run start: Input、Registry versions、Pool、concurrency、Reusable、Secret/settings、effective retention。
+- YAML1.2、安全性、Pydantic
+- JSON Schema draft
+- Input
+- needs/foreach cycle
+- numeric/expression
+- executor/field conflicts
+- settings/external/progress
+- Secret placement/full-scalar rule
+
+Run start:
+
+- Input
+- current Registry versions
+- Runner Pool
+- concurrency
+- Reusable refs
+- effective settings/retention
+- Authorization
 
 FailureならRun row無し。
 
-## 20. 受入条件
+## 22. 受入条件
 
 1. YAML1.2 ambiguity
 2. canonical JSON golden
 3. Draft2020-12 only
 4. Input nullable
-5. Registry identity
-6. retention settings inheritance/unlimited
-7. unknown retention key reject
-8. reload valid YAML without process restart
-9. reload invalid YAML blocks new Runs but old Run snapshot continues
-10. explicit refresh
-11. concurrency identity
-12. arbitrary Output/spill
-13. deterministic hash
+5. executor default/internal + uses->reusable resolution
+6. Job outputs.schema exact shape
+7. Registry one-current-version/duplicate ID reject/version mismatch
+8. runtime setting inheritance
+9. External Job lease override hierarchy
+10. progress/log setting validation
+11. Secret full-scalar restriction
+12. retention inheritance/unlimited
+13. reload valid YAML without process restart
+14. reload invalid YAML blocks new Runs but old Run snapshot continues
+15. explicit refresh
+16. concurrency identity
+17. arbitrary Output/spill
+18. deterministic hash
