@@ -1,6 +1,6 @@
 # 04. Runner / IPC 詳細設計
 
-- Status: Draft v0.3
+- Status: Draft v0.4
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `03-runtime-and-scheduling.md`, `08-persistence.md`, `10-retry-recovery-cancel.md`
@@ -186,7 +186,7 @@ Structured IPCは専用pipe。Action stdout/stderrは別captureしてExecution L
 - runtime metadata
 - runtime-only materialized Secret
 
-Secretをdebug dumpしない。
+Runnerはcurrent AttemptでmaterializeしたSecret値のredaction setを保持し、`12`のSecretGuardをLog/structured persistence入口へ適用する。
 
 ## 13. Log / Progress / Step / Artifact / State
 
@@ -194,7 +194,7 @@ Progressは `current>=0`, totalありなら `total>0 && current<=total`。
 
 Step sequenceはRunner側で確定。open StepはAttempt異常終了時に閉じる。
 
-Artifactはmetadata referenceのみ。State操作はcurrent Workflow Run namespaceだけ。
+Artifactはmetadata referenceのみ。State操作はcurrent Workflow Run namespaceだけ。Structured persistenceはSecretGuardを通す。
 
 ## 14. temp directory
 
@@ -213,6 +213,7 @@ jobrunner-data/runs/<workflow_run_id>/tmp/<job_run_id>/<attempt_no>/
 - result受信
 - child exit code 0
 - Output validation / success_if通過
+- SecretGuard通過
 
 failure:
 
@@ -221,6 +222,7 @@ failure:
 - malformed IPC
 - Action exception
 - Output validation/success_if failure
+- `secret_value_persistence_blocked`
 
 ## 16. **Internal Job timeout**
 
@@ -254,15 +256,18 @@ Heartbeat/liveness消失後、`10`がowned running Attemptを `runner_lost` へ�
 
 ## 19. Graceful Parent shutdown
 
+Parentの正常shutdownをWorkflow user cancelと混同しない。
+
 既定:
 
 1. new claim停止
-2. running internal Actionへ **shutdown由来のgraceful cancel request**
-3. bounded grace後も残るAction childはterminate
-4. Attemptは `cancelled` ではなく `runner_shutdown_interrupted` のretryable failureとして確定できるようにし、次回Runtime起動時に通常Retry/Recovery policyへ渡す
-5. Runner stop/reap
+2. Runnerへstop request
+3. running Action childへ終了要求し、bounded grace後は必要ならchild/Runner Processをreap
+4. **Workflow `cancel_requested` は立てない**
+5. shutdown中にrunning Attemptを`cancelled`や`failure`へ確定することを必須にしない
+6. 次回Runtime起動時、旧 `runtime_instance_id` に属する未完了running Attemptを通常のorphan/`runner_lost` Recovery対象として扱う
 
-Parentの正常shutdownをWorkflow user cancelと混同しない。Workflow `cancel_requested` は立てない。
+これにより親アプリrestartは既存のRunner lost/Retry policyに一本化する。
 
 ## 20. 非目標
 
@@ -277,9 +282,10 @@ CPU/RAM/GPU quota、cgroup、Windows Job Object sandboxはMVPなし。任意code
 5. atomic claim
 6. spawn/bootstrap/version
 7. dedicated IPC + stdout/stderr
-8. state/artifact proxy
+8. state/artifact proxy + SecretGuard
 9. internal timeoutのみ
 10. Workflow cancel vs Parent shutdown区別
-11. child crash/fencing
-12. restart suppression
-13. temp cleanup
+11. Parent restart -> runner_lost Recovery
+12. child crash/fencing
+13. restart suppression
+14. temp cleanup
