@@ -1,13 +1,13 @@
 # 02. Expression / Inputs / Outputs 詳細設計
 
-- Status: Draft v0.5
+- Status: Draft v0.6
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01-workflow-definition.md`
 
 ## 1. 目的
 
-CEL/JMESPath、`${{ ... }}`、Input/Output/Artifact/state/Secret参照とcondition helperの正規契約を定義する。
+CEL/JMESPath、`${{ ... }}`、Input/Job Output/Workflow Output/Artifact/state/Secret参照とcondition helperの正規契約を定義する。
 
 ## 2. Expression実装
 
@@ -53,7 +53,7 @@ jobs
 
 `inputs`はRun start snapshot。extra reject、null/missing区別。
 
-`env`はJSON-compatible **literal only**。Expression/Secret参照禁止。
+`env`はJSON-compatible literal-only。Expression/Secret参照禁止。
 
 ## 6. Secrets
 
@@ -88,7 +88,7 @@ needs.<template>.artifacts
 - `outputs`: full job_key -> 任意JSON value
 - `artifacts`: full job_key -> named Artifact map
 
-### Dynamic group status
+Group status:
 
 - 未確定/non-terminalあり: `running`
 - 全expansion確定 + 全generated Job terminal: `completed`
@@ -137,23 +137,18 @@ Retry condition等で利用。
 
 ## 12. `outputs` context
 
-`success_if`内のcurrent result。**scalar/list/object/nullすべて許可**。
+`success_if`内のcurrent Job result。scalar/list/object/nullすべて許可。
 
 例:
 
 ```yaml
 success_if: ${{ outputs == true }}
-```
-
-```yaml
 success_if: ${{ outputs.failed_count < 3 }}
 ```
 
-後者はobject resultの場合。
-
 ## 13. Workflow Output用 `jobs`
 
-Workflowトップレベル`outputs`評価時のみ。
+トップレベルWorkflow `outputs`評価時だけ使用。
 
 ```text
 jobs.<job>.status/conclusion/outputs/artifacts
@@ -167,54 +162,72 @@ jobs.<job>.status/conclusion/outputs/artifacts
 
 Retryはpersistent Input snapshotを再利用。
 
-## 15. Job / Workflow Output
+## 15. Job Output
 
-Action/External resultとWorkflow OutputはJSON-compatible value。
+Action/External Job resultは任意JSON-compatible value:
 
-Canonical JSON条件:
+```text
+null / boolean / number / string / array / object
+```
+
+Canonical JSON:
 
 - UTF-8
 - NaN/Infinity禁止
 - deterministic object serialization可能
 
-Optional JSON Schema validationを適用可能。
+Optional JSON Schema validation。
 
 ### 15.1 Transparent PayloadStore
 
-永続化時にcanonical JSON bytesを計測する。
+Canonical JSON bytes:
 
 ```text
 size <= output-inline-threshold-bytes
-  -> SQLite inline JSON
+  -> SQLite inline
 size > threshold
-  -> durable filesystem PayloadStore blob
+  -> durable filesystem blob
 ```
 
-default threshold = 4MiB。
+Default threshold=4MiB。Validation最大値ではない。
 
-**これは保存方式の切替でありvalidation上限ではない。**
+`needs.*.outputs`, `success_if`, Service Output readはstorage kindを意識せず同じJSON valueを得る。
 
-`needs.*.outputs`, `jobs.*.outputs`, `success_if`, Service APIのOutput readはstorage kindを意識せず同じJSON valueを取得する。
+Blob load時はsize/digest検証。欠落/破損はstorage failure。
 
-Payload load時はsize/digestを検証し、blob欠落/破損はstructured storage failure。
+### 15.2 Attempt history
 
-### 15.2 Retry / Attempt history
+OutputはAttempt単位immutable。Failed/cancelled AttemptのOutputはcurrentとして公開しない。Current Job Outputはcurrent successful Attemptから解決。
 
-OutputはAttempt単位immutable。Failed/cancelled AttemptのOutputはcurrent Job Outputとして公開しない。最新successful AttemptのOutputをcurrentとする。
+## 16. Workflow Output
 
-## 16. Artifact reference
+トップレベルYAML `outputs` は **name -> expression/literal のmapping** なので、Workflow Output全体のcanonical resultはJSON objectになる。
 
-ArtifactはOutputとは別のimmutable成果物。Reference shapeは`09`。
+```yaml
+outputs:
+  score: ${{ jobs.aggregate.outputs.score }}
+  report: ${{ jobs.report.artifacts.report }}
+```
 
-Managed ArtifactはArtifactStore、External ReferenceはURI metadataとして扱う。
+各field値は任意JSON-compatible value。
 
-## 17. `continue-on-error`
+Workflow Output object自体もPayloadStoreのinline/spill規則を使う。
+
+Reusable WorkflowではこのWorkflow Output objectがParent Job Outputになる。
+
+`outputs: {}` または未指定ならWorkflow Outputは `{}`。
+
+## 17. Artifact reference
+
+ArtifactはOutputとは別のimmutable成果物。Managed ArtifactはArtifactStore、External ReferenceはURI metadata。
+
+## 18. `continue-on-error`
 
 activation時booleanへ評価しsnapshot。Retryで再評価しない。
 
 利用可能: `inputs/needs/env/state/item/iteration/workflow/run/job`。
 
-## 18. Condition helper
+## 19. Condition helper
 
 Effective success:
 
@@ -226,31 +239,29 @@ Effective success:
 - `success()`: dependency set全件effective success。空ならtrue
 - `failure()`: non-allowed failure/blockedあり
 - `cancelled()`: Workflow cancelまたはdependency cancelled
-- `always()`: dependencies terminalならtrue。ただしWorkflow cancel後のnew activationは不可
+- `always()`: dependencies terminalならtrue。ただしWorkflow cancel後のnew activation不可
 
 未指定`if`は`success()`。
 
 通常Job skipped dependency -> downstream default skip。
 
-Dynamic groupは個別skipをgroup aggregateしgroup conclusionがsuccessになり得る。
+Dynamic groupは個別skipをaggregateしgroup conclusionがsuccessになり得る。
 
-## 19. `success_if`
+## 20. `success_if`
 
-ResultのJSON Schema検証後に評価。
+ResultのJSON Schema検証後:
 
 - true -> success
 - false -> `success_condition_failed`
 - expression error -> `expression_evaluation_error`
 
-PayloadStoreへの永続化はSecretGuard通過後。`success_if`評価にはActionから返ったin-memory valueを使ってよい。
+Payload persistenceはSecretGuard後。
 
-## 20. `order_by`
+## 21. `order_by` / JMESPath
 
-criterionはnon-null string/number。同一criterion内同型。bool/object/array/null/混在は禁止。
+Order criterionはnon-null string/number、同criterion同型。bool/object/array/null/混在禁止。
 
-## 21. JMESPath
-
-`jmespath(value, expression)`。valueはJSON-compatible、expression string。戻り型制約は利用field側。
+`jmespath(value, expression)`はJSON-compatible valueを対象とする。
 
 ## 22. 評価タイミング
 
@@ -263,18 +274,19 @@ criterionはnon-null string/number。同一criterion内同型。bool/object/arra
 | with | activation/Attempt1前 |
 | Secret | 各internal Attempt child起動前 |
 | retry if | failed Attempt後 |
-| success_if | result/schema検証後 |
-| Payload persistence | success_if/SecretGuard後 |
+| success_if | Job result/schema検証後 |
+| Job Payload persistence | success_if/SecretGuard後 |
 | Workflow outputs | Workflow success確定直前 |
 
 ## 23. 受入条件
 
-1. scalar/list/object/null Output
-2. optional JSON Schema各型
-3. 4MiB境界inline/spill
-4. large Output downstream透過参照
-5. blob欠落/破損fail-closed
-6. skipped/default condition
-7. Nested parent helper
-8. Secret利用位置
-9. missing/null/type strictness
+1. Job Output scalar/list/object/null
+2. Workflow Output always object
+3. optional JSON Schema各型
+4. 4MiB inline/spill
+5. large Output downstream透過参照
+6. blob欠落/破損fail-closed
+7. skipped/default condition
+8. Nested parent helper
+9. Secret利用位置
+10. missing/null/type strictness
