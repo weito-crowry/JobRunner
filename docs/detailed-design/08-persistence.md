@@ -1,13 +1,13 @@
 # 08. Persistence 詳細設計
 
-- Status: Draft v2.1
+- Status: Draft v2.2
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - Canonical JSON: `01` の `jobrunner.canonical-json.v1`
 
 ## 1. 目的
 
-SQLite schema、PayloadStore / ArtifactStore metadata、Input snapshot、Dynamic expansion、Result Reuse、deadline、Retention、Migration、Recovery、Idempotencyを実装可能な正規契約として定義する。
+SQLite schema、PayloadStore / ArtifactStore metadata、Input snapshot、Dynamic expansion、Reusable binding、Result Reuse、deadline、Retention、Migration、Recovery、Idempotencyを実装可能な正規契約として定義する。
 
 ## 2. Storage構成
 
@@ -18,7 +18,7 @@ SQLite
 ├─ Payload metadata
 ├─ Artifact metadata
 ├─ Action/Validator identity
-└─ Dynamic/Reuse/idempotency/retention metadata
+└─ Dynamic/Reusable/Reuse/idempotency/retention metadata
 
 PayloadStore
 └─ large JSON Output blob
@@ -75,15 +75,15 @@ human_reviews
 idempotency_records
 ```
 
-Workflow Definition履歴tableは作らない。実行済みDefinitionは`workflow_runs` snapshot。
+Workflow Definition履歴table無し。実行済みDefinition=`workflow_runs` snapshot。
 
-**Dynamic Job template自体の`job_runs` rowは作らない。**
+Dynamic template自体の`job_runs` rowは作らない。
 
-- Run start時に`job_runs`へ作るのはstatic non-dynamic Jobだけ
-- Dynamic template definitionは`workflow_runs.definition_json` snapshotがSource of Truth
-- Dynamic expansion時にgenerated concrete Jobだけを`job_runs`へinsert
-- Dynamic group status/conclusionはDefinition + `dynamic_expansions` + generated `job_runs`から導出
-- Dynamic templateはRunner/Retry/Attempt/Progress上の実行Jobとして数えない
+- Run start: static non-dynamic Jobだけ`job_runs`
+- Dynamic template definition=`workflow_runs.definition_json`
+- Expansion: generated concrete Jobだけ`job_runs`
+- Dynamic group state=Definition + `dynamic_expansions` + generated Jobs
+- TemplateはRunner/Attempt/Retry/Progress上の実行Jobとして数えない
 
 ## 5. Payload column set
 
@@ -155,7 +155,7 @@ completed_at TEXT NULL
 updated_at TEXT NOT NULL
 ```
 
-Logical pointers=`parent_job_run_id/parent_attempt_id/reusable_binding_id`。Repositoryがsame relationをtransaction内検証する。
+Logical pointers=`parent_job_run_id/parent_attempt_id/reusable_binding_id`。Repositoryがsame relationをtransaction内検証。
 
 Enums/invariants:
 
@@ -174,6 +174,7 @@ child: parent ids/binding non-empty,depth>=1
 `effective_settings_json` exact keys:
 
 ```text
+default_runner_pool
 max_dynamic_jobs
 external_lease_minutes
 external_on_lease_expiry
@@ -183,7 +184,9 @@ workflow_progress_mode
 job_progress_mode
 ```
 
-Retention policy exact keysは`01`の5項目。
+`default_runner_pool`=non-empty registered Pool name snapshot。既存Runはcurrent System default変更の影響を受けない。
+
+Retention policy exact keys=`01`の5項目。
 
 Indexes:
 
@@ -272,34 +275,29 @@ validator pair both NULL or both non-empty
 timeout only internal,finite>0
 ```
 
-### 8.1 Readiness / pending Input invariant
+Internal `runs_on`はJob row作成時にexplicit値またはRun `effective_settings.default_runner_pool`へ**解決済みsnapshot**を保存する。Generated internal JobもExpansion時に同じRun snapshotを使う。
 
-`pending_*`は**executorに関係なく「次のAttempt用snapshot」**を表す。
+### 8.1 Readiness / pending Input
+
+`pending_*`=次Attempt用snapshot。
 
 ```text
-status=queued AND ready_at IS NULL
-  -> pending_input_json/pending_secret_bindings_json/pending_input_digest are NULL
-
-status=queued AND ready_at IS NOT NULL
-  -> pending_input_json/pending_secret_bindings_json/pending_input_digest are all non-NULL
-
-status IN(running,waiting_external,waiting_review,waiting_child,completed)
-  -> pending_* are NULL
+status=queued AND ready_at IS NULL -> pending_* all NULL
+status=queued AND ready_at IS NOT NULL -> pending_* all non-NULL
+status IN(running,waiting_external,waiting_review,waiting_child,completed) -> pending_* all NULL
 ```
 
 意味:
 
-- static non-dynamic Jobの初期dependency待ち: queued + ready_at NULL + pending無し
-- internal初回activation: queued + ready_at有り + pending有り
-- external/human/reusable初回activation:直接Attemptを作るので通常queued-readyを経由しない
-- **全executorのAutomatic/Manual Retry**: queued + ready_at有り + failed Attemptからcopyしたpending有り
-- executor-specific scheduler/Runnerがnew Attemptを作るとpendingをAttemptへexact copyしてclear
+- static initial dependency wait: queued/ready NULL/pending無し
+- internal initial activation: queued/ready/pending有り
+- external/human/reusable initial activation:直接Attempt
+- all executor Retry: queued/ready/pending有り
+- executor-specific activation consumes pending -> Attempt exact copy -> clear
 
-`pending_secret_bindings_json`は`02` canonical array。Secret value無し。
+`pending_secret_bindings_json`=`02` canonical array。Secret value無し。
 
-`current_attempt_id`はlatest created Attemptを指す論理pointerなので、Retry queued中はprior failed Attemptを指したままでよい。New Attempt作成時に更新する。
-
-Progress numeric invariantは`09`。
+`current_attempt_id`はlatest created Attempt。Retry queued中はprior failed Attemptのままでよい。
 
 Indexes:
 
@@ -356,11 +354,7 @@ completed <=> conclusion non-NULL
 
 Pre-Attempt failureはrow無し。
 
-Internal claimはJob pending snapshotをexact copy。External/Human/Reusable初回activationは直接snapshot。Retry時は全executorがJob pending snapshot経由。Secret禁止executorはbindings=`[]`。
-
-```sql
-CREATE INDEX ix_attempts_job ON job_attempts(job_run_id,attempt_no DESC);
-```
+Internal claim=Job pending exact copy。External/Human/Reusable初回=直接snapshot。Retry=全executor pending経由。Secret禁止executor bindings=`[]`。
 
 ## 10. `job_steps`
 
@@ -377,7 +371,7 @@ completed_at TEXT NULL
 UNIQUE(attempt_id,sequence)
 ```
 
-`status=running|completed`, conclusion=`NULL|success|failure|cancelled|incomplete`。
+Status=`running|completed`, conclusion=`NULL|success|failure|cancelled|incomplete`。
 
 ## 11. `dynamic_expansions`
 
@@ -414,9 +408,9 @@ ON dynamic_expansions(workflow_run_id,template_id,parent_generated_job_run_id)
 WHERE parent_generated_job_run_id IS NOT NULL;
 ```
 
-`if=false`=skipped、`foreach=[]`=expanded/count0。Generated concrete Job + source + digest + outcomeは1 transaction。
+`if=false`=skipped、`foreach=[]`=expanded/count0。Generated Job + source + digest + outcome=1 transaction。
 
-Whole skipped group reactivation時はgenerated0のskipped rowをreset/remove可能。Past skipはEventに残す。Expanded rowはsame Runでgenerated setを書き換えない。
+Whole skipped group reactivation時はgenerated0 skipped row reset/remove可。Past skip=Event。Expanded rowはsame Runでgenerated set不変。
 
 ## 12. `reusable_bindings`
 
@@ -432,9 +426,17 @@ child_definition_json TEXT NOT NULL
 child_definition_hash TEXT NOT NULL
 child_action_versions_json TEXT NOT NULL
 child_validator_versions_json TEXT NOT NULL
+child_effective_settings_json TEXT NOT NULL
+child_retention_policy_json TEXT NOT NULL
 created_at TEXT NOT NULL
 UNIQUE(parent_job_run_id)
 ```
+
+`child_effective_settings_json`は`workflow_runs.effective_settings_json`と同shape、`default_runner_pool`含む。
+
+Binding first activation時にChild Workflow settings + current System configから算出し固定する。Parent Retry/new Child Runでは再計算せずbinding snapshotをChild `workflow_runs`へcopyする。
+
+Child retentionもbinding snapshotをcopy。Parent run-history deletionはowned Child subtreeの実効最終上限。
 
 ## 13. `workflow_state` / `workflow_state_history`
 
@@ -488,15 +490,7 @@ data_deleted_at TEXT NULL
 metadata_deleted_at TEXT NULL
 ```
 
-```text
-storage_kind=managed|external
-managed -> store_key non-empty,external_uri NULL
-external -> store_key NULL,external_uri non-empty
-data_deleted_at only managed
-metadata_deleted_at -> current resolution外
-```
-
-Same Attempt/name複数generation可。Current=`created_at DESC,id DESC`。Cross-run ArtifactRef retention pin無し。
+`storage_kind=managed|external`。Managed store_key only、External URI only。Same Attempt/name generation可。Current=`created_at DESC,id DESC`。Cross-run pin無し。
 
 ## 15. `events`
 
@@ -508,21 +502,16 @@ workflow_run_id TEXT NULL REFERENCES workflow_runs(id) ON DELETE NO ACTION
 job_run_id TEXT NULL REFERENCES job_runs(id) ON DELETE NO ACTION
 attempt_id TEXT NULL REFERENCES job_attempts(id) ON DELETE NO ACTION
 runner_id TEXT NULL
-actor_type TEXT NULL
-actor_id TEXT NULL
-source TEXT NULL
-request_id TEXT NULL
+actor_type/actor_id/source/request_id TEXT NULL
 payload_json TEXT NOT NULL
 created_at TEXT NOT NULL
 ```
 
-System retention audit=`retention_deleted|retention_orphan_cleaned`はowner IDs NULL、通常event retention外・MVP無期限。
-
-Indexes by workflow/time and type/time。
+System retention audit=`retention_deleted|retention_orphan_cleaned` owner IDs NULL、通常event retention外・無期限。
 
 ## 16. `execution_logs`
 
-全executorのAttemptに最大1 logical Execution Log。
+全executor Attemptに最大1 logical Log。
 
 ```text
 id TEXT PRIMARY KEY
@@ -536,7 +525,7 @@ deleted_at TEXT NULL
 UNIQUE(attempt_id)
 ```
 
-Internalはclaim時、External/Human/ReusableはAttempt作成時。Path Core生成。Retention後`deleted_at`。
+Internal=claim時、External/Human/Reusable=Attempt作成時。
 
 ## 17. `runners`
 
@@ -556,11 +545,7 @@ stopped_at TEXT NULL
 updated_at TEXT NOT NULL
 ```
 
-Status=`starting|idle|claiming|running|stopping|stopped|lost|restart_suppressed`。
-
-Running -> current pointers non-null。Idle/terminal states -> null。
-
-Unique current slot=`runtime_instance_id,pool_name,runner_id` for active statuses。
+Status=`starting|idle|claiming|running|stopping|stopped|lost|restart_suppressed`。Running=current pointers、idle/terminal=null。Active logical slot unique。
 
 ## 18. `runner_restarts`
 
@@ -597,16 +582,7 @@ updated_at TEXT NOT NULL
 UNIQUE(attempt_id)
 ```
 
-```text
-status=available|leased|completed|cancelled
-lease_seconds finite>0
-on_lease_expiry=requeue|fail
-completed -> completed_at non-NULL
-cancelled -> cancelled_at non-NULL
-available|leased -> terminal timestamps NULL
-```
-
-Task config=activation snapshot。Requeueで変更しない。
+Status=`available|leased|completed|cancelled`。Lease config activation snapshot。Requeueで変更無し。
 
 ## 20. `external_leases`
 
@@ -622,18 +598,7 @@ invalidated_at TEXT NULL
 created_at TEXT NOT NULL
 ```
 
-Status=`active|expired|released|invalidated`。
-
-```sql
-CREATE UNIQUE INDEX uq_external_active_lease
-ON external_leases(task_id)
-WHERE status='active';
-CREATE INDEX ix_external_lease_due
-ON external_leases(expires_at)
-WHERE status='active';
-```
-
-Heartbeat/renew/transfer column無し。
+Status=`active|expired|released|invalidated`。Active one/task partial unique。Due index。Heartbeat/renew/transfer column無し。
 
 ## 21. `human_reviews`
 
@@ -652,11 +617,11 @@ cancelled_at TEXT NULL
 UNIQUE(attempt_id)
 ```
 
-Status=`pending|completed|cancelled`。Outcome=`NULL|approve|reject`。Completed rewrite不可。
+Status=`pending|completed|cancelled`、Outcome=`NULL|approve|reject`。Completed rewrite不可。
 
 ## 22. `idempotency_records`
 
-Completed resultだけ永続化し`reserved` row無し。
+Completed resultだけ、`reserved` row無し。
 
 ```text
 scope TEXT NOT NULL
@@ -670,48 +635,17 @@ expires_at TEXT NOT NULL
 PRIMARY KEY(scope,operation,request_key)
 ```
 
-### 22.1 `request_hash`
+`request_hash`=SHA-256(canonical-json-v1(Service request excluding request_id/transport-only fields))。
 
-```text
-SHA-256(canonical-json-v1(Service request excluding request_id and transport-only fields))
-```
+Scope source=`namespace + operation_resource_key + actor_principal_key + access_scope`をcanonical化/hashしたopaque key。
 
-HTTP path注入resource ID、claim_next、result/artifact metadata等Service意味fieldは含む。Actor/AccessScopeはscope側。
+Flow: optional fast read -> prepare -> `BEGIN IMMEDIATE` -> key/hash recheck -> domain state recheck -> side effect + result row commit。
 
-### 22.2 `scope`
-
-Opaque scope hash source:
-
-```text
-namespace
-operation_resource_key
-actor_principal_key
-access_scope
-```
-
-Actor principalはAdapter/parentが安定供給。AccessScopeはcanonical JSON-compatible。
-
-### 22.3 flow
-
-1. optional fast read
-2. filesystem prepareはtemp/final prepareまで
-3. `BEGIN IMMEDIATE`
-4. key再確認
-5. unexpired same hash -> replay
-6. unexpired different -> conflict
-7. expired -> replace可
-8. domain current state再検証
-9. side effect + completed result row same transaction commit
-
-DB reservation row無し。SQLite write serialization + commit-time recheckでduplicate commit防止。
-
-TTL=`System idempotency_ttl_hours`, default24h。
+TTL=System `idempotency_ttl_hours`, default24h。
 
 ## 23. Concurrency transaction
 
-Dedicated table無し。
-
-Workflow start/slot releaseは`BEGIN IMMEDIATE`でsame BINARY group active holderを再count。
+Dedicated table無し。Workflow start/slot release=`BEGIN IMMEDIATE`でsame BINARY group active holderをrecount。
 
 Active holder=`queued|running|paused`かつ`wait_reason != concurrency`。
 
@@ -719,42 +653,34 @@ Waiting release=`priority DESC,created_at ASC,id ASC`。
 
 ## 24. Result Reuse persistence
 
-Successful Attempt terminal時:
+Successful Attempt terminal時=`reuse_context_json/reuse_key/reuse_eligible`。
 
-```text
-reuse_context_json
-reuse_key
-reuse_eligible
-```
+Manual Retry successful descendantはcurrent if/expected Input/Artifact/validationを再計算。Dynamic successful expansionはexpansion digest exact check。
 
-Context=`03`。
-
-Manual Retry successful descendantはcurrent `if`/expected Input/Artifact/validationを再計算し、stored Inputだけ比較しない。
-
-Dynamic successful expansionは`expansion_digest` exact再検証後にgenerated Job reuseへ進む。
+Reusable executor identityにはChild Definition/Action/Validator versions **+ child effective settings + child retention policy** を含む。
 
 ## 25. Retention / delete order
 
 Policy=`workflow_runs.retention_policy_json`。
 
-- Run: completed_at、non-terminal delete無し
-- Log: close time、running delete無し
-- normal Event: created_at、retention audit除外
-- Artifact data/metadata: created_at + owner non-terminal guard
-- Output Payload: run-historyと共にdelete
-- Cross-run ArtifactRef retention hold無し
+- Run completed_at、non-terminal delete無し
+- Log close time、running delete無し
+- normal Event created_at、retention audit除外
+- Artifact created_at + owner non-terminal guard
+- Output Payload run-historyと共にdelete
+- Cross-run ArtifactRef pin無し
 - External Artifact実体delete無し
 
-Child subtreeは`call_depth DESC`で先に削除。
+Child subtreeは`call_depth DESC`で先に削除。Parent run-history expiryはChild subtree実効上限。
 
 1 Run代表順:
 
 1. descendant Child subtree
 2. external_leases
 3. human_reviews
-4. execution log file/row
-5. Artifact data/row
-6. state history/current
+4. execution log
+5. Artifact
+6. state
 7. normal events
 8. job_steps
 9. external_tasks
@@ -765,60 +691,53 @@ Child subtreeは`call_depth DESC`で先に削除。
 14. Workflow Output blob
 15. workflow_runs
 
-Runner current pointerが残る場合はrepair後。FK無効化禁止。
+Runner current pointerはrepair後。FK無効化禁止。
 
 ## 26. Transaction boundaries
 
-1 DB transaction all-or-nothing:
+1 DB transaction:
 
-- Workflow Run start + optional idempotency result
-- internal claim + Attempt + pending snapshot copy + Runner ownership
-- Dynamic expansion registration
-- state current + history
-- External Lease claim + idempotency result
-- External submit terminal + optional claim_next Lease + full idempotency result
-- Human review first-wins + idempotency result
-- Manual Retry reopen + pending snapshot + idempotency result
+- Workflow Run start + optional idempotency
+- internal claim + Attempt + pending copy + Runner ownership
+- Dynamic expansion
+- state current+history
+- External Lease claim + idempotency
+- External submit + optional claim_next Lease + full idempotency
+- Human review first-wins + idempotency
+- Reusable binding + initial Child Run
+- Manual Retry reopen + pending snapshot + idempotency
 - concurrency holder decision
 
-Payload/Artifact filesystemはprepare/finalize + DB transaction + orphan cleanup。Distributed exactly-once無し。
+Payload/Artifact filesystem=prepare/finalize + DB transaction + orphan cleanup。Distributed exactly-once無し。
 
-## 27. Migration / schema verification
+## 27. Migration / verification
 
 Migration=`migrations/NNN_name.sql`。
 
-Startup:
+Startup: schema read -> duplicate/gap/future reject -> pending sequential -> expected version verify。
 
-1. schema_migrations read
-2. duplicate/gap/unknown future reject
-3. pending sequential apply
-4. expected final version verify
-
-Test=`sqlite_master`/PRAGMAでtable/column/index/FK/checkを実DB検証。
+Tests use`sqlite_master`/PRAGMA for exact table/column/index/FK/check。
 
 ## 28. 受入条件
 
 1. 全18 table exact schema
-2. Dynamic template has no executable job_runs row
-3. effective_settings/retention snapshot
-4. all-executor queued ready/pending invariant
-5. initial noninternal direct activation vs retry queued pending
+2. Dynamic template no job_runs
+3. effective_settings includes default_runner_pool
+4. explicit/omitted runs_on stored resolved
+5. all-executor queued pending invariant
 6. Attempt secret bindings/input digest
-7. Runner/scheduler copies pending snapshot exactly
-8. one-running internal partial unique
-9. noninternal ready queue index
-10. Dynamic expansion digest/unique/skip-empty
-11. Reusable binding/Child unique
-12. State atomic
-13. Artifact/log/common executor schema
-14. Runner liveness/restart invariants
-15. External Task lease config snapshot
-16. active Lease/no renew
-17. Human Review immutability
-18. idempotency request hash/scope/no-reserved/recheck/TTL
-19. submit+claim_next+idempotency single transaction
-20. concurrency transaction
-21. Result Reuse current-context precheck
-22. Child-first Retention
-23. migration future/gap reject
-24. Payload/Artifact crash consistency
+7. noninternal retry ready index
+8. Dynamic expansion digest/unique
+9. Reusable binding Child settings/Retention
+10. Child Retry copies binding settings unchanged
+11. State/Artifact/Log schemas
+12. Runner invariants
+13. External Task lease snapshot
+14. Human immutable
+15. Idempotency request hash/scope/no-reserved/recheck
+16. submit+claim_next atomic
+17. concurrency transaction
+18. Result Reuse identities
+19. Child-first Retention
+20. migration verification
+21. Payload/Artifact crash consistency
