@@ -1,106 +1,130 @@
 # 06. Reusable Workflows 詳細設計
 
-- Status: Draft v0.1
+- Status: Draft v0.2
 - 対象: MVP
 - 上位仕様: `docs/design.md`
-- 関連:
-  - `docs/detailed-design/01-workflow-definition.md`
-  - `docs/detailed-design/02-expression-and-inputs.md`
-  - `docs/detailed-design/03-runtime-and-scheduling.md`
-  - `docs/detailed-design/05-dynamic-jobs.md`
+- 関連: `01-workflow-definition.md`, `02-expression-and-inputs.md`, `03-runtime-and-scheduling.md`, `05-dynamic-jobs.md`
 
 ## 1. 目的
 
-本書は JobRunner における Reusable Workflow の定義、呼び出し、入力・出力、親子 Workflow Run の状態連携、Retry / Cancel / Recovery を定義する。
+Reusable Workflow の参照、親子Workflow Run、Input/Output、Definition binding、Retry/Cancel/Recoveryを定義する。
 
 ## 2. 基本原則
 
-1. Reusable Workflow は MVP から対応する。
-2. 親 Workflow から見た Reusable Workflow は 1 Job として扱う。
-3. 子 Workflow は独立した Workflow Run を持つ。
-4. 親と子の mutable state は共有しない。
-5. データ受け渡しは Input / Output / Artifact の明示 mapping のみとする。
-6. 子 Workflow の定義も Workflow Run 開始時に snapshot する。
-7. 循環参照は開始前または展開時に拒否する。
-8. 深さ自体には固定上限を必須としない。
+1. 親から見るReusable Workflowは1 Job。
+2. 子は独立Workflow Run。
+3. 親子mutable stateは共有しない。
+4. Input/Output/Artifactのみ明示mapping。
+5. 子Definitionもsnapshotする。
+6. Cycleは禁止。固定depth limitはMVP必須にしない。
+7. 親Job Retryでは**最初に確定したChild Definition bindingを再利用**し、変更後のChild YAMLを取り直さない。
 
-## 3. YAML 定義
-
-Job は `uses` で Reusable Workflow を参照する。
+## 3. YAML
 
 ```yaml
 jobs:
   analyze:
-    uses: workflows/analyze.yml
+    uses: ./workflows/analyze.yml
     with:
       document_id: ${{ inputs.document_id }}
 ```
 
-`action` と `uses` は相互排他とする。
+`uses` Jobでは `action/executor/runs-on/success_if/external` 禁止。
 
-以下も同時指定不可とする。
+Dynamic `foreach`と組み合わせ可能。
 
-- `action`
-- `uses`
-- `executor: external_llm`
-- `executor: human`
+## 4. `uses` reference 正規syntax
 
-Reusable Workflow Job では `runs-on` は指定しない。Runner 選択は子 Workflow 内の各 Job が行う。
+`uses`はliteral stringのみ。expressionは禁止。
 
-## 4. Workflow reference
-
-MVP では親システムが解決可能な Workflow ID または相対 path を許可する。
-
-例:
+### relative file
 
 ```yaml
-uses: workflows/common/analyze.yml
+uses: ./workflows/common/analyze.yml
 ```
 
-または:
+- `./`で始まる
+- extension `.yml | .yaml`
+- configured Workflow root内へ正規化する
+- absolute path禁止
+- root外へ出る`..` traversal禁止
+- symlink解決後もroot外なら拒否
+
+### registered Workflow ID
 
 ```yaml
 uses: common.analyze
 ```
 
-canonical な解決方法は `WorkflowResolver` に集約する。
+`./`で始まらない値はWorkflow Registry IDとして扱う。
 
-Workflow YAML 自身が任意 URL を取得する機能は MVP に入れない。
+URL/HTTP/Git referenceをYAMLから直接fetchしない。
 
-## 5. Input
+`WorkflowResolver`はどちらもcanonical `workflow_id`へ解決してcycle検出・bindingに使う。
 
-親 Job の `with` で子 Workflow Input を構築する。
+## 5. Parent Job Input
 
-```yaml
-jobs:
-  child:
-    uses: workflows/child.yml
-    with:
-      symbol: ${{ inputs.symbol }}
-      candidates: ${{ needs.generate.outputs.candidates }}
+`with`をChild Workflow Inputへ解決し、Child Input Schemaで検証する。
+
+Secret referenceは禁止。ChildがSecretを必要とする場合Child自身のinternal Action JobがSecret Providerを使う。
+
+Input invalid時はChild Runを作らずParent Attempt failure。
+
+## 6. Reusable Binding
+
+Parent Jobの**最初のactivation時**にChild referenceを解決し、`reusable_bindings`へ固定する。
+
+保存:
+
+```text
+binding_id
+parent_workflow_run_id
+parent_job_run_id
+workflow_ref_original
+child_workflow_id
+child_workflow_version
+child_definition_yaml
+child_definition_hash
+child_action_versions_json
+created_at
 ```
 
-子 Workflow Input は通常の Workflow Input Schema で検証する。
+### 6.1 binding作成
 
-検証失敗時は子 Workflow Run を作成せず、親 Job を failure とする。
+1. `uses`解決
+2. canonical workflow_id取得
+3. ancestor cycle検証
+4. Child Definition static/runtime validation
+5. Child Action versions解決
+6. bindingを1回だけ保存
 
-## 6. Child Workflow Run 作成
+同一Parent Job Runにbindingは1件。
 
-親 Reusable Workflow Job が ready になったとき、Runtime は以下を atomic に実施する。
+### 6.2 source変更
 
-1. 子 Workflow Definition を解決
-2. 循環参照検証
-3. 子 Workflow Input を評価
-4. 子 Definition / Action / Runner Pool を再検証
-5. 子 Workflow Run を作成
-6. 親 Job Run と子 Workflow Run の relation を保存
-7. 子 Workflow の root Job を activation 対象にする
+Parent Run開始からParent Job初activationまでにChild sourceが変わった場合、初activation時の現行Childがbindingされる。**binding後の変更はParent Job Retryに影響しない。**
 
-親 Job の Attempt ごとに子 Workflow Run は 1 つだけ作る。
+これはParent snapshotにChild全体を前もって埋め込まず、実際に呼ばれた時点で独立Child Runを固定するための規則。
 
-## 7. 親子識別
+## 7. Child Workflow Run作成
 
-子 Workflow Run は少なくとも以下を持つ。
+Parent Attempt開始時、bindingからChild Runを作成する。
+
+同一Parent AttemptにChild Runはexactly one。
+
+Atomic保存:
+
+- Parent Attempt / waiting_child
+- Child Workflow Run
+- parent/child relation
+- Child initial Jobs
+- Events
+
+Childはresolverから再読込せずbindingのDefinition/Action versionsを使用する。
+
+## 8. relation
+
+Child Workflow Run:
 
 ```text
 parent_workflow_run_id
@@ -108,43 +132,31 @@ parent_job_run_id
 parent_attempt_id
 root_workflow_run_id
 call_depth
+reusable_binding_id
 ```
 
-親を持たない通常 Workflow Run では `parent_*` は null。
+Root Runはparent fields null、`root_workflow_run_id=self`、`call_depth=0`。
 
-## 8. Definition Snapshot
+## 9. Child Snapshot
 
-子 Workflow Run も通常 Workflow Run と同じく以下を snapshot する。
+通常Run同様:
 
-- Workflow YAML
-- Definition hash
-- Workflow version
-- Input snapshot
-- Action ID / version
+- binding済みChild YAML/hash/version
+- Child Input
+- Child Action versions
 - optional source_identity
 
-親 Workflow Run の snapshot に子 Workflow の全内容を埋め込む必要はない。
+をChild Runへ保存する。
 
-親子 relation と、それぞれの独立 snapshot を保存する。
+## 10. State / Actor / Scope
 
-## 9. Workflow state
+Child stateは独立namespace。親state直接read/writeは禁止。
 
-子 Workflow Run は独立した state namespace を持つ。
+ActorContext / AccessScopeは親から継承し、権限拡大しない。Child側で狭めることは可能。
 
-禁止:
+## 11. Workflow Output
 
-```text
-child -> parent mutable state direct set
-parent -> child mutable state direct set
-```
-
-必要な値は Input として渡す。
-
-子の計算結果は Output として返す。
-
-## 10. Output
-
-Reusable Workflow は Workflow-level Output を定義可能とする。
+Child YAMLのトップレベル:
 
 ```yaml
 outputs:
@@ -152,66 +164,84 @@ outputs:
   report: ${{ jobs.report.artifacts.report }}
 ```
 
-子 Workflow が success した時点で Workflow Output を評価する。
+`jobs` contextは`02`のWorkflow Output用shape。
 
-親 Job の Output として同じ値を公開する。
+Child success確定直前にOutput mappingを評価しJSON-compatible objectへまとめる。評価失敗はChild `failure/workflow_output_invalid`。
 
-親側:
+Parent Job success時、そのobjectをParent Job Outputとして公開する。
 
-```yaml
-with:
-  score: ${{ needs.child.outputs.score }}
-```
+Artifact referenceも同じOutput object内またはParent Job Artifact mappingとして扱える。
 
-Artifact 参照も同様に明示 mapping する。
+## 12. Conclusion propagation
 
-## 11. Conclusion propagation
-
-子 Workflow Run の conclusion と親 Job の conclusion は原則連動する。
-
-| Child conclusion | Parent Job conclusion |
+| Child | Parent Job |
 | --- | --- |
 | success | success |
-| failure | failure |
+| failure | failure (`child_workflow_failed`) |
 | cancelled | cancelled |
 
-子 Workflow 内の `continue-on-error` は子 Workflow 自身の最終 conclusion 算出に反映された後、親へ伝播する。
+Parent Jobの`continue-on-error`はこのParent conclusionへ通常規則として適用される。
 
-## 12. Retry
+## 13. Retry
 
-親 Job を Retry した場合、新しい Attempt を作成し、その Attempt に対して新しい子 Workflow Run を作る。
+Parent failed Job manual/auto Retry:
 
-既存の子 Workflow Run は書き換えない。
+- new Parent Attempt
+- **既存Reusable Bindingを使用**
+- new Child Workflow Run
+- Parent Input同一
+
+過去Child Runは履歴として保持する。
 
 ```text
 Parent Job
-├─ Attempt 1
-│  └─ Child Workflow Run A -> failure
-└─ Attempt 2
-   └─ Child Workflow Run B -> success
+├─ Attempt 1 -> Child A failure
+└─ Attempt 2 -> Child B success
 ```
 
-Retry Input は元親 Job Inputと同一とする。
+Child source/action versionがbinding後に変わり、現在RegistryがbindingされたAction versionを提供できない場合は`action_version_mismatch`でfail-closed。新Child Definitionへ自動upgradeしない。
 
-## 13. Cancel
+## 14. Cancel
 
-親 Workflow Run または親 Job が cancel された場合、実行中の子 Workflow Run へ cancel を伝播する。
+Parent Workflow Run/Parent Job cancelはcurrent Childへ伝播。
 
-子 Workflow Run の graceful cancel 規則は通常 Workflow Run と同じ。
+Child cancelは通常graceful cancel。
 
-子だけを cancel する管理 API を提供するかは Service API 詳細設計に委ねるが、MVP では親子整合性を優先し、親 Job を経由した cancel を基本とする。
+### public direct control
 
-## 14. Pause / Resume
+MVPでは`parent_workflow_run_id != null`のChild Workflow Runへのpublic:
 
-親 Workflow Run が pause されても、すでに開始済みの子 Workflow Run内で実行中の Job は停止しない。
+```text
+pause
+resume
+cancel
+retry
+priority update
+```
 
-ただし親側で新規 Child Workflow Run を開始しない。
+を拒否する。
 
-子 Workflow Run 自身の pause 状態は独立管理できる。
+code:
 
-## 15. 循環参照
+```text
+child_run_direct_control_forbidden
+```
 
-以下を禁止する。
+read/info/log/artifact参照はAuthorization範囲内で許可。
+
+理由はParent Job stateとの不整合を避けるため。内部のParent propagation操作は許可する。
+
+## 15. Pause
+
+Parent Pauseは**開始済みChildへ伝播しない**。Child内running/queued JobはChild自身のSchedulingに従って進行できる。
+
+ただしParent Pause中は新しいParent Job / new Child Runを開始しない。
+
+Child自身をpublic pauseするAPIはMVPでは禁止（前節）。
+
+## 16. Cycle / depth
+
+禁止:
 
 ```text
 A -> A
@@ -219,105 +249,88 @@ A -> B -> A
 A -> B -> C -> A
 ```
 
-Workflow Definition load 時に静的解決できる範囲は事前検出する。
+canonical workflow_idのancestor chainでChild開始前に検査。`call_depth`保存。
 
-動的 resolver を用いる場合も Child Run 作成直前に ancestor chain を検査する。
+fixed depth limitは置かないが、cycle無しでもOS/DB資源を無限利用できるわけではなく各WorkflowのDynamic limit等は別途適用される。
 
-cycle 検出時は `workflow_cycle_detected` failure とする。
-
-## 16. 深さ
-
-固定 depth limit は MVP の必須制約にしない。
-
-ただし `call_depth` は保存し、将来 system setting で上限を導入できる構造にする。
-
-## 17. Dynamic Job との組み合わせ
-
-Reusable Workflow Job に `foreach` を付けることを許可する。
+## 17. Dynamic Jobとの組合せ
 
 ```yaml
 jobs:
   evaluate:
     foreach: ${{ needs.generate.outputs.items }}
     key: ${{ item.id }}
-    uses: workflows/evaluate-one.yml
+    uses: ./workflows/evaluate-one.yml
     with:
       item: ${{ item }}
 ```
 
-生成された各 Job が独立した Child Workflow Run を持つ。
+Generated Jobごとに独立binding/Child Runを持つ。Nested Dynamicにも同じ規則。
 
-Dynamic Job 総数上限 1000 は Reusable Workflow Job にも適用する。
+Dynamic Job数1000制限はParent Run generated Job数へ適用。Child内generated JobはChild Run自身で数える。
 
-子 Workflow 内でさらに Dynamic Job を生成してよい。
+## 18. Child concurrency
 
-## 18. Concurrency
+Childは自身のWorkflow concurrencyを持つ。Parent groupを自動継承しない。
 
-子 Workflow は自身の `concurrency` 設定を持てる。
+Childがconcurrency waitになってもParent Jobは`waiting_child`を維持する。
 
-親の concurrency group を自動継承しない。
+## 19. Recovery
 
-必要なら親 Input から同じ値を子へ渡し、子 Definition 側で同じ group を構築する。
+Runtime再起動後:
 
-## 19. Authorization / Actor
+- Parent Attempt + binding + Child relation復元
+- Child runningなら通常Recovery
+- Child completedならParent未反映結果をidempotentに伝播
+- same Parent AttemptへChild重複作成禁止
+- Retry時もbindingをresolverで差し替えない
 
-子 Workflow Run は親 Workflow Run の Actor / AccessScope を引き継ぐ。
+## 20. Persistence uniqueness
 
-子の Service operation も AuthorizationProvider を必ず通す。
+- one binding per `parent_job_run_id`
+- one Child Run per `parent_attempt_id`
 
-## 20. Event Log
+をDB unique constraintで保証する。
 
-少なくとも以下を記録する。
+## 21. Events
 
 ```text
-child_workflow_requested
+reusable_binding_created
 child_workflow_started
 child_workflow_completed
 child_workflow_cancel_propagated
 child_workflow_cycle_rejected
+child_workflow_direct_control_rejected
 ```
-
-Event には親 Job / Attempt と子 Workflow Run の ID を含める。
-
-## 21. Recovery
-
-Runtime 再起動後は親 Job と子 Workflow Run relation をDBから復元する。
-
-- 子が running なら通常 recovery を継続
-- 子が completed なら親 Job の未確定状態を再評価
-- 親 Attempt が terminal なのに新しい子を生成しない
-- 同一 parent Attempt に子 Workflow Run を重複生成しない
 
 ## 22. Failure code
 
-代表 code:
-
 ```text
 workflow_not_found
+workflow_reference_invalid
 workflow_input_invalid
 workflow_cycle_detected
 child_workflow_start_failed
 child_workflow_failed
 child_workflow_cancelled
 workflow_output_invalid
+action_version_mismatch
+child_run_direct_control_forbidden
 ```
 
 ## 23. 受入条件
 
-最低限以下をテストする。
-
-1. 親 -> 子 Workflow success
-2. 子 failure の親伝播
-3. Input mapping
-4. Output mapping
-5. Artifact mapping
-6. state 非共有
-7. direct cycle 拒否
-8. indirect cycle 拒否
-9. Retry で新 Child Workflow Run
-10. Cancel propagation
-11. Runtime restart 後の relation 復元
-12. Dynamic Job + Reusable Workflow
-13. nested Reusable Workflow
-14. Child concurrency
-15. duplicate Child Run 防止
+1. file/registered ID reference
+2. URL/absolute/path traversal拒否
+3. binding first activation
+4. binding後source変更でもRetry固定
+5. parent-child success/failure/cancel
+6. Workflow `jobs` output mapping
+7. state isolation
+8. direct/indirect cycle
+9. Retry -> new Child / same binding
+10. public Child control拒否/read許可
+11. Parent Pauseはstarted Childへ非伝播
+12. Dynamic + Reusable
+13. runtime restart duplicate防止
+14. one binding/job + one child/attempt uniqueness
