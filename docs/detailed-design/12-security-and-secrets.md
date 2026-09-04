@@ -1,6 +1,6 @@
 # 12. Security / Secrets 詳細設計
 
-- Status: Draft v1.2
+- Status: Draft v1.3
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `02`, `03`, `04`, `08`, `09`, `11`
@@ -19,14 +19,15 @@
 10. Runner fencing。
 11. Cross-run Artifact accessもAuthorization必須。
 12. Provider/RegistryはProcess-local Integration Bootstrapで再構築。
+13. External Lease ownershipとIdempotency actor isolationは同じcanonical Actor principal identityを使う。
 
 ## 2. Actor / AccessScope
 
 ActorContext:
 
 ```text
-actor_type
-actor_id optional
+actor_type non-empty string
+actor_id optional non-empty string
 source optional
 claims optional
 metadata optional
@@ -37,6 +38,33 @@ AccessScope=parent-defined project/workspace/tenant/resource scope。
 ChildはParent scope継承、権限拡大禁止。Runtime Handle内部operationもcurrent Workflow RunのActor/Scopeを引き継ぐ。
 
 ActorContext/AccessScopeはJSON-compatible persistence-safe dataとし、parentはsession token/password等を入れない。Known Secret値はpersist前SecretGuard対象。
+
+### 2.1 Canonical Actor principal key
+
+Service callerを状態変更・Lease所有者として同一視するcanonical keyを `actor_principal_key` とする。
+
+```text
+principal_source = {
+  "actor_type": actor.actor_type,
+  "actor_id": actor.actor_id,
+  "access_scope": access_scope
+}
+
+actor_principal_key =
+  "apr_" + SHA-256(canonical-json-v1(principal_source)).lowercase_hex64
+```
+
+Rules:
+
+- `source/claims/metadata` はprincipal identityへ含めない
+- 同じ認証主体がMCP/HTTP/Pythonの別Adapterを通っても、親が同じ`actor_type/actor_id/AccessScope`を与えれば同じprincipalになる
+- `actor_id=null`は一般read/writeでは許可できるが、同一主体の復元が必要なExternal Lease ownershipには使わない
+- `wf_task_claim` / `wf_task_submit` / `claim_next` は**non-empty `actor_id`必須**。不足時=`claimant_identity_required`
+- External Lease `claimant_key` はcurrent Service callerの `actor_principal_key` exact value
+- `wf_task_info`でactive `lease_id`を復元できるのはcurrent caller principalとLease `claimant_key`が一致する場合だけ
+- Idempotency scopeの`actor_principal_key`もこの定義を使う
+
+このkeyは認証credentialではない。保存・比較用のopaque identityであり、これ単独でAuthorizationを省略しない。
 
 ## 3. AuthorizationProvider contract
 
@@ -295,6 +323,7 @@ Safe YAML:
 - custom tag/duplicate/merge reject
 - arbitrary include/fetch無し
 - Reusable URL fetch無し
+- JSON Schema external `$ref/$dynamicRef` fetch無し。`01`のlocal fragment policyに従う
 
 ## 18. Arbitrary code / Sandbox
 
@@ -310,31 +339,38 @@ Providerはforbidden/not_found policyを選べる。Error detailsもSecretGuard�
 
 Public state historyで`include_values=true`を使う場合もAuthorization + response size policy適用。SecretGuard済みstateのみが保存される前提だが、AccessScopeによるread制限を省略しない。
 
+External Task infoのactive Lease IDはAuthorizationだけではなく§2.1 claimant一致も必要。他principalのLease IDをread responseへ露出しない。
+
 ## 20. 受入条件
 
 1. Bootstrap/provider boundary
-2. all public read/write Authorization
-3. public state read uses workflow_state.read
-4. Runtime Handle state/artifact operations each invoke Authorization hook
-5. denied Runtime Handle operation has no side effect
-6. telemetry fenced by current Attempt ownership
-7. Secret name/non-empty str
-8. full-scalar-only placement
-9. canonical binding/no value persistence
-10. unique Secret name resolved exactly once per Attempt
-11. same Secret multiple bindings use same value
-12. Retry re-resolves Secret once/name and can rotate
-13. non-empty Secret binding marks reuse ineligible
-14. Action Runner in-memory materialization
-15. Validator no Secret value
-16. Structured SecretGuard targets
-17. Payload spill pre-guard
-18. Managed Artifact byte guard with chunk-boundary match
-19. stdout/stderr byte streaming redaction across chunk boundaries
-20. structured log/progress/Step telemetry redaction
-21. no raw pre-redaction sink
-22. External Artifact no content scan
-23. transformed Secret non-guarantee
-24. same/cross-run Artifact authorization
-25. Reusable scope non-escalation
-26. Runner fencing/path safety
+2. Actor principal canonical hash + source exclusion
+3. task claim/submit requires non-empty actor_id
+4. claimant_key exact principal reuse across adapters
+5. other principal cannot recover active lease_id
+6. Idempotency uses same actor_principal_key definition
+7. all public read/write Authorization
+8. public state read uses workflow_state.read
+9. Runtime Handle state/artifact operations each invoke Authorization hook
+10. denied Runtime Handle operation has no side effect
+11. telemetry fenced by current Attempt ownership
+12. Secret name/non-empty str
+13. full-scalar-only placement
+14. canonical binding/no value persistence
+15. unique Secret name resolved exactly once per Attempt
+16. same Secret multiple bindings use same value
+17. Retry re-resolves Secret once/name and can rotate
+18. non-empty Secret binding marks reuse ineligible
+19. Action Runner in-memory materialization
+20. Validator no Secret value
+21. Structured SecretGuard targets
+22. Payload spill pre-guard
+23. Managed Artifact byte guard with chunk-boundary match
+24. stdout/stderr byte streaming redaction across chunk boundaries
+25. structured log/progress/Step telemetry redaction
+26. no raw pre-redaction sink
+27. External Artifact no content scan
+28. transformed Secret non-guarantee
+29. same/cross-run Artifact authorization
+30. Reusable scope non-escalation
+31. Runner fencing/path safety
