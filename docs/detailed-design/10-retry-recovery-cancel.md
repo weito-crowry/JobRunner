@@ -1,6 +1,6 @@
 # 10. Retry / Recovery / Cancel 詳細設計
 
-- Status: Draft v1.3
+- Status: Draft v1.4
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `02`, `03`, `04`, `05`, `07`, `08`, `11`
@@ -236,7 +236,7 @@ Reopenをcommitする場合、同じtransactionで:
 11. successful Dynamic expansionをreuse check対象
 12. Event/Execution Log/idempotency result
 
-`started_at`は最初のRun開始時刻として保持する。Past Attempt/Job Output/Artifact/Event/Logは削除しない。
+`created_at`は元Run row作成時刻として不変。`started_at`は`03/08`の**最初のConcurrency admission時刻**として保持し、Manual Retry reopenで書き換えない。`completed_at`だけをclearし、再terminal化時に新しい完了時刻を設定する。Past Attempt/Job Output/Artifact/Event/Logは削除しない。
 
 Concurrency queue中でもtarget pending snapshotは保持し、slot取得までnew Attemptを作らない。
 
@@ -356,6 +356,7 @@ Completed RunはRecoveryのみでreopenしない。
 - ready Job Input snapshotを再評価しない
 - admitted paused RunはConcurrency holderを維持する
 - paused Concurrency waiterはslot無し、`concurrency_queued_at`を保持
+- `started_at`はPause/Resumeで変更しない
 
 ## 16. Cancel
 
@@ -366,6 +367,8 @@ Completed RunはRecoveryのみでreopenしない。
 - Child cancel
 - new activation禁止
 - Concurrency holder解放後waiting Runをwake
+
+一度もadmitされていないConcurrency waiterをCancelした場合は`started_at=NULL`のままterminal化してよい。
 
 ## 17. External / Human
 
@@ -379,7 +382,7 @@ Human reject=retryable false defaultだがYAML retry.ifで明示Automatic Retry�
 
 Repeated RecoveryでAttempt/Task/Lease/Review/Dynamic/Child/retry schedule/reuse resultを重複生成しない。
 
-Reopened Runが`wait_reason=concurrency`なら通常のConcurrency waitingとして復元し、pending Job Inputと保存済み`concurrency_queued_at`を再評価/再採番しない。
+Reopened Runが`wait_reason=concurrency`なら通常のConcurrency waitingとして復元し、pending Job Inputと保存済み`concurrency_queued_at`を再評価/再採番しない。`created_at/started_at`も保存済み値を保持する。
 
 ## 19. 受入条件
 
@@ -397,13 +400,14 @@ Reopened Runが`wait_reason=concurrency`なら通常のConcurrency waitingとし
 12. completed Run retry increments run_attempt
 13. completed Run concurrency reacquire queue/reject/available + fresh queue timestamp
 14. reject leaves Run unchanged
-15. reopen clears conclusion/completed/failure/current Workflow Output
-16. target no with/item/version re-eval
-17. Secret value re-materializes but binding fixed
-18. descendant blocked/skipped reactivation
-19. successful Job current-context reuse
-20. Dynamic expansion strict reuse
-21. timeout starts at claim and covers bootstrap through terminal commit
-22. timeout result-before-deadline but commit-after-deadline discarded
-23. cancel/result commit ordering
-24. runner_lost/pause/cancel/recovery idempotency
+15. reopen preserves created_at/started_at and clears conclusion/completed/failure/current Workflow Output
+16. never-admitted cancelled Run may retain started_at NULL
+17. target no with/item/version re-eval
+18. Secret value re-materializes but binding fixed
+19. descendant blocked/skipped reactivation
+20. successful Job current-context reuse
+21. Dynamic expansion strict reuse
+22. timeout starts at claim and covers bootstrap through terminal commit
+23. timeout result-before-deadline but commit-after-deadline discarded
+24. cancel/result commit ordering
+25. runner_lost/pause/cancel/recovery idempotency
