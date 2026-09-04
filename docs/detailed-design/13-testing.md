@@ -1,573 +1,459 @@
 # 13. Testing 詳細設計
 
-- Status: Draft v0.1
+- Status: Draft v0.2
 - 対象: MVP
 - 上位仕様: `docs/design.md`
-- 関連: `docs/detailed-design/01-workflow-definition.md` 〜 `12-security-and-secrets.md`
+- 関連: `01-workflow-definition.md`〜`12-security-and-secrets.md`
 
 ## 1. 目的
 
-本書は JobRunner MVP のテスト戦略、レイヤ分割、必須シナリオ、競合・Recovery・Persistence・MCP・Securityの検証方針を定義する。
+JobRunner MVPのunit/integration/process/E2E/recovery/security/adapter contractテストを定義し、設計上のatomicity/idempotency/fencingを実DB・実Processで検証する。
 
-## 2. 基本原則
+## 2. 原則
 
-1. Runtimeの状態遷移はunit testだけで済ませずintegration testを持つ。
-2. SQLite transaction / concurrencyは実DBで検証する。
-3. Runner / Action Runnerは実Processを使うE2Eを用意する。
-4. External / Human / Retry / Recoveryはnegative caseを必須とする。
-5. Definition / Expressionはtable-driven testを多用する。
-6. 時刻依存処理はclock abstractionで制御可能にする。
-7. random sleepによる不安定な競合testを避け、barrier / hookを用いる。
-8. 受入条件は各詳細設計の末尾と本書を対応させる。
+1. 状態遷移はunitだけで済ませずSQLite integrationを持つ。
+2. Runner/Action Runnerは実Process testを持つ。
+3. Clock/ID/Process launcherを注入可能にしrandom sleep依存を避ける。
+4. Concurrent testはbarrier/hookを使う。
+5. 各詳細設計の受入条件を少なくとも1 testへtraceする。
+6. Windows 11とLinuxをfirst-class対象とする。
 
 ## 3. Test layers
 
 ```text
 Unit
-Integration
+SQLite Integration
 Process Integration
 Adapter Contract
 End-to-End
-Recovery / Chaos-like
+Recovery / Fault Injection
 ```
 
-## 4. Unit Test
+## 4. Definition validation
 
-対象例:
-
-```text
-YAML parser
-Pydantic/typed model validation
-CEL/JMESPath wrapper
-Input mapping
-condition evaluation
-retry decision
-backoff calculation
-priority comparator
-dynamic key generation
-output aggregation
-failure model
-```
-
-外部I/Oをmockし、純粋ロジックを高速に回す。
-
-## 5. Integration Test
-
-実SQLite temporary DBを使用する。
-
-対象:
+Positive/negative table:
 
 ```text
-Workflow Run creation
-Job activation
-atomic claim
-Attempt creation
-state history
-Artifact metadata
-Event append
-Dynamic Job expansion
-External lease
-Human review
-Idempotency
-Retention metadata
-```
-
-## 6. Process Integration Test
-
-実Runner Process + Common Action Runner Processを起動する。
-
-テストAction Registryを用意する。
-
-代表Action:
-
-```text
-success_action
-failure_action
-sleep_action
-progress_action
-step_action
-stdout_action
-stderr_action
-artifact_action
-cancel_aware_action
-crash_action
-hang_action
-```
-
-## 7. Adapter Contract Test
-
-同じService operationに対し、Python API / MCP / Web Adapterで意味が変わらないことを検証する。
-
-WebUI画面そのものは別設計だが、HTTP Adapter contractはService testを再利用する。
-
-## 8. End-to-End Test
-
-最低限以下のWorkflowを実際に流す。
-
-### 8.1 Basic
-
-```text
-A -> B -> C
-```
-
-Output mapping / needs / logs / Workflow conclusionを確認。
-
-### 8.2 Branch
-
-```text
-A
-├-> B
-└-> C
-    ↓
-    D
-```
-
-ただし1 Workflow Run内internal Jobは同時実行最大1であることを確認。
-
-### 8.3 External
-
-```text
-internal -> external_llm -> internal
-```
-
-### 8.4 Human
-
-```text
-internal -> human -> internal
-```
-
-### 8.5 Dynamic
-
-```text
-generate -> foreach[N] -> aggregate
-```
-
-### 8.6 Reusable
-
-```text
-parent -> child workflow -> parent continuation
-```
-
-## 9. Definition Validation Test
-
-positive / negative tableを用意する。
-
-negative例:
-
-```text
-unknown key
+valid Workflow
+unknown top-level/Job/settings field
+duplicate YAML mapping key
+YAML merge key <<
+custom/object tag
 duplicate Job ID
-missing needs target
-DAG cycle
-unknown Action
-unknown Runner Pool
-action + uses conflict
-invalid executor
-invalid retry
-invalid timeout
-invalid foreach
-invalid concurrency
-invalid expression
+missing needs / DAG cycle
+invalid executor field combination
+internal explicit/default/unregistered runs-on
+external/human/reusable action/runs-on conflict
+Workflow top-level outputs
+invalid success_if/retry/timeout/external config
+Reusable uses URL/absolute/path traversal
 ```
 
-Workflow Run rowが作られる前に失敗するケースを確認する。
+Invalid startではWorkflow Run rowが作られないこと。
 
-## 10. Expression Test
+## 5. Expression/Input/Output
 
 CEL:
 
 ```text
-boolean
-number
-string
-list/map access
-helper functions
-success/failure/cancelled/always
-missing value
-null
-wrong type
+boolean strictness
+number/string/list/map
+missing vs null
+invalid context
+declared needs外参照拒否
 ```
 
 JMESPath:
 
 ```text
-selection
-filter
-projection
-invalid syntax
-unexpected result type
+filter/projection
+syntax/evaluation failure
+foreach unexpected type
 ```
 
-`${{ ... }}`全体式と文字列埋め込みを分けて検証する。
-
-## 11. Input / Output Test
+Contexts:
 
 ```text
-Workflow input required/default/type
-Job with mapping
-$base + override
-needs outputs
-Artifact refs
-state refs
-Secret refs
-Output JSON validation
-JSON Schema success/failure
-NaN/Infinity rejection
+inputs/env/state
+needs normal
+needs Dynamic group jobs/outputs/artifacts full key
+item/iteration.current/parent/ancestors
+failure/outputs
+Workflow output jobs context
 ```
 
-RetryでInputが変化しないことを必須検証。
-
-## 12. Scheduling Test
+Helpers:
 
 ```text
-Workflow priority
-Job priority
-order_by
-ready time tie-break
-pool routing
-unknown pool rejection
-1 Run internal Job max1
+success/failure/cancelled/always
+continue-on-error effective success
+upstream skipped -> default skipped
+upstream failure -> default blocked
+explicit if false -> skipped
+cancel -> cancelled/no new activation
+```
+
+`continue-on-error`はactivation時snapshotでRetry時変化しない。
+
+Job Output:
+
+```text
+JSON/schema
+NaN/Infinity reject
+4 MiB exactly allowed
+4 MiB+1 reject output_too_large
+```
+
+## 6. Secret tests
+
+```text
+internal Action with Secret success
+external_llm/human/reusable/condition Secret ref reject
+persistent Inputにreferenceのみ
+Secret value absent DB/Event/Log/idempotency
+per-Attempt materialize
+Secret rotation後Retryはnew value使用
+missing Secret child spawn前failure
+redaction hook
+```
+
+## 7. Scheduling / status
+
+```text
+Workflow queued/running/paused/completed
+Job queued/running/waiting_external/waiting_review/waiting_child/completed
+Job paused status不存在
+Workflow priority > Job priority > order_by > source > ready_at
+1 Workflow Run internal max1
 multiple Workflow Runs parallel
-pause no-new-claim
-resume
-priority update no preemption
+Pause no new claim/activation
+Resume
+Cancel no-new-activation
 ```
 
-複数Runnerを実Processまたはthreaded test harnessで競合させる。
+## 8. Atomic internal claim
 
-## 13. Atomic Claim Test
-
-同じqueued Jobに複数Runnerが同時claim要求。
+複数Runnerを同じcandidateへbarrier同期。
 
 期待:
 
 ```text
-success count = 1
-attempt count = 1
-owner runner = exactly one
+claim success exactly 1
+Attempt created exactly 1
+Runner owner exactly 1
+partial unique index violationが外へ漏れずconflict/retry処理
 ```
 
-少なくとも数十〜数百回繰り返すstress testを別カテゴリで用意する。
+数十〜数百回stressカテゴリも用意。
 
-## 14. Runner / IPC Test
+## 9. Runner process / liveness / IPC
+
+実Processで:
 
 ```text
-start handshake
-ready event
-log/progress/step/result/error
-malformed JSON
-unknown event type
-protocol version mismatch
-stdout/stderr capture
-Action exception
-child process non-zero exit
-Action process crash
+parent supervisor -> runner persistent
+mandatory HTTP/Broker無しでsame SQLite internal service
+parent lifecycle pipe EOF -> old Runner exit
+heartbeat 5s/lost 20s fake clock
+main loop tick normal
+main loop artificial hang -> heartbeat stops/lost
+heavy Action child -> main tick/heartbeat継続
+Registry bootstrap/version mismatch
+JSON Lines dedicated channel
+Action print/stdout/stderrがprotocolを壊さない
+malformed/unknown protocol/type
+state/artifact Runtime Handle proxy
+child exception/nonzero/no-result/hang
 ```
 
-Protocol errorでCore stateが不整合にならないことを確認。
-
-## 15. Heartbeat Test
-
-fake clockを使用する。
+## 10. Timeout / Cancel Runner
 
 ```text
-normal heartbeat
-late heartbeat within grace
-lost threshold exceeded
-runner_lost transition
-restart policy
-max_restarts
-restart window
-backoff
-restart suppressed
+no timeout long Action success
+timeout cancel request
+grace period
+child terminate -> job_timeout
+Workflow cancel cooperative Action
+late Runner completion fencing
 ```
 
-Actionが長時間実行中でもHeartbeat継続を確認。
+## 11. Dynamic Jobs
 
-## 16. Timeout Test
+Root:
 
 ```text
-no timeout -> long action success
-timeout -> cancel requested
-graceful exit
-forced child termination
-failure code job_timeout
-retry after timeout
+0/1/many
+stable key/index fallback
+special chars percent encoding
+raw key 256-byte boundary
+full job_key 2048-byte boundary
 ```
 
-実時間を長く待たないようclock/process hookを使う。
-
-## 17. Dynamic Job Test
-
-必須:
+Nested:
 
 ```text
-0 items
-1 item
-many items
-stable key
-index fallback
-duplicate key
-1000 jobs allowed
-1001 jobs rejected
-system override
-workflow override
-nested foreach
-arbitrary depth representative case
-atomic rollback
-order_by
-output aggregation
-artifact aggregation
-runtime restart after expansion
+foreach.parent/items
+parent_a condition[x] vs parent_b condition[x] no collision
+iteration parent/ancestors exact snapshot
+3+ nested levels representative
 ```
 
-上限超過時に部分Jobが残らないことを確認。
-
-## 18. Reusable Workflow Test
+Atomic/limit:
 
 ```text
-parent-child success
-input mapping
-output mapping
-artifact mapping
-child failure propagation
-child cancel propagation
-retry -> new child run
-direct cycle
-indirect cycle
-nested child
+1000 generated allowed
+1001 rejected with 0 partial rows
+DB failure mid expansion rollback
+restart after committed expansion no duplicate
+```
+
+Ordering/group:
+
+```text
+order_by string/number
+null/bool/object/mixed type reject
+source tie
+full-key needs group status/conclusion
+full-key output/artifact lookup
+```
+
+Dynamic + Reusable/External/HumanもE2E。
+
+## 12. Reusable Workflow
+
+```text
+registered ID/local ./path
+URL/absolute/../ traversal rejection
+binding created first activation
+Child source changes after binding
+Parent Retry -> same binding/new Child Run
+Action version mismatch after binding
+Workflow top-level jobs output mapping
 state isolation
-actor/scope inheritance
+Actor/Scope inheritance
+cycle direct/indirect
+nested reusable
+Parent cancel propagation
+Parent pause does not pause started Child
+public Child pause/resume/cancel/retry/priority reject
+Child info/log read allowed with auth
+one binding per parent Job
+one Child per parent Attempt
 runtime restart relation recovery
 ```
 
-## 19. External LLM Test
+## 13. External LLM
 
 ```text
-claim success
+activation -> exactly one Attempt/Task
 concurrent claim exactly one
-lease expiry
-stale lease submit rejection
-cancelled task submit rejection
-result schema validation
-claim_next
-retry -> new task
-restart with valid lease
-restart with expired lease
-idempotent submit
+active lease unique index
+requeue expiry -> same Attempt/new Lease
+fail expiry -> failure/retry policy
+valid/stale/expired/cancel submit
+submit Output+Artifact atomic
+claim_next failure does not rollback submit
+Pause blocks new claim but existing submit allowed
+Pause does not freeze expires_at
+Retry -> new Attempt/Task
+restart valid/expired lease
+idempotent claim/submit
 ```
 
-## 20. Human Review Test
+## 14. Human Review
 
 ```text
-approve
-reject
-concurrent review first wins
-cancel waiting_review
-late review rejection
-retry after reject
-idempotent review_submit
-actor Event
+activation -> one pending Review, outcome null
+approve/reject
+concurrent submit first wins
+cancel pending/late submit reject
+Pause retains pending and submit allowed
+Retry -> new Attempt/Review
+unique Attempt Review constraint
+idempotency/actor Event
 ```
 
-## 21. Retry Test
+## 15. Retry
+
+Automatic:
 
 ```text
-manual retry
-auto retry disabled default
-max attempts
-retry condition false
-retry condition true
-backoff
-retry exhausted
-Input frozen
-old output not current
-new successful artifact current
+disabled default
+retryable default matrix
+max-attempts
+if true/false/error
+backoff/retry_not_before
+scheduled retry creates no Attempt
+executor activation creates next Attempt
 ```
 
-## 22. Recovery Test
-
-Runtimeを意図的に停止し再起動する。
-
-ケース:
+Manual:
 
 ```text
-queued Job
-running internal Job
-waiting_external valid lease
-waiting_external expired lease
+Job-only failed requirement
+non-terminal failed Job retry
+completed failed Run reopen
+run_attempt increment
+Run conclusion/failure/output/completed_at cleared
+old Attempts preserved
+blocked descendants reset
+successful/skipped/cancelled/other failed descendants not reset
+Dynamic expansion not regenerated
+idempotent concurrent same request
+recovery never reopens terminal Run
+```
+
+## 16. Recovery/fencing
+
+Force Runtime/Runner stop at controlled points:
+
+```text
+queued
+running internal before/after child result
+waiting_external valid/expired lease
 waiting_review
-paused Run
-child Workflow running
-dynamic expansion completed
-retry backoff waiting
+waiting_child
+paused
+concurrency wait
+Dynamic expansion before/after commit
+retry backoff
 ```
 
-Recovery後に重複Job / Attempt / Child Runが生成されないことを確認。
+Expect no duplicate Attempt/Task/Review/Child/Expansion。
 
-## 23. Fencing Test
+Old runtime/runner late heartbeat/completion rejected。
 
-旧Runner instanceからlate completionを送信。
-
-期待:
-
-```text
-rejected
-current Attempt unchanged
-Event/diagnostic available
-```
-
-旧runtime_instance_idも同様。
-
-## 24. Persistence Test
+## 17. Persistence/migration
 
 ```text
 fresh migration
-incremental migration
-migration rollback/failure
-foreign key
-WAL behavior
-busy timeout
-transaction rollback
-JSON serialization
-Definition YAML snapshot
-Definition hash
+all prior schema version -> latest
+migration failure fail-closed
+WAL/busy_timeout
+FK/check constraints
+UUID4 prefix format
+internal running partial unique
+Dynamic root/nested expansion unique
+Reusable binding/Child unique
+External Task/active Lease unique
+Human pending/outcome constraint
+state current/history atomic
+Concurrency BEGIN IMMEDIATE race
+Idempotency same transaction/TTL expiry
+safe relative execution_log path
 ```
 
-Migration fixtureは全versionからlatestへのupgrade pathを可能な範囲で保持する。
-
-## 25. Workflow State Test
+## 18. Artifact / Log / State
 
 ```text
-get absent
-set first revision
-set overwrite
-history old/new
-last-write-wins
-restart persistence
-step/job/attempt attribution
+Artifact immutable generations/current successful Attempt
+failed Attempt Artifact not current
+Dynamic full-key Artifact map
+External Artifact submit
+Log append/flush/tail/offset
+large log absent from run info
+internal-ID log/temp paths
+path traversal rejection
+Step normal/crash close
+Progress known/indeterminate/Dynamic denominator
+state get/set/history/last-write-wins/restart
 Child state isolation
+temp cleanup/failure warning
+retention Event
 ```
 
-## 26. Artifact / Log Test
+## 19. Service/Adapter contract
+
+同じtyped Service operationをPython/MCP/Web Adapterで意味一致させる。
 
 ```text
-Artifact metadata register
-same-name generations
-current resolution
-history
-log append
-stdout/stderr
-log tail/offset
-large log not embedded in wf_info
-Step boundary
-Temp directory deletion
-Temp delete failure warning
+wf_definition_list/info
+wf_start
+wf_run_list/info
+wf_pause/resume/cancel/retry/priority_update
+wf_task_info/claim/submit
+wf_review_list/info/submit
+wf_artifact_info
+wf_log_read
+wf_runner_info
 ```
 
-## 27. Authorization / Secrets Test
+MCP:
+
+```text
+namespace validation/collision
+parent tool subset
+```
+
+`wf_info`のようにDefinition/Runが曖昧な旧operationを公開しない。
+
+## 20. Authorization
+
+全public read/write operationがProviderを通ることをspy Providerで検証。
 
 ```text
 AllowAll
-Deny provider
-filtered AccessScope
-all state-changing ops call authorize
-Secret runtime injection
-Secret absent from DB
-Secret absent from Event
-Secret absent from Definition snapshot resolved values
-redaction hook
-log path traversal
-Artifact URI no auto-fetch
+Deny
+filtered scope
+Definition/Run/Review/Artifact/Log/Runner read
+state-changing write
+Child read vs direct control
 ```
 
-## 28. Idempotency Test
+## 21. Idempotency
 
-各対象operationで:
+対象operationごと:
 
 ```text
 same key + same request -> same result
 same key + different request -> conflict
-concurrent same key -> single side effect
+concurrent same key -> one side effect
+DB fault between side effect/resultを作れないsame transaction設計
+TTL 24h内 replay
+expiry後record retention/replay非保証
 ```
 
-対象:
+## 22. Failure injection
+
+Dependency injection/hookで:
 
 ```text
-start
-pause
-resume
-cancel
-retry
-task_submit
-review_submit
-```
-
-## 29. Failure Injection
-
-test hook経由で以下を注入できると望ましい。
-
-```text
-DB write failure
+DB write/commit failure
 process spawn failure
-log write failure
-temp cleanup failure
-heartbeat stop
-Action process kill
-IPC malformed frame
+IPC malformed
+child kill
+heartbeat/main loop tick stop
+log write/temp cleanup failure
 Artifact registration failure
 ```
 
-本番コードへ広範なtest-only分岐を埋め込まずdependency injectionで行う。
+本番ロジックに広範なtest-only分岐を入れない。
 
-## 30. Property / Fuzz Test候補
+## 23. Performance smoke
 
-MVP必須ではないが以下は有効。
-
-```text
-YAML parser invalid structures
-Expression nested data
-Dynamic key generation
-state transition illegal paths
-IPC frame decoder
-```
-
-## 31. Performance smoke test
-
-大規模分散性能は目標外だが、退行検出として以下を測る。
+分散性能目標ではないが退行検知:
 
 ```text
-1000 Dynamic Jobs expansion
+1000 Dynamic expansion
 1000 Job metadata read
-large Event history pagination
-large Execution Log tail
-3 heavy Runner pool scheduling simulation
+Event cursor pagination
+large log tail
+3 Runner scheduling simulation
 ```
 
-閾値は実装後baseline化する。
+実装後baseline化。
 
-## 32. Platform Test
+## 24. Platform/CI
 
-少なくとも:
+最低:
 
 ```text
 Windows 11
 Linux
+supported Python versions (MVP >=3.10)
 ```
 
-Process spawn / signal / path / filesystem差異を確認。
-
-Windowsを第一級対象とする。
-
-## 33. Python version
-
-Packageが宣言するsupported Python versionsすべてでCIを回す。
-
-CEL/JMESPath等依存library互換性をCIで固定する。
-
-## 34. CI構成
-
-推奨job:
+CI例:
 
 ```text
 lint/typecheck
@@ -579,73 +465,33 @@ recovery
 platform matrix
 ```
 
-重いstress testは通常PRとnightly相当で分離してよい。
+Stressは通常PRと分離可能。
 
-## 35. Test data isolation
+## 25. Determinism/Test isolation
 
-各testはtemporary DB / temporary data rootを使用。
-
-固定の開発DBを共有しない。
-
-Process test終了時に子Processを必ずreapする。
-
-## 36. Determinism
-
-以下を注入可能にする。
+Injectable:
 
 ```text
 Clock
 ID generator
-Random source optional
 Process launcher
+Random optional
 ```
 
-テストで再現可能なID/時刻を使えるようにする。
+各testはtemp DB/data root。Process testは全childをreap。
 
-## 37. Coverage方針
+## 26. MVP completion gate
 
-line coverageの数値だけを完了条件にしない。
+1. 01〜12の受入条件に対応test
+2. all migration tests
+3. Windows/Linux process integration
+4. concurrent claim/concurrency/idempotency race
+5. restart recovery/fencing
+6. External/Human E2E
+7. Dynamic 1000 + nested identity
+8. Reusable binding/cycle/direct control
+9. Secret non-persistence
+10. Adapter contract
+11. Manual Retry reopen semantics
 
-重要state transition / conflict / recovery / negative pathが網羅されていることを優先する。
-
-特に以下は必須。
-
-```text
-atomicity
-idempotency
-fencing
-cancel
-retry
-recovery
-Dynamic Job rollback
-Secret non-persistence
-```
-
-## 38. MVP completion gate
-
-MVP実装完了条件:
-
-1. 01〜12の各受入条件に対応testがある
-2. 全migration test pass
-3. Windows/Linux process integration pass
-4. concurrent claim test pass
-5. restart recovery test pass
-6. External/Human E2E pass
-7. Dynamic Job 1000件 test pass
-8. Reusable Workflow nested/cycle test pass
-9. Secret non-persistence test pass
-10. adapter contract test pass
-
-## 39. 非目標
-
-MVPで以下は必須としない。
-
-```text
-Kubernetes E2E
-multi-machine chaos test
-browser UI E2E
-massive distributed load test
-security penetration test automation
-```
-
-WebUI E2EはWebUI詳細設計作成後に別途追加する。
+WebUI browser E2EはWebUI詳細設計後に追加する。
