@@ -1,459 +1,203 @@
 # 13. Testing 詳細設計
 
-- Status: Draft v0.2
+- Status: Draft v0.3
 - 対象: MVP
 - 上位仕様: `docs/design.md`
-- 関連: `01-workflow-definition.md`〜`12-security-and-secrets.md`
+- 関連: `01`〜`12`
 
-## 1. 目的
+## 1. 基本原則
 
-JobRunner MVPのunit/integration/process/E2E/recovery/security/adapter contractテストを定義し、設計上のatomicity/idempotency/fencingを実DB・実Processで検証する。
+1. 状態遷移はintegration testを必須にする。
+2. SQLite concurrency/transactionは実DBで検証。
+3. Runner/Action Runnerは実Process E2Eを持つ。
+4. External/Human/Retry/Recoveryはnegative case必須。
+5. Definition/Expressionはtable-driven。
+6. 時刻依存はClock abstraction。
+7. 競合testはbarrier/hookを使いrandom sleepへ依存しない。
 
-## 2. 原則
-
-1. 状態遷移はunitだけで済ませずSQLite integrationを持つ。
-2. Runner/Action Runnerは実Process testを持つ。
-3. Clock/ID/Process launcherを注入可能にしrandom sleep依存を避ける。
-4. Concurrent testはbarrier/hookを使う。
-5. 各詳細設計の受入条件を少なくとも1 testへtraceする。
-6. Windows 11とLinuxをfirst-class対象とする。
-
-## 3. Test layers
+## 2. Test layers
 
 ```text
 Unit
-SQLite Integration
+Integration
 Process Integration
 Adapter Contract
 End-to-End
-Recovery / Fault Injection
+Recovery/Failure Injection
 ```
 
-## 4. Definition validation
-
-Positive/negative table:
-
-```text
-valid Workflow
-unknown top-level/Job/settings field
-duplicate YAML mapping key
-YAML merge key <<
-custom/object tag
-duplicate Job ID
-missing needs / DAG cycle
-invalid executor field combination
-internal explicit/default/unregistered runs-on
-external/human/reusable action/runs-on conflict
-Workflow top-level outputs
-invalid success_if/retry/timeout/external config
-Reusable uses URL/absolute/path traversal
-```
-
-Invalid startではWorkflow Run rowが作られないこと。
-
-## 5. Expression/Input/Output
-
-CEL:
-
-```text
-boolean strictness
-number/string/list/map
-missing vs null
-invalid context
-declared needs外参照拒否
-```
-
-JMESPath:
-
-```text
-filter/projection
-syntax/evaluation failure
-foreach unexpected type
-```
-
-Contexts:
-
-```text
-inputs/env/state
-needs normal
-needs Dynamic group jobs/outputs/artifacts full key
-item/iteration.current/parent/ancestors
-failure/outputs
-Workflow output jobs context
-```
-
-Helpers:
-
-```text
-success/failure/cancelled/always
-continue-on-error effective success
-upstream skipped -> default skipped
-upstream failure -> default blocked
-explicit if false -> skipped
-cancel -> cancelled/no new activation
-```
-
-`continue-on-error`はactivation時snapshotでRetry時変化しない。
-
-Job Output:
-
-```text
-JSON/schema
-NaN/Infinity reject
-4 MiB exactly allowed
-4 MiB+1 reject output_too_large
-```
-
-## 6. Secret tests
-
-```text
-internal Action with Secret success
-external_llm/human/reusable/condition Secret ref reject
-persistent Inputにreferenceのみ
-Secret value absent DB/Event/Log/idempotency
-per-Attempt materialize
-Secret rotation後Retryはnew value使用
-missing Secret child spawn前failure
-redaction hook
-```
-
-## 7. Scheduling / status
-
-```text
-Workflow queued/running/paused/completed
-Job queued/running/waiting_external/waiting_review/waiting_child/completed
-Job paused status不存在
-Workflow priority > Job priority > order_by > source > ready_at
-1 Workflow Run internal max1
-multiple Workflow Runs parallel
-Pause no new claim/activation
-Resume
-Cancel no-new-activation
-```
-
-## 8. Atomic internal claim
-
-複数Runnerを同じcandidateへbarrier同期。
-
-期待:
-
-```text
-claim success exactly 1
-Attempt created exactly 1
-Runner owner exactly 1
-partial unique index violationが外へ漏れずconflict/retry処理
-```
-
-数十〜数百回stressカテゴリも用意。
-
-## 9. Runner process / liveness / IPC
-
-実Processで:
-
-```text
-parent supervisor -> runner persistent
-mandatory HTTP/Broker無しでsame SQLite internal service
-parent lifecycle pipe EOF -> old Runner exit
-heartbeat 5s/lost 20s fake clock
-main loop tick normal
-main loop artificial hang -> heartbeat stops/lost
-heavy Action child -> main tick/heartbeat継続
-Registry bootstrap/version mismatch
-JSON Lines dedicated channel
-Action print/stdout/stderrがprotocolを壊さない
-malformed/unknown protocol/type
-state/artifact Runtime Handle proxy
-child exception/nonzero/no-result/hang
-```
-
-## 10. Timeout / Cancel Runner
-
-```text
-no timeout long Action success
-timeout cancel request
-grace period
-child terminate -> job_timeout
-Workflow cancel cooperative Action
-late Runner completion fencing
-```
-
-## 11. Dynamic Jobs
-
-Root:
-
-```text
-0/1/many
-stable key/index fallback
-special chars percent encoding
-raw key 256-byte boundary
-full job_key 2048-byte boundary
-```
-
-Nested:
-
-```text
-foreach.parent/items
-parent_a condition[x] vs parent_b condition[x] no collision
-iteration parent/ancestors exact snapshot
-3+ nested levels representative
-```
-
-Atomic/limit:
-
-```text
-1000 generated allowed
-1001 rejected with 0 partial rows
-DB failure mid expansion rollback
-restart after committed expansion no duplicate
-```
-
-Ordering/group:
-
-```text
-order_by string/number
-null/bool/object/mixed type reject
-source tie
-full-key needs group status/conclusion
-full-key output/artifact lookup
-```
-
-Dynamic + Reusable/External/HumanもE2E。
-
-## 12. Reusable Workflow
-
-```text
-registered ID/local ./path
-URL/absolute/../ traversal rejection
-binding created first activation
-Child source changes after binding
-Parent Retry -> same binding/new Child Run
-Action version mismatch after binding
-Workflow top-level jobs output mapping
-state isolation
-Actor/Scope inheritance
-cycle direct/indirect
-nested reusable
-Parent cancel propagation
-Parent pause does not pause started Child
-public Child pause/resume/cancel/retry/priority reject
-Child info/log read allowed with auth
-one binding per parent Job
-one Child per parent Attempt
-runtime restart relation recovery
-```
-
-## 13. External LLM
-
-```text
-activation -> exactly one Attempt/Task
-concurrent claim exactly one
-active lease unique index
-requeue expiry -> same Attempt/new Lease
-fail expiry -> failure/retry policy
-valid/stale/expired/cancel submit
-submit Output+Artifact atomic
-claim_next failure does not rollback submit
-Pause blocks new claim but existing submit allowed
-Pause does not freeze expires_at
-Retry -> new Attempt/Task
-restart valid/expired lease
-idempotent claim/submit
-```
-
-## 14. Human Review
-
-```text
-activation -> one pending Review, outcome null
-approve/reject
-concurrent submit first wins
-cancel pending/late submit reject
-Pause retains pending and submit allowed
-Retry -> new Attempt/Review
-unique Attempt Review constraint
-idempotency/actor Event
-```
-
-## 15. Retry
-
-Automatic:
-
-```text
-disabled default
-retryable default matrix
-max-attempts
-if true/false/error
-backoff/retry_not_before
-scheduled retry creates no Attempt
-executor activation creates next Attempt
-```
-
-Manual:
-
-```text
-Job-only failed requirement
-non-terminal failed Job retry
-completed failed Run reopen
-run_attempt increment
-Run conclusion/failure/output/completed_at cleared
-old Attempts preserved
-blocked descendants reset
-successful/skipped/cancelled/other failed descendants not reset
-Dynamic expansion not regenerated
-idempotent concurrent same request
-recovery never reopens terminal Run
-```
-
-## 16. Recovery/fencing
-
-Force Runtime/Runner stop at controlled points:
-
-```text
-queued
-running internal before/after child result
-waiting_external valid/expired lease
-waiting_review
-waiting_child
-paused
-concurrency wait
-Dynamic expansion before/after commit
-retry backoff
-```
-
-Expect no duplicate Attempt/Task/Review/Child/Expansion。
-
-Old runtime/runner late heartbeat/completion rejected。
-
-## 17. Persistence/migration
-
-```text
-fresh migration
-all prior schema version -> latest
-migration failure fail-closed
-WAL/busy_timeout
-FK/check constraints
-UUID4 prefix format
-internal running partial unique
-Dynamic root/nested expansion unique
-Reusable binding/Child unique
-External Task/active Lease unique
-Human pending/outcome constraint
-state current/history atomic
-Concurrency BEGIN IMMEDIATE race
-Idempotency same transaction/TTL expiry
-safe relative execution_log path
-```
-
-## 18. Artifact / Log / State
-
-```text
-Artifact immutable generations/current successful Attempt
-failed Attempt Artifact not current
-Dynamic full-key Artifact map
-External Artifact submit
-Log append/flush/tail/offset
-large log absent from run info
-internal-ID log/temp paths
-path traversal rejection
-Step normal/crash close
-Progress known/indeterminate/Dynamic denominator
-state get/set/history/last-write-wins/restart
-Child state isolation
-temp cleanup/failure warning
-retention Event
-```
-
-## 19. Service/Adapter contract
-
-同じtyped Service operationをPython/MCP/Web Adapterで意味一致させる。
-
-```text
-wf_definition_list/info
-wf_start
-wf_run_list/info
-wf_pause/resume/cancel/retry/priority_update
-wf_task_info/claim/submit
-wf_review_list/info/submit
-wf_artifact_info
-wf_log_read
-wf_runner_info
-```
-
-MCP:
-
-```text
-namespace validation/collision
-parent tool subset
-```
-
-`wf_info`のようにDefinition/Runが曖昧な旧operationを公開しない。
-
-## 20. Authorization
-
-全public read/write operationがProviderを通ることをspy Providerで検証。
-
-```text
-AllowAll
-Deny
-filtered scope
-Definition/Run/Review/Artifact/Log/Runner read
-state-changing write
-Child read vs direct control
-```
-
-## 21. Idempotency
-
-対象operationごと:
-
-```text
-same key + same request -> same result
-same key + different request -> conflict
-concurrent same key -> one side effect
-DB fault between side effect/resultを作れないsame transaction設計
-TTL 24h内 replay
-expiry後record retention/replay非保証
-```
-
-## 22. Failure injection
-
-Dependency injection/hookで:
-
-```text
-DB write/commit failure
-process spawn failure
-IPC malformed
-child kill
-heartbeat/main loop tick stop
-log write/temp cleanup failure
-Artifact registration failure
-```
-
-本番ロジックに広範なtest-only分岐を入れない。
-
-## 23. Performance smoke
-
-分散性能目標ではないが退行検知:
-
-```text
-1000 Dynamic expansion
-1000 Job metadata read
-Event cursor pagination
-large log tail
-3 Runner scheduling simulation
-```
-
-実装後baseline化。
-
-## 24. Platform/CI
-
-最低:
-
-```text
-Windows 11
-Linux
-supported Python versions (MVP >=3.10)
-```
-
-CI例:
+## 3. Definition / Expression
+
+必須negative:
+
+- duplicate YAML key / merge key / custom tag
+- unknown key
+- bad Job ID / missing needs / DAG cycle
+- **Dynamic foreach.parentを含むcycle**
+- executor field conflict
+- envでSecret参照
+- external/human/reusableでSecret参照
+- external/human/reusable `timeout-minutes`
+- invalid CEL/JMESPath
+- missing/null/type mismatch
+
+Condition helper:
+
+- success/failure/cancelled/always
+- continue-on-error effective success
+- skipped dependency
+- explicit if false
+- **Nested Dynamic parent + declared needsのcondition dependency set**
+
+## 4. Input / Output / Secret
+
+- Workflow required/default/extra/type
+- `$base` shallow override
+- Retry Input固定
+- Secret reference固定 + Attemptごとrematerialize
+- Secret非永続化
+- Output schema
+- NaN/Infinity
+- 4MiB default limit / override
+
+## 5. Scheduling
+
+- Workflow priority
+- Job priority
+- Dynamic order_rank/source_order
+- pool routing
+- one internal running per Workflow Run
+- multiple Workflow Runs parallel
+- pause/resume
+- priority update non-preemptive
+
+Internal claim競合はexactly one。
+
+## 6. Runner / IPC
+
+- start/ready/log/progress/step/result/error
+- malformed JSON / protocol mismatch
+- stdout/stderr capture
+- action exception/crash/hang
+- heartbeat継続
+- main-loop stall detection
+- old runner fencing
+- restart suppression
+
+## 7. Timeout
+
+- internal no-timeout long action success
+- internal timeout -> cancel -> child terminate -> `job_timeout`
+- timeout後Retry
+- **external/human/reusable timeout definition reject**
+
+## 8. Dynamic Jobs
+
+必須:
+
+- 0/1/N
+- stable key/index fallback
+- parent別同raw key非衝突
+- special char percent encoding
+- **full logical job_keyに固定長上限無し**
+- 1000 allowed / 1001 rollback
+- nested 2/3段以上
+- arbitrary-depth representative
+- parent edge cycle
+- parent+needs helper
+- order_by type/order
+- atomic expansion crash/restart
+- group status `running/completed`
+- group conclusion success/failure/blocked/cancelled
+- full-key Output/Artifact lookup
+
+## 9. Reusable Workflow
+
+- registered ID
+- relative pathはcaller source directory基準
+- root traversal/symlink escape
+- non-filesystem caller relative reject
+- binding固定
+- source変更後Retryでsame binding
+- parent-child output/state isolation
+- direct/indirect cycle
+- direct child control reject
+- Dynamic + Reusable
+- restart duplicate防止
+
+## 10. External LLM
+
+- activation one Attempt/Task
+- concurrent claim exactly one
+- **candidate ordering = Workflow priority -> Job priority -> dynamic order -> source -> ready -> id**
+- claim_next同一selection
+- lease expiry requeue same Attempt
+- lease expiry fail -> Retry
+- stale/cancel submit reject
+- Pause中existing submit可/expiry clock継続
+- restart valid/expired lease
+
+## 11. Human
+
+- pending review
+- approve/reject
+- concurrent first-wins
+- cancel/late submit
+- pause中submit
+- Retry new review
+- timeout無し
+
+## 12. Retry / Recovery
+
+- auto retry disabled default
+- max-attempts/condition/backoff
+- manual retry completed/failure Run reopen
+- run_attempt増加
+- success/cancelled Run retry reject
+- blocked descendants再評価
+- terminal RunはRecoveryだけでreopenしない
+- running internal runner_lost
+- retry backoff restart
+- Dynamic/Child duplicate無し
+
+## 13. Persistence
+
+- fresh/incremental migration
+- WAL/FK/busy timeout
+- internal running partial unique
+- Dynamic expansion partial unique
+- Reusable uniqueness
+- External active lease unique
+- Human one review/Attempt
+- state current+history atomic
+- concurrency race
+- no fixed DB length check for logical job_key
+
+## 14. Idempotency
+
+対象operationごとに:
+
+- same Actor/AccessScope + same key/hash -> replay
+- same scope + same key/different hash -> conflict
+- **different Actorはsame keyでも独立**
+- **different AccessScopeはsame keyでも独立**
+- concurrent same key -> single side effect
+- TTL expiry後、expired rowがDBに残ったままsame keyを新requestとして再利用
+
+## 15. Authorization / Security
+
+- AllowAll/Deny
+- list/read/write全public operationがauthorize通過
+- filtered AccessScope
+- log path traversal reject
+- Artifact URI auto-fetch無し
+- arbitrary shell非搭載
+
+## 16. Platform / CI
+
+少なくともWindows 11 / Linux。
+
+CI推奨:
 
 ```text
 lint/typecheck
@@ -462,36 +206,23 @@ integration-sqlite
 process-integration
 adapter-contract
 recovery
-platform matrix
+platform-matrix
 ```
 
-Stressは通常PRと分離可能。
+1000 Dynamic Jobs等の重いstressはPR/nightly分離可。
 
-## 25. Determinism/Test isolation
+## 17. MVP completion gate
 
-Injectable:
-
-```text
-Clock
-ID generator
-Process launcher
-Random optional
-```
-
-各testはtemp DB/data root。Process testは全childをreap。
-
-## 26. MVP completion gate
-
-1. 01〜12の受入条件に対応test
-2. all migration tests
+1. `01`〜`12`の受入条件に対応test
+2. migration pass
 3. Windows/Linux process integration
-4. concurrent claim/concurrency/idempotency race
-5. restart recovery/fencing
+4. concurrent claim
+5. restart recovery
 6. External/Human E2E
-7. Dynamic 1000 + nested identity
-8. Reusable binding/cycle/direct control
+7. Dynamic 1000 + nested + atomic rollback
+8. Reusable nested/cycle/binding
 9. Secret non-persistence
-10. Adapter contract
-11. Manual Retry reopen semantics
+10. idempotency scope/TTL
+11. adapter contract
 
-WebUI browser E2EはWebUI詳細設計後に追加する。
+WebUI E2EはWebUI詳細設計後に追加する。
