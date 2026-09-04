@@ -1,6 +1,6 @@
 # 05. Dynamic Jobs 詳細設計
 
-- Status: Draft v1.0
+- Status: Draft v1.1
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `02`, `03`, `08`, `10`
@@ -12,14 +12,15 @@
 ## 2. 基本原則
 
 1. Actionから任意Jobを直接追加しない。YAML templateをEngineが展開する。
-2. generated Jobは通常Jobと同じJob Run/Attempt/Retry/Log/Artifact/Validator規則。
-3. 入れ子深さに固定上限無し。
-4. Workflow Run generated Job数上限default1000。
-5. 1 expansion all-or-nothing。
-6. identity=parent path込みfull `job_key`。
-7. 同一Run internal Job同時最大1。
-8. `foreach=[]`正常0件と`if=false` skipを区別。
-9. 一度`expanded`としてcommitしたgenerated Job集合は同一Run内で変更しない。
+2. Dynamic templateは**仮想group**であり、それ自体の`job_runs`/Attempt/Runner実行を作らない。
+3. Expansionで生成されたconcrete Jobだけが通常Job Run/Attempt/Retry/Log/Artifact/Validator規則を持つ。
+4. 入れ子深さに固定上限無し。
+5. Workflow Run generated Job数上限default1000。
+6. 1 expansion all-or-nothing。
+7. identity=parent path込みfull `job_key`。
+8. 同一Run internal Job同時最大1。
+9. `foreach=[]`正常0件と`if=false` skipを区別。
+10. 一度`expanded`としてcommitしたgenerated Job集合は同一Run内で変更しない。
 
 ## 3. Root Dynamic Job
 
@@ -38,7 +39,9 @@ jobs:
     validator: domain.validate_candidate
 ```
 
-Template自身はAction/Validatorを実行せずgenerated Job群の論理親。
+Template自身はAction/Validatorを実行しない。Run start時にTemplate用`job_runs` rowを作らず、Definition snapshot + `dynamic_expansions` + generated Job Runsからgroup stateを導出する。
+
+したがってTemplate IDそのものを`wf_retry`の`job_run_id`として指定することはできない。Expansion failureはAttempt無しfailureとして扱う。
 
 ## 4. Nested Dynamic Job
 
@@ -147,7 +150,7 @@ Effective max:
 Workflow settings.max-dynamic-jobs > System max_dynamic_jobs > 1000
 ```
 
-Count=当該Workflow Run generated Job総数。Child Runは別count。
+Count=当該Workflow Run generated **concrete Job**総数。Dynamic template group自体はcountしない。Child Runは別count。
 
 超過時当該expansion全rollback。Silent truncate禁止。
 
@@ -185,14 +188,14 @@ Commit transaction:
 - expansion row/outcome
 - source snapshot/digest
 - expansion digest
-- all generated `job_runs`
+- all generated concrete `job_runs`
 - item/iteration/source_order/order_rank
 
 をall-or-nothingで保存。
 
 ## 13. Expansion digest
 
-`expanded` outcomeごとに、Manual Retry後の同一性確認用 `expansion_digest` を保存する。
+`expanded` outcomeごとにManual Retry同一性確認用 `expansion_digest` を保存。
 
 Canonical source:
 
@@ -213,11 +216,7 @@ Canonical source:
 }
 ```
 
-をcanonical-json-v1 -> SHA-256。
-
-`source`にはforeach評価結果arrayそのもの、`candidates`には全candidateをsource order順で入れる。
-
-Empty arrayもdigestを持つ。
+canonical-json-v1 -> SHA-256。Source=arrayそのもの、candidates=source order順。Empty arrayもdigestを持つ。
 
 ## 14. `if`
 
@@ -247,23 +246,19 @@ order_by:
     direction: asc
 ```
 
-Allowed:
-
-```text
-omitted|null
-literal source_order
-non-empty array of {expr,direction}
-```
+Allowed=`omitted|null|source_order|non-empty array {expr,direction}`。
 
 Direction=`asc|desc`, default asc。Unknown key reject。
 
-Criterionはstringまたはfinite number、criterion内同型。null/bool/object/array/NaN/Infinity/混在禁止。
+Criterion=stringまたはfinite number、criterion内同型。null/bool/object/array/NaN/Infinity/混在禁止。
 
 Sort criteria left-to-right、tie=source_order ASC。`order_rank=0..N-1` snapshot。
 
-Runner orderingはWorkflow priority -> Job priority -> order_rank -> source_order -> ready_at -> id。
+Runner ordering=Workflow priority -> Job priority -> order_rank -> source_order -> ready_at -> id。
 
 ## 16. Template group status / conclusion
+
+Template groupは仮想viewとして導出する。
 
 Status:
 
@@ -273,14 +268,14 @@ Status:
 Conclusion priority:
 
 1. cancel -> cancelled
-2. expansion/non-allowed Job failure -> failure
+2. expansion/non-allowed generated failure -> failure
 3. required blocked -> blocked
 4. all expansion skipped + generated0 -> skipped
 5. その他effective success/skippedまたは正常empty -> success
 
 Nested zero-parentは§7優先。
 
-Generated Job 0件ならoutputs/artifacts/jobs mapはempty object。
+Generated Job 0件ならoutputs/artifacts/jobs map=empty object。
 
 ## 17. Output / Artifact aggregation
 
@@ -294,7 +289,7 @@ Raw keyだけでindexしない。
 
 ## 18. Generated Job Retry
 
-Generated Job Retryはsame Job Run new Attempt。
+Generated Job Retry=same Job Run new Attempt。
 
 固定:
 
@@ -305,73 +300,57 @@ Generated Job Retryはsame Job Run new Attempt。
 - order rank
 - Action/Validator version
 
-foreach/key/orderは再評価しない。
+foreach/key/order再評価無し。
 
 ## 19. Manual Retry後のExpansion Reuse
 
-Upstream JobをManual Retryした場合、descendantに**既にcommit済み`expanded` expansion**があるなら、そのgenerated集合を勝手に差し替えない。
+Upstream Manual Retry後、既存`expanded` expansionのgenerated集合を勝手に差し替えない。
 
-副作用無しでcurrent dependency contextから再計算:
+Current dependency contextから副作用無し再計算:
 
 1. expansion instance identity集合
 2. current `if`
-3. foreach source array
+3. foreach source
 4. raw/full key
-5. item snapshot
-6. source order/order rank
-7. Action/Validator/Runner Pool preflight
-8. canonical `expansion_digest`
+5. item
+6. source/order rank
+7. preflight
+8. expansion digest
 
-Required:
+Exact matchのみexisting expansion保持。各successful generated Jobは`03` strict Result Reuseへ。
 
-- existing `expanded` instanceの集合が同一
-- 全instanceでcurrent `if=true`
-- current expansion digest == stored digest
+Mismatch/error=`dynamic_expansion_not_reusable`, retryable=false, new Workflow Run要求。
 
-Exact matchならexisting expansion/generated Jobを保持し、その後各successful generated Jobは`03` Result Reuse check。
+### Whole skipped group
 
-Mismatch/error:
+Group全体completed/skipped + generated0は未実行扱い。Manual Retry descendant reactivation時にskipped expansion rowをreset/removeしてcurrent dependenciesから再評価可。Past skipはEventへ。
 
-```text
-category=runtime
-code=dynamic_expansion_not_reusable
-retryable=false
-```
+### Expanded empty
 
-としてsame Runをfailureにしnew Workflow Runを要求する。
+`foreach=[]` はexpanded/success。Current digest exact match必須。Nonemptyへ変化したらnot reusable。
 
-### 19.1 skipped expansion
+### Mixed successful group
 
-Template group全体が`completed/skipped`でgenerated Job=0の場合は未実行扱いなので、Manual Retry descendant reactivation時にそのtemplateの`skipped` expansion rowをreset/removeしてcurrent dependenciesから再評価してよい。過去skip事実はEvent Logへ残す。
-
-### 19.2 expanded empty
-
-`foreach=[]` は`expanded/success`なので実行済み成功group。Manual Retry後もcurrent digest exact match必須。新たに非emptyへ変わった場合はsame RunでJob生成せず `dynamic_expansion_not_reusable`。
-
-### 19.3 mixed group
-
-一部expansion skipped + 一部expandedでgroup successの場合は**group全体をsuccessfulとして扱う**。Skipped instanceも含めcurrent outcome/digest構造が同一でなければreuse不可。Group successを理由に一部skipだけ再展開しない。
+一部skipped+一部expandedでgroup successの場合、group全体をsuccessfulとして扱い、skipを部分再展開しない。Current outcome/digest構造exact match必須。
 
 ## 20. Recovery
 
 - committed expansion再生成無し
 - uncommittedはcurrent dependenciesから再評価
-- committed outcome重複確定無し
 - expansion digest復元
-- zero-parent propagation idempotent
-- running Runner recovery
-- queued維持
-- `reuse_check_pending`時は§19再開
+- zero-parent idempotent
+- generated concrete Jobのrunning/queued recovery
+- `reuse_check_pending`時§19再開
 
 ## 21. Reusable / External / Human
 
-Dynamic templateにReusable/External/Human可。Field/Validator constraintsは`01`。
+Dynamic templateにReusable/External/Human可。生成されたconcrete Jobのfield constraintsは`01`。
 
 ## 22. Pause / Cancel
 
 Pause中new expansion無し。Commit済み保持。
 
-Cancel後new expansion無し。未実行generatedは通常cancel。
+Cancel後new expansion無し。未実行generated Jobは通常cancel。
 
 ## 23. Failure code
 
@@ -391,21 +370,21 @@ dynamic_expansion_not_reusable
 
 ## 24. 受入条件
 
-1. Root/Nested/3+ depth
-2. parent cycle/zero-parent propagation
-3. parent別same raw key
-4. no fixed job_key limit
-5. System/Workflow 1000 hierarchy + 1001 rollback
-6. Action/Validator version preflight
-7. atomic expansion/recovery
-8. order schema/asc/desc/stable tie
-9. Root if=false skipped vs foreach=[] success
-10. group precedence/mixed skip-success
-11. expansion_digest golden
-12. Manual Retry exact expansion reuse
-13. changed source/key/order/item -> not reusable/new Run
-14. expanded empty changed to nonempty -> not reusable
-15. whole skipped group may re-evaluate
-16. mixed successful group cannot partially re-expand
-17. full-key output/artifact
-18. Generated Retry snapshot固定
+1. Dynamic template has no job_runs/Attempt/Retry target
+2. Root/Nested/3+ depth
+3. parent cycle/zero-parent
+4. parent別same raw key/full key
+5. generated max excludes template groups
+6. 1000/1001 rollback
+7. Action/Validator preflight
+8. atomic expansion/recovery
+9. order schema/stable tie
+10. if=false skipped vs foreach=[] success
+11. group precedence
+12. expansion_digest golden
+13. Manual Retry exact expansion reuse
+14. changed source/key/order/item -> new Run
+15. whole skipped group re-evaluate only
+16. mixed group no partial re-expansion
+17. full-key aggregation
+18. Generated Retry snapshot fixed
