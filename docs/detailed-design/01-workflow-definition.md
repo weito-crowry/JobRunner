@@ -1,6 +1,6 @@
 # 01. Workflow Definition 詳細設計
 
-- Status: Draft v1.0
+- Status: Draft v1.1
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 
@@ -26,7 +26,7 @@ PyPI `cel-python` は cloud-custodian/cel-python。
 
 `ruamel.yaml 0.19.0` は導入上の既知問題を避け対象外。
 
-Process/SQLite/JSON/UUID/hashlibはPython標準libraryを優先する。
+Process/SQLite/JSON/UUID/hashlibはPython標準libraryを優先。
 
 ## 3. YAML基本原則
 
@@ -177,6 +177,7 @@ concurrency:
 System config canonical defaults:
 
 ```text
+default_runner_pool = "default"
 max_dynamic_jobs = 1000
 external_lease_minutes = 60
 external_on_lease_expiry = requeue
@@ -206,16 +207,19 @@ settings:
     managed-artifact-data-days: null
 ```
 
-Effective runtime setting:
+`default_runner_pool`はSystem configのみでWorkflow YAMLから上書きしない。ただし**Workflow Run start時にeffective settingsへsnapshot**し、`runs-on`省略Job/Generated JobはそのRun snapshotの値を使う。Parent restart後にcurrent System defaultが変わっても既存RunのPool解決を変えない。
+
+その他effective runtime setting:
 
 ```text
 Workflow specified value > System config > canonical default
 ```
 
-ただしExternal Jobのlease/expiryは§18のJob overrideが最優先。
+External Job lease/expiryは§18 Job overrideが最優先。
 
 Validation:
 
+- `default_runner_pool`: non-empty string、Run start時にregistered Pool存在を要求
 - `max-dynamic-jobs`: integer >=0 signed64
 - `external-lease-minutes`: finite positive number
 - `external-on-lease-expiry`: requeue|fail
@@ -338,11 +342,20 @@ Resolution:
 2. `uses` absent + `executor` omitted -> resolved executor=`internal`
 3. `uses` absent + explicit executor ->その値
 
-したがってYAMLで`executor: reusable`は書かない。
+YAMLで`executor: reusable`は書かない。
 
-### 14.2 Job `outputs`
+### 14.2 `runs-on` resolution
 
-Job result schema設定は:
+Internal Jobだけで使用。
+
+- explicit non-empty `runs-on` ->そのPool名
+- omitted -> Workflow Run `effective_settings.default_runner_pool`
+- resolved PoolはJob Run/Generated Job Run作成時に`runs_on`へsnapshot
+- 未登録PoolはRun startまたはDynamic expansion preflightでfail-closed
+
+### 14.3 Job `outputs`
+
+Job result schema設定:
 
 ```yaml
 outputs:
@@ -350,20 +363,18 @@ outputs:
     type: object
 ```
 
-のみ。`outputs` omittedまたは`outputs: {}`はSchema無し。`outputs`内unknown key reject。
+のみ。Omitted/`{}`=Schema無し。Unknown key reject。
 
-SchemaはDraft2020-12。Job Output本体は任意JSON valueであり、GitHub Actions風のname mappingではない。トップレベルWorkflow `outputs`とは別概念。
+Schema=Draft2020-12。Job Output本体は任意JSON value。トップレベルWorkflow outputs name mappingとは別概念。
 
-### 14.3 Job `progress`
+### 14.4 Job `progress`
 
 ```yaml
 progress:
   mode: auto|explicit|none
 ```
 
-`progress` omitted時はWorkflow `settings.job-progress-mode`、未指定ならSystem/default `auto`。
-
-Exact semanticsは`09`。
+Omitted -> Workflow `settings.job-progress-mode` -> System/default auto。Exact semantics=`09`。
 
 ## 15. Result validation order
 
@@ -397,11 +408,11 @@ Reusable:
 - uses required
 - action/validator/executor/runs-on/success_if/external/timeout forbidden
 
-`with/if/continue-on-error/priority/retry/outputs/progress/foreach/key/order_by` は各Executorで共通規則に従い利用可能。
+`with/if/continue-on-error/priority/retry/outputs/progress/foreach/key/order_by` は共通規則に従い利用可能。
 
 ## 17. Secret expression field restriction
 
-`${{ secrets.NAME }}` はinternal Job `with`だけで利用可能。さらにMVPでは**1 scalar全体がSecret参照式である場合だけ**許可する。
+`${{ secrets.NAME }}` はinternal Job `with`だけ、かつ1 scalar全体のみ。
 
 Allowed:
 
@@ -417,7 +428,7 @@ with:
   auth: "Bearer ${{ secrets.API_TOKEN }}"
 ```
 
-Secretを文字列加工したい場合はAction内部で行う。Persistent表現は`02/08/12`。
+加工はAction内部。Persistent表現=`02/08/12`。
 
 ## 18. External Job override
 
@@ -447,12 +458,12 @@ Workflow Definition sourceは親Process再起動なしでreload可能。
 Standard filesystem WorkflowResolver:
 
 - `wf_definition_list/info` と `wf_start` でsource metadata (`mtime_ns + size`) を確認
-- metadata変化時はfile再read/parse/validateしてcache replace
-- metadata同一でも親は`WorkflowResolver.refresh(workflow_ref=None)`を明示call可能
-- invalid new YAMLはold Definitionへsilent fallbackせず、そのreferenceのnew Run startを拒否
-- existing Workflow Runは自身のsnapshotを使い影響無し
+- metadata変化時file再read/parse/validateしてcache replace
+- metadata同一でも`WorkflowResolver.refresh(workflow_ref=None)`可
+- invalid new YAMLはold Definitionへsilent fallbackせずnew Run start拒否
+- existing Runは自身のsnapshot継続
 
-File watcher/background hot reloadは必須ではない。Python Action/Validator code reloadもJobRunner専用機構を作らず親development autoreloadへ任せる。
+File watcher/background hot reload必須無し。Python Action/Validator code reloadは親development autoreloadへ任せる。
 
 ## 20. Definition Snapshot
 
@@ -461,7 +472,7 @@ File watcher/background hot reloadは必須ではない。Python Action/Validato
 - typed Definition JSON/hash
 - Workflow Input
 - Action/Validator ID+version
-- effective runtime settings
+- effective runtime settings（default_runner_pool含む）
 - effective retention policy
 - optional source_identity
 
@@ -476,13 +487,13 @@ Load:
 - numeric/expression
 - executor/field conflicts
 - settings/external/progress
-- Secret placement/full-scalar rule
+- Secret placement/full-scalar
 
 Run start:
 
 - Input
 - current Registry versions
-- Runner Pool
+- default/explicit Runner Pool
 - concurrency
 - Reusable refs
 - effective settings/retention
@@ -496,17 +507,17 @@ FailureならRun row無し。
 2. canonical JSON golden
 3. Draft2020-12 only
 4. Input nullable
-5. executor default/internal + uses->reusable resolution
-6. Job outputs.schema exact shape
-7. Registry one-current-version/duplicate ID reject/version mismatch
-8. runtime setting inheritance
-9. External Job lease override hierarchy
-10. progress/log setting validation
-11. Secret full-scalar restriction
-12. retention inheritance/unlimited
-13. reload valid YAML without process restart
-14. reload invalid YAML blocks new Runs but old Run snapshot continues
-15. explicit refresh
+5. executor default/internal + uses->reusable
+6. default_runner_pool System default/snapshot/restart stability
+7. explicit/omitted runs-on resolution
+8. Job outputs.schema exact shape
+9. Registry one-current-version/duplicate reject/version mismatch
+10. runtime setting inheritance
+11. External lease hierarchy
+12. progress/log setting validation
+13. Secret full-scalar
+14. retention inheritance
+15. reload valid/invalid/refresh
 16. concurrency identity
 17. arbitrary Output/spill
 18. deterministic hash
