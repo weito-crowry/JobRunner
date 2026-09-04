@@ -1,33 +1,26 @@
 # 10. Retry / Recovery / Cancel 詳細設計
 
-- Status: Draft v0.1
+- Status: Draft v0.2
 - 対象: MVP
 - 上位仕様: `docs/design.md`
-- 関連:
-  - `docs/detailed-design/03-runtime-and-scheduling.md`
-  - `docs/detailed-design/04-runner-and-ipc.md`
-  - `docs/detailed-design/07-external-and-human.md`
-  - `docs/detailed-design/08-persistence.md`
+- 関連: `03-runtime-and-scheduling.md`, `04-runner-and-ipc.md`, `06-reusable-workflows.md`, `07-external-and-human.md`, `08-persistence.md`
 
 ## 1. 目的
 
-本書は JobRunner における Retry、Failure分類、Runner lost、Runtime再起動、Pause / Resume、Cancel、Timeout、Recovery policyを定義する。
+Structured Failure、Automatic/Manual Retry、backoff、Timeout、Runner/Runtime Recovery、Pause/Resume/Cancelを定義する。
 
 ## 2. 基本原則
 
-1. Retryは新Attemptを作る。
-2. 失敗Attemptをqueuedへ戻して再利用しない。
-3. Retry Inputは元Job Inputから変更しない。
-4. automatic retryはJob定義で明示時のみ有効。
-5. manual retryはService APIから行う。
-6. Job timeoutは未指定時なし。
-7. Cancelはgracefulを標準とする。
-8. force killは通常Service APIに含めない。
-9. Recoveryは履歴を破壊せずfail-closedで行う。
+1. Retryは新Attemptを作る。失敗Attemptを書き換えない。
+2. Retryの永続Job Input/Definition/Action version bindingは固定。
+3. Automatic RetryはYAMLで明示時のみ。
+4. Manual Retryはfailed Job 1件を明示指定するMVP API。
+5. Job timeout未指定は無期限。
+6. Cancelはgraceful。公開force-success/force-kill APIなし。
+7. Recoveryだけでcompleted Workflow Runを再openしない。
+8. completed failed Runを再openできるのは認可されたManual Retryだけ。
 
 ## 3. Structured Failure
-
-最低限:
 
 ```text
 category
@@ -38,7 +31,7 @@ details optional
 occurred_at
 ```
 
-category例:
+category:
 
 ```text
 execution
@@ -52,25 +45,29 @@ cancel
 internal
 ```
 
-code例:
+## 4. 標準failureの既定retryable
 
-```text
-action_exception
-action_process_exit
-output_validation_failed
-ipc_protocol_error
-job_timeout
-runner_lost
-action_version_mismatch
-external_lease_expired
-human_rejected
-cancelled
-internal_error
-```
+| code | default |
+| --- | --- |
+| `action_exception` | true |
+| `action_process_exit` | true |
+| `job_timeout` | true |
+| `runner_lost` | true |
+| `external_lease_expired` (`fail` policy) | true |
+| `child_workflow_start_failed` | true |
+| `output_validation_failed` | false |
+| `output_too_large` | false |
+| `success_condition_failed` | false |
+| `ipc_protocol_error` | false |
+| `action_version_mismatch` | false |
+| `human_rejected` | false |
+| `cancelled` | false |
+| `workflow_cycle_detected` | false |
+| `internal_error` | false |
 
-## 4. Retry YAML
+親定義/Actionがdomain failureを返す場合は明示`retryable`を設定できる。Engine標準codeのdefaultを親が無条件に上書きする仕組みはMVP必須にしない。
 
-GitHub Actions風の全体記法へ寄せるが、`retry`自体はJobRunner独自拡張。
+## 5. Retry YAML
 
 ```yaml
 retry:
@@ -82,300 +79,273 @@ retry:
     multiplier: 2.0
 ```
 
-## 5. Retry既定値
-
-`retry`未指定:
+未指定:
 
 ```text
-automatic retry = disabled
+automatic retry disabled
 max-attempts = 1
 ```
 
-manual retryは別扱い。
+`max-attempts`はautomatic schedulerが作成してよい**総Attempt番号の上限**。Manual Retryはこの上限を超えて新Attemptを開始できるが、`attempt_no >= max-attempts`になった後は追加Automatic Retryはしない。
 
-## 6. Automatic Retry判定
+## 6. Automatic Retry scheduling
 
-Attempt failure後:
+Failed Attempt確定後:
 
-1. failure確定
-2. Jobがcancel対象か確認
-3. `max-attempts`残数確認
-4. retry `if` 評価
+1. Workflow/Job cancel無し
+2. Retry policy存在
+3. current `attempt_no < max-attempts`
+4. Retry `if`を`failure` contextで評価
 5. backoff算出
-6. 次Attemptをqueued可能状態として予約
-7. Event記録
+6. Jobを`queued`、`retry_not_before`設定
+7. `retry_scheduled` Event
 
-`if`評価失敗はretryしない。Jobをfailureとして確定し、式評価failureを記録する。
+**この時点で次Attempt rowを作らない。**
+
+実際のnext Attemptは:
+
+- internal: Runner atomic claim
+- external: External activation
+- human: Human activation
+- reusable: Child activation
+
+で作る。
+
+Retry condition expression errorは追加retryせずJob failureを維持しdiagnostic Eventを残す。
 
 ## 7. Backoff
 
-MVPで以下を許可する。
-
 ```text
-initial-seconds
-max-seconds
-multiplier
+initial_seconds >=0
+max_seconds >= initial_seconds
+multiplier >=1
 ```
 
-jitterは必須にしない。
+Attempt nのdelayは実装上overflowしない範囲でexponential計算し`max_seconds`でclip。JitterはMVPなし。
 
-0秒も許可。
+`retry_not_before`まではRunner/External/Human/Child activation対象外。Runnerを占有しない。
 
-backoff待ちはRunnerを占有しない。
+## 8. Manual Retry API
 
-## 8. Manual Retry
-
-Service operation:
+MVPは**Job指定のみ**。
 
 ```text
-wf_retry
+wf_retry(workflow_run_id, job_run_id, request_id?)
 ```
 
-対象をWorkflow Run / Job単位で指定可能にする設計余地を持つ。
+要求条件:
 
-MVP基本はfailed Jobを指定してRetry。
+- Jobが`completed/failure`
+- Jobが指定Workflow Runに属する
+- Authorization pass
+- Workflow Run conclusionは`failure`またはRunがまだnon-terminal
+- cancel済みWorkflow Runはretry不可
+- original Action version / Reusable bindingが現在実行可能であることを再確認
 
-manual retryはauto retry上限消費後でも許可可能。
+Job Input変更は不可。
 
-新Attempt番号を払い出す。
+## 9. completed failed Workflow Run の再open
 
-## 9. Retry Input固定
+Manual Retry対象Runが`completed/failure`なら同一transactionで:
 
-Retry時に以下を変更しない。
+1. `workflow_runs.run_attempt += 1`
+2. Run `status = queued`、`conclusion = null`
+3. `failure_json = null`, `output_json = null`, `completed_at = null`
+4. target Jobのcurrent `conclusion/failure/completed_at`をclearし`queued`
+5. `retry_not_before = now`
+6. target Jobの**以前のAttempt rowsは維持**
+7. target failureにより`blocked`になったdescendant Jobを再評価可能な`queued`状態へ戻す
+8. Event + idempotency result
 
-- Job final Input
+### 9.1 descendant reset範囲
+
+Reset対象は:
+
+- conclusion=`blocked`
+- dependency graph上target Jobのdescendant
+- blocked reasonがdependency failure系
+
+Resetしない:
+
+- `success`済みJob
+- `failure`済み別Job
+- 明示`if=false`で`skipped`済みJob
+- `cancelled` Job
+
+ResetされたJobはactivation時に全dependencyを再確認し、別failureが残れば再びblockedになれる。
+
+Dynamic generated Jobもfull dependency graph上同規則。Dynamic expansion自体を再生成せず、既存generated Jobを使う。
+
+## 10. Manual RetryとAttempt番号
+
+Manual Retry request transactionではAttempt rowを作らない。次execution activationで`max(existing attempt_no)+1`を払う。
+
+Auto retry上限到達後でもManual Retry可能。Manual attempt後は総attempt_noが既に`max-attempts`以上なら追加Auto Retryなし。
+
+## 11. Retry Input / Secret / Artifact
+
+固定:
+
+- persisted Job Input
 - Workflow Definition snapshot
 - Workflow Input snapshot
+- Dynamic item/iteration
+- Reusable binding
+- Action ID/version
 
-Action versionは元Workflow Run snapshot基準で照合。
+Secretは同じreferenceを各internal Attempt起動直前に再materializeするためrotationを許容する（`02`）。
 
-current Registryが一致しなければRetry開始せず`action_version_mismatch`。
+Failed Attempt Output/Artifactはcurrentとして使わない。新successful Attemptがcurrentになる。
 
-## 10. Retry Output / Artifact
+## 12. Job Timeout
 
-失敗AttemptのOutputをcurrent成功Outputとして利用しない。
+`timeout-minutes`明示時のみ。
 
-新Attempt success後、そのOutput/Artifactがcurrentになる。
+期限:
 
-旧Attempt成果物は履歴として残す。
+1. Runner->Action Runner cancel(reason=timeout)
+2. graceful grace（System default 10秒）
+3. child未終了ならterminate
+4. Attempt failure `job_timeout`
+5. Automatic Retry判定
 
-## 11. Job Timeout
+External lease durationとは別。
 
-YAMLで明示時のみ有効。
+## 13. Runner lost
 
-```yaml
-timeout-minutes: 120
-```
+`04`のheartbeat/liveness threshold超過後、Recovery transactionでcurrent runner identityを再確認。
 
-またはJobRunner独自の細粒度記法を追加してもよいが、可能な限りGitHub Actions名へ寄せる。
+所有中running Attemptがまだ同じinstance/currentなら:
 
-未指定は無期限。
+- Attempt -> completed/failure `runner_lost`
+- Job failure stateへ
+- Runner -> lost
+- Retry policy評価
 
-## 12. Timeout処理
+Completionとのraceはconditional updateでfirst terminal transition wins。
 
-期限到達時:
+## 14. Runner restart
 
-1. RunnerがAction Runnerへcancel request
-2. graceful終了猶予
-3. 終了しない場合はRunnerがAction子Processをterminate可能
-4. Attemptをfailure / `job_timeout`で確定
-5. Retry policy適用
-
-Job timeoutとExternal Lease timeoutは別。
-
-## 13. Runner Lost
-
-Heartbeat期限超過でRunner lost判定。
-
-対象Runnerが所有していたrunning Attemptを`runner_lost` failureとして扱う。
-
-重複Recovery防止のため、conditional updateで未確定Attemptだけを確定する。
-
-その後Retry policyを適用。
-
-## 14. Runner Restart
-
-Runner Process再起動policy:
+Defaultは`04`:
 
 ```text
-mode: on_failure | never
-max_restarts
-window_seconds
-backoff
+on_failure
+5 restarts / 300s
+1s -> max30s exponential backoff
 ```
 
-Crash loop判定時はrestart suppressed。
+Crash loop -> `restart_suppressed`。Job retry policyとRunner restart policyは別物。
 
-suppressed状態をService/MCP/Webから取得可能にする。
+## 15. Parent Runtime restart
 
-## 15. Parent Runtime再起動
+1. new `runtime_instance_id`
+2. migration/Registry/Pool構築
+3. non-terminal Run列挙
+4. old runtime runnerをcurrent ownershipから除外
+5. running internal Attemptをfencing/runner_lost recovery
+6. External active leaseはexpires_atまで維持
+7. Human pending review維持
+8. waiting_child relation復元
+9. queued/retry_not_before/concurrency/pause再評価
+10. downstream activation漏れをidempotentに修復
 
-新Runtime起動時:
+Old Runtime/Runnerのlate updateは拒否。
 
-1. 新`runtime_instance_id`発行
-2. DB migration確認
-3. Registry / Runner Pool構築
-4. non-terminal Workflow Run列挙
-5. running AttemptとRunner heartbeat照合
-6. old runtime所属Runnerをcurrent ownershipとして認めない
-7. orphan running AttemptをRecovery
-8. External valid leaseは維持
-9. waiting_reviewは維持
-10. queued/ready判定再開
+## 16. Recovery idempotency
 
-## 16. Old Runner fencing
+何回実行しても:
 
-旧Runtimeまたは旧Runner instanceからのlate updateを拒否する。
+- terminal Attemptを再確定しない
+- duplicate Attemptを作らない
+- Dynamic expansionを重複しない
+- Child Run/bindingを重複しない
+- External Task/Human Reviewを同Attemptへ重複作成しない
+- completed RunをRecovery理由で再openしない
 
-更新要求には最低限:
+DB unique/conditional updateを利用する。
 
-```text
-runtime_instance_id
-runner_id
-runner_instance_id
-attempt_id
-```
+## 17. Pause / Resume
 
-を含め、current ownershipと一致する場合のみ受理。
+Pause:
 
-## 17. Pause
+- Run `paused`
+- running internal継続
+- new internal/external/new Child activation禁止
+- existing external submit/Human review/started Child進行は受理
+- Lease expiry clock継続
 
-Workflow Run単位。
+Resume:
 
-Pause要求時:
+- pause flag解除
+- activation再評価
+- Attempt追加なし
 
-- `pause_requested=true`
-- running internal Jobは継続
-- 新internal Jobをclaimさせない
-- 新external task claimを許可しない
-- waiting_reviewは保持
-- claim済みexternal submitは受理
-- review submitは受理
+同状態への再操作はidempotent no-op。
 
-## 18. Resume
+## 18. Cancel
 
-`pause_requested=false`にし、ready判定 / schedulingを再開。
-
-Resume自体で新Attemptは作らない。
-
-## 19. Cancel
-
-Workflow Run cancel時:
+Workflow cancel transaction/propagation:
 
 - `cancel_requested=true`
-- queued / ready Jobをcancelledへ
-- waiting_external task/leaseを無効化
-- waiting_reviewをcancelledへ
-- running internal Actionへcancel request
-- Reusable Workflow childへcancel伝播
-- 新Job activation禁止
+- queued Job -> completed/cancelled
+- waiting_external -> Lease invalidation + Attempt/Job cancelled
+- waiting_review -> Review cancelled + Attempt/Job cancelled
+- waiting_child -> Child cancel propagation
+- running internal -> cancel request
+- new activation/expansion禁止
 
-## 20. Graceful Cancel
+Cancel後late external/human/runner completionはstate/ownershipに従い拒否またはcancelled結論へ収束する。
 
-Action Runtime Handleでcancel確認可能にする。
+## 19. Force操作
 
-```python
-if runtime.cancel_requested():
-    return ...
-```
-
-協調停止を基本とする。
-
-Actionが応答しない場合のterminateはRunner運用上の最後の手段であり、一般利用者向けforce-success/force-cancelとは分ける。
-
-## 21. Cancel conclusion
-
-cancel要求により終了したJob:
+Public Service/MCPに:
 
 ```text
-status=completed
-conclusion=cancelled
+force_success
+force_complete
+force_kill_runner
 ```
 
-Workflow Runも必要Jobがcancelされた場合、最終conclusionはcancelled。
+をMVPでは提供しない。
 
-## 22. Human Reject
+Timeout/parent shutdown等でRunnerがAction子Processをterminateする内部運用は別。
 
-`human_rejected`はfailure。
+## 20. Workflow completion / Retry後
 
-人間操作だけでsuccessへ上書きしない。
+Retry後にtarget/descendantsが再terminalになったら通常`03`のWorkflow conclusionを再計算する。
 
-必要ならJob Retry。
+過去`run_attempt`の履歴はAttempt/Eventから追跡可能。同一Workflow Run IDを維持する。
 
-## 23. External Lease expiry
-
-Policy:
-
-```text
-requeue
-fail
-```
-
-`fail`時はstructured failureを生成しRetry policyへ渡す。
-
-`requeue`時は同一Attemptを再claim可能に戻す。
-
-## 24. Recovery idempotency
-
-Recovery処理は何度呼ばれても二重新Attemptや二重Eventを増やさないよう、状態条件とunique constraintを使う。
-
-例:
-
-```text
-attempt terminalなら再確定しない
-retry child既存なら再作成しない
-child Workflow Run既存なら再作成しない
-```
-
-## 25. Workflow Run completion再評価
-
-Recovery後、全Job状態を再評価しWorkflow Runがterminalになれる場合は確定する。
-
-terminal Workflow Runを再openしない。
-
-## 26. Failure propagation
-
-通常はrequired Job failureでWorkflow failure。
-
-`continue-on-error: true` Jobはdownstream条件評価に情報を残すが、Workflow最終failureへの寄与を抑制可能。
-
-`if: always()`等は通常condition規則に従う。
-
-## 27. Retry Event
-
-代表:
+## 21. Events
 
 ```text
 retry_scheduled
 retry_started
 retry_exhausted
 manual_retry_requested
+workflow_reopened_for_retry
 runner_lost
 runner_restart_suppressed
-recovery_started
-recovery_completed
-cancel_requested
-cancel_propagated
+recovery_started/completed
+cancel_requested/propagated
 ```
 
-## 28. 受入条件
+## 22. 受入条件
 
-1. auto retry disabled既定
-2. max-attempts
-3. retry if true/false
-4. exponential backoff
-5. manual retry
-6. Retry Input固定
-7. Action version mismatch拒否
-8. timeoutなし長時間Job
-9. timeout failure + retry
-10. runner_lost recovery
-11. runtime restart recovery
-12. old runner late update拒否
-13. pause中no new claim
-14. resume
-15. cancel queued/waiting/running
-16. external late submit拒否
-17. child workflow cancel伝播
-18. recovery二重実行安全
-19. terminal Runを再openしない
+1. retryable default table
+2. auto retry未指定無し
+3. max attempts / condition / backoff
+4. schedule時Attempt未作成
+5. executor別next Attempt作成
+6. Manual Retry Job-only
+7. completed failed Run reopen + run_attempt
+8. blocked descendant reset範囲
+9. success/skipped/cancelled descendant非reset
+10. retry Input/Reusable binding固定
+11. Secret再materialize
+12. timeout no-default + terminate
+13. runner_lost race/fencing/retry
+14. restart recovery exact
+15. pause/resume idempotent
+16. cancel全executor/child
+17. Recovery terminal Run非reopen
