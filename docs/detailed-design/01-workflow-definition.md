@@ -1,32 +1,29 @@
 # 01. Workflow Definition 詳細設計
 
-- Status: Draft v0.2
+- Status: Draft v0.3
 - 対象: MVP
 - 上位仕様: `docs/design.md`
-- 用語方針: GitHub Actions に対応概念がある場合は、可能な限り同じ用語を使う
 
 ## 1. 目的
 
-本書は JobRunner の Workflow YAML の正規契約を定義する。式評価、Dynamic Job 展開、Reusable Workflow 実行、Retry/Recovery、DB schema は各専用詳細設計に従う。
+JobRunner の Workflow YAML の正規契約を定義する。式評価、Dynamic Job、Reusable Workflow、Retry/Recovery、DB schema は各専用詳細設計に従う。
 
 ## 2. 基本原則
 
 1. canonical authoring format は YAML。
-2. YAML は安全な loader で読み込み、任意 Python/Shell/custom tag を実行しない。
-3. YAML mapping の重複 key は validation error。後勝ちで上書きしない。
-4. YAML merge key `<<` は MVP では禁止し、定義を明示的に保つ。
-5. 未知 key は schema validation error。黙って無視しない。
-6. load 後は typed immutable `WorkflowDefinition` に正規化する。
-7. Workflow Run 開始時に再検証し、その Run が使う定義を snapshot する。
-8. 実行開始後の元 YAML 変更は既存 Workflow Run に反映しない。
+2. safe loader を使用し、custom tag / 任意コード実行を禁止する。
+3. mapping の重複 key と YAML merge key `<<` は error。
+4. 未知 key は error。暗黙補正しない。
+5. load 後は typed immutable `WorkflowDefinition` に正規化する。
+6. Workflow Run 開始時に runtime dependency を含め再検証し、実使用定義を snapshot する。
+7. 実行開始後の元 YAML 変更は既存 Workflow Run に反映しない。
 
-## 3. トップレベル schema
+## 3. トップレベル
 
 ```yaml
 name: Example Workflow
 version: 1
 description: optional
-
 inputs: {}
 env: {}
 outputs: {}
@@ -36,24 +33,20 @@ settings: {}
 jobs: {}
 ```
 
-| key | 必須 | 型 | 説明 |
-| --- | --- | --- | --- |
-| `name` | yes | string | 表示名 |
-| `version` | yes | integer >= 1 | 親管理 version |
-| `jobs` | yes | mapping | Job 定義 |
-| `description` | no | string | 説明 |
-| `inputs` | no | mapping | Workflow Input schema |
-| `env` | no | mapping | Workflow Run 内の immutable static values |
-| `outputs` | no | mapping | Workflow-level Output mapping。Reusable Workflow の返値にも使う |
-| `priority` | no | integer | 既定 0。値が大きいほど高い |
-| `concurrency` | no | mapping | Workflow Run concurrency |
-| `settings` | no | mapping | JobRunner 固有設定 |
+必須は `name`, `version`, `jobs`。
 
-## 4. Workflow ID / version
+- `inputs`: Workflow Input schema
+- `env`: Run 内 immutable static values。**Secret参照も含め Secret 用途には使用しない**
+- `outputs`: Workflow-level Output mapping
+- `priority`: integer、既定 0、大きいほど高優先
+- `concurrency`: Workflow Run concurrency
+- `settings`: JobRunner 固有設定
 
-Workflow ID は YAML の `name` ではなく、親システムの登録名または WorkflowResolver が解決した canonical reference から与える。同一 Runtime registry 内で一意とする。
+## 4. Workflow ID / version / hash
 
-`version` は人間・親システム向けの明示 version であり、定義同一性そのものには使わない。定義同一性は typed definition の canonical JSON を SHA-256 した `definition_hash` でも確認する。
+Workflow ID は YAML の `name` ではなく、親システム登録名または WorkflowResolver の canonical reference から決める。
+
+`version` は親側の明示 version。定義同一性は typed definition の canonical JSON を SHA-256 した `definition_hash` でも確認する。
 
 ## 5. Workflow Input
 
@@ -67,54 +60,31 @@ inputs:
     default: M5
 ```
 
-標準型は `string / integer / number / boolean / object / array`。`null` 許可は schema で明示する。
+標準型: `string / integer / number / boolean / object / array`。`null` 許可は schema で明示する。
 
-Input field:
-
-- `type`: 必須
-- `required`: boolean、既定 false
-- `default`: 任意
-- `description`: 任意
-- `schema`: object/array 等の追加 JSON Schema
-
-Workflow Run 開始時に required、extra field、型、default を検証し、最終 Input を snapshot する。Run 中は変更しない。
+Run開始時に required / extra / type / default を検証し、最終 Input を snapshot する。Run中は変更しない。
 
 ## 6. `env`
 
-Workflow Run 内の immutable static values。
+Workflow Run 内の固定値のみ。
 
 ```yaml
 env:
   MODE: research
 ```
 
-Secret 値そのものは書かず `${{ secrets.NAME }}` を使用する。Secret の利用位置は `02-expression-and-inputs.md` に従う。
+`${{ secrets.* }}` は `env` では禁止。Secret は `02-expression-and-inputs.md` の規則に従い internal Action Job の `with` でのみ参照する。
 
 ## 7. Workflow-level `outputs`
-
-Workflow 完了時に公開する値を定義する。
 
 ```yaml
 outputs:
   score: ${{ jobs.aggregate.outputs.score }}
-  report: ${{ jobs.report.artifacts.report }}
 ```
 
-- key は output 名。
-- value は literal または `${{ ... }}`。
-- 評価 context の `jobs` は `02-expression-and-inputs.md` の Workflow Output 用 context に従う。
-- 通常 Workflow でも定義可能。Reusable Workflow 呼び出しでは親 Job Output として公開される。
-- Workflow conclusion が `success` のとき評価する。評価失敗は `workflow_output_invalid` として Workflow conclusion を `failure` にする。
+Workflow `success` 確定直前に `jobs` context で評価する。評価 failure は `workflow_output_invalid` とし Workflow conclusion を `failure` にする。
 
-## 8. Workflow priority
-
-```yaml
-priority: 10
-```
-
-整数、既定 0。Workflow Run 開始時に snapshot し、実行中は Service API から変更可能。変更は実行中 Job を preempt しない。
-
-## 9. Workflow concurrency
+## 8. Workflow concurrency
 
 ```yaml
 concurrency:
@@ -123,15 +93,15 @@ concurrency:
   on-limit: queue
 ```
 
-- `group`: 必須、固定 string または式
+- `group`: fixed string または式
 - `max-runs`: integer >= 1
 - `on-limit`: `queue | reject`、既定 `queue`
 
-未指定時は論理的 concurrency 制限なし。Runner Pool 数とは別概念。
+未指定時は無制限。
 
-## 10. Workflow `settings`
+## 9. Workflow `settings`
 
-MVP で受理する key:
+MVP:
 
 ```yaml
 settings:
@@ -141,24 +111,19 @@ settings:
   max-job-output-bytes: 4194304
 ```
 
-- `max-dynamic-jobs`: integer >= 0。既定 1000。
-- `external-lease-minutes`: positive number。既定 60。
-- `external-on-lease-expiry`: `requeue | fail`。既定 `requeue`。
-- `max-job-output-bytes`: positive integer。既定 4 MiB = 4,194,304 bytes。canonical UTF-8 JSON の byte 長で判定する。
+未知 key は error。優先順位は Job override > Workflow settings > System default。
 
-優先順位は Job override > Workflow settings > System default。未知 settings key は error。
+## 10. Job ID
 
-## 11. Job ID
-
-静的 Job ID は Workflow 内一意。
+静的 Job ID:
 
 ```text
 ^[A-Za-z_][A-Za-z0-9_-]*$
 ```
 
-`[` `]` `/` は Dynamic Job の logical key に使用するため静的 Job ID では禁止する。
+`[` `]` `/` は Dynamic logical key 用に予約する。
 
-## 12. Job 共通 field
+## 11. Job 共通 field
 
 ```yaml
 jobs:
@@ -182,106 +147,64 @@ jobs:
     external: null
 ```
 
-Reusable Workflow Job は `uses` を持つ。
+### 11.1 `needs`
 
-### 12.1 `needs`
+string または string array。存在しない Job、自己依存、duplicate、cycle は error。
 
-string 1件または string array。内部では順序付き tuple/list に正規化する。存在しない Job、自己依存、duplicate、DAG cycle は error。
+Dynamic `foreach.parent` も依存 edge として DAG cycle 検証対象に含める。
 
-Dynamic Job group や nested Dynamic Job の依存規則は `05-dynamic-jobs.md` に従う。
+### 11.2 `runs-on`
 
-### 12.2 `runs-on`
+internal Job の Runner Pool。省略時は System `default_runner_pool`、既定文字列 `default`。最終解決 Pool が未登録なら Run開始前 error。
 
-`internal` Job の Runner Pool。
+external/human/reusable では禁止。
 
-- optional。
-- 省略時は System `default_runner_pool` を使う。System default は文字列 `default`。
-- 最終的に解決された Pool が登録されていなければ Workflow Run 開始前 validation error。
-- `external_llm` / `human` / Reusable Workflow Job では指定禁止。
+### 11.3 `executor`
 
-`default` という Pool 自体が予約済みで必ず存在するわけではない。internal Job がそこへ解決される場合にのみ登録が必要。
+`internal | external_llm | human`。省略時 `internal`。Reusable Workflow Job は `uses` で識別し `executor` は書かない。
 
-### 12.3 `executor`
+### 11.4 `action`
 
-MVP:
+- internal: 必須
+- external_llm / human / reusable: 禁止
 
-- `internal`（省略時の既定）
-- `external_llm`
-- `human`
+### 11.5 `with`
 
-Reusable Workflow Job は `uses` で識別し、`executor` は指定しない。
+Action / External / Human / Child Workflow Input。Secret参照の可否は `02` に従う。
 
-### 12.4 `action`
+### 11.6 `if`
 
-- `internal`: 必須
-- `external_llm`: 禁止
-- `human`: 禁止
-- Reusable Workflow (`uses`): 禁止
+boolean式。未指定は `${{ success() }}`。
 
-External/Human payload は `with` だけで構築する。
+### 11.7 `success_if`
 
-### 12.5 `with`
+internal / external_llm の Output validation 後に評価。human/reusable では禁止。
 
-Action / executor / Child Workflow Input の定義。literal、array、object、expression を許可する。最終 Job Input は実行可能になった時点で解決・snapshotし、Retry では同じ永続 Input を再利用する。Secret の materialize は別扱い。
+### 11.8 `continue-on-error`
 
-### 12.6 `if`
+boolean または CEL boolean。activation 時に snapshot。Job failure 自体は保持し、依存進行と Workflow conclusion で許容 failure として扱う。
 
-boolean 式。未指定時は `success()`。`if=false` の終端規則は `02` / `03` に従う。
+### 11.9 `timeout-minutes`
 
-### 12.7 `success_if`
+positive number。未指定は timeout なし。
 
-Action または external result が正常に JSON Output を返した後に評価する optional boolean 式。
+**MVPで execution timeout を適用するのは internal Job のみ。**
 
-```yaml
-success_if: ${{ outputs.failed_count < 3 }}
-```
+- external_llm: `timeout-minutes` 禁止。待機制御は External Lease が担当
+- human: `timeout-minutes` 禁止。Review期限はMVPなし
+- reusable: `timeout-minutes` 禁止。子 Workflow 各Jobのtimeoutに委ねる
 
-`internal` / `external_llm` で利用可能。`human` / Reusable Workflow Job では指定禁止。
+### 11.10 `retry`
 
-### 12.8 `continue-on-error`
+未指定は automatic retry なし。詳細は `10`。
 
-boolean または CEL expression、既定 false。Job activation 時に評価し boolean を snapshot する。Job failure を success に書き換えず、dependency / Workflow conclusion で「許容 failure」として扱う。
+### 11.11 Job `outputs`
 
-### 12.9 `priority`
+internal/external result は JSON-compatible object。optional JSON Schema を指定可能。canonical UTF-8 JSON が `max-job-output-bytes` 超過なら `output_too_large`。
 
-integer、既定 0。値が大きいほど高い。
+### 11.12 `external`
 
-### 12.10 `timeout-minutes`
-
-positive number。未指定時は timeout なし。External lease timeout とは別概念。
-
-### 12.11 `retry`
-
-```yaml
-retry:
-  max-attempts: 3
-  if: ${{ failure.retryable }}
-  backoff:
-    initial-seconds: 5
-    max-seconds: 60
-    multiplier: 2.0
-```
-
-未指定時 automatic retry なし。詳細は `10-retry-recovery-cancel.md`。
-
-### 12.12 Job `outputs`
-
-Action/external result の JSON object 全体が `needs.<job>.outputs`。optional `schema` で JSON Schema 検証できる。
-
-```yaml
-outputs:
-  schema:
-    type: object
-    required: [count]
-    properties:
-      count: {type: integer}
-```
-
-canonical UTF-8 JSON が `max-job-output-bytes` を超える場合は `output_too_large` failure。大きいデータは Action/親側へ保存し Artifact として登録する。
-
-### 12.13 `external`
-
-`executor: external_llm` でのみ利用可能。
+external_llm Jobのみ。
 
 ```yaml
 external:
@@ -289,34 +212,23 @@ external:
   on-lease-expiry: fail
 ```
 
-- `lease-minutes`: positive number
-- `on-lease-expiry`: `requeue | fail`
-
-未指定値は Workflow settings > System default を継承する。
-
-## 13. Executor 別 field 制約
+## 12. Executor別制約
 
 ### internal
 
 - `action`: required
-- `uses`: forbidden
-- `external`: forbidden
-- `runs-on`: optional（default pool 解決）
+- `runs-on`: optional
+- `timeout-minutes`: optional
+- `uses/external`: forbidden
 
 ### external_llm
 
-- `action`: forbidden
-- `uses`: forbidden
-- `runs-on`: forbidden
+- `action/uses/runs-on/timeout-minutes`: forbidden
 - `external`: optional
 
 ### human
 
-- `action`: forbidden
-- `uses`: forbidden
-- `runs-on`: forbidden
-- `success_if`: forbidden
-- `external`: forbidden
+- `action/uses/runs-on/success_if/external/timeout-minutes`: forbidden
 
 ### Reusable Workflow
 
@@ -327,80 +239,72 @@ jobs:
     with: {}
 ```
 
-- `uses`: required
-- `action`, `executor`, `runs-on`, `success_if`, `external`: forbidden
-- `uses` reference は literal のみ。詳細は `06-reusable-workflows.md`。
+- `uses`: required, literal only
+- `action/executor/runs-on/success_if/external/timeout-minutes`: forbidden
 
-## 14. Dynamic Job の定義位置
+## 13. Dynamic Job syntax
 
-Root Dynamic Job:
+Root:
 
 ```yaml
-jobs:
-  evaluate:
-    foreach: ${{ needs.generate.outputs.items }}
-    key: ${{ item.id }}
-    action: evaluate
+foreach: ${{ needs.generate.outputs.items }}
 ```
 
-Nested Dynamic Job は `foreach.parent/items` object form を使う。詳細は `05-dynamic-jobs.md`。
+Nested:
 
-## 15. Definition Snapshot / hash
+```yaml
+foreach:
+  parent: evaluate
+  items: ${{ iteration.parent.outputs.conditions }}
+```
 
-Workflow Run 開始時に少なくとも保存する。
+`parent` edge も DAG dependency として扱う。詳細は `05`。
 
-- `workflow_id`, `version`, `name`
-- source YAML 全文
+## 14. Definition Snapshot
+
+Run開始時に保存:
+
+- workflow_id/version/name
+- source YAML全文
 - canonical typed definition JSON
-- SHA-256 `definition_hash`
+- SHA-256 definition_hash
 - Workflow Input snapshot
-- 使用 Action ID/version snapshot
-- optional `source_identity`
+- Action ID/version snapshot
+- optional source_identity
 
-Hash は typed definition の Runtime 非依存項目を JSON key sort / UTF-8 / NaN・Infinity禁止で deterministic serialization して SHA-256。
+## 15. 検証段階
 
-## 16. Reload
+load時:
 
-元 Workflow YAML は親システムが reload 可能にしてよい。reload は新しい Workflow Run にのみ影響し、既存 Run の snapshot は不変。
-
-## 17. 検証段階
-
-### load 時
-
-- safe YAML parse
-- duplicate mapping key / merge key / custom tag rejection
+- safe YAML
+- duplicate key / merge key / custom tag
 - schema / unknown key
-- Job ID / `needs` / cycle
-- executor別 field constraint
+- Job ID / `needs` / Dynamic parent edge / cycle
+- executor field constraint
 - CEL/JMESPath compile
-- Reusable Workflow reference syntax
-- retry/timeout/concurrency/settings 型
+- reusable reference syntax
+- retry/timeout/concurrency/settings
 
-### Workflow Run start 時
+Run start時:
 
-- Input validation
-- Action ID/version存在
-- resolved Runner Pool存在
-- Reusable Workflow解決/cycle
-- Secret reference policy
-- runtime settings妥当性
+- Input
+- Action ID/version
+- resolved Runner Pool
+- reusable resolution/cycle
+- Secret利用位置
+- runtime settings
 
-検証 failure では Workflow Run row を作らない。
+失敗時は Workflow Run row を作らない。
 
-## 18. 受入条件
+## 16. 受入条件
 
-最低限以下をテストする。
-
-1. valid YAML load
-2. duplicate YAML key / merge key / custom tag rejection
-3. unknown key rejection
-4. Workflow Input required/default/type/extra
-5. top-level Workflow `outputs`
-6. internal `runs-on` explicit/default/unregistered
-7. external/human/reusable field conflicts
-8. `success_if` field
-9. external lease override precedence
-10. 4 MiB Job Output limit
-11. action version snapshot
-12. definition hash deterministic
-13. source YAML change後も既存 Run snapshot不変
+1. duplicate/merge/custom tag拒否
+2. `env` Secret参照拒否
+3. Dynamic parent cycle検出
+4. internal timeout許可
+5. external/human/reusable timeout拒否
+6. executor別field conflict
+7. Workflow outputs
+8. output size limit
+9. definition hash deterministic
+10. source変更後も既存Run snapshot不変
