@@ -1,6 +1,6 @@
 # JobRunner 基本設計
 
-- Status: Draft v0.9
+- Status: Draft v1.0
 - 対象: MVP
 - WebUI: 画面設計のみ後続
 - 用語: GitHub Actions に対応概念がある場合は可能な限り合わせる
@@ -46,7 +46,41 @@ jmespath >=1.1,<2
 
 SQLite/process/JSON/UUID等はPython標準libraryを優先する。
 
-## 3. 用語
+## 3. Package / optional dependency
+
+1 GitHub Repository / 1 Python Package。
+
+概念構成:
+
+```text
+jobrunner/
+├─ definitions/
+├─ runtime/
+├─ runners/
+├─ actions/
+├─ validators/
+├─ expressions/
+├─ persistence/
+├─ artifacts/
+├─ events/
+├─ security/
+└─ adapters/
+   ├─ mcp/
+   └─ web/
+```
+
+配布extras:
+
+```text
+jobrunner
+jobrunner[mcp]
+jobrunner[web]
+jobrunner[all]
+```
+
+Base packageはMCP/HTTP Adapter implementationへ依存しない。Core -> Adapterの逆依存禁止。Parentは既存MCP/Web serverへAdapterをregisterして使い、JobRunner専用serverを別管理しない。
+
+## 4. 用語
 
 | 用語 | 意味 |
 | --- | --- |
@@ -63,7 +97,7 @@ SQLite/process/JSON/UUID等はPython標準libraryを優先する。
 
 正式用語は`Runner`。`Worker`は使わない。
 
-## 4. 組み込み構成
+## 5. 組み込み構成
 
 ```text
 Parent System
@@ -84,13 +118,15 @@ Parent System
 
 親起動時にRuntime/Registry/Runner Poolを自動初期化。JobRunner専用サービス手動起動不要。
 
-Maintenance LoopはCron/SchedulerではなくRetry/Lease等の期限処理専用。
+Maintenance LoopはCron/SchedulerではなくRetry/Lease/Retention等の内部期限処理専用。
 
-## 5. Workflow Definition
+## 6. Workflow Definition / reload
 
-Canonical format YAML。safe loader、duplicate/merge/custom tag/unknown key reject。
+Canonical format=YAML 1.2。safe loader、duplicate/merge/custom tag/unknown key reject。
 
 Workflow Inputは`type/required/nullable/default/schema`。null許可は`nullable:true`。
+
+JSON SchemaはDraft2020-12。Canonical JSONは`jobrunner.canonical-json.v1`。
 
 `env`はJSON-compatible literal-only。Expression/Secret禁止。
 
@@ -102,11 +138,14 @@ Run開始時snapshot:
 - Input
 - Action ID/version
 - Validator ID/version
+- effective Retention policy
 - optional non-empty `source_identity`
 
-既存Runは元YAML変更の影響無し。
+Workflow YAMLは親Process再起動なしでreload可能。Filesystem Resolverはsource metadata変化または明示`refresh()`で再read/validateする。Invalid new YAML時はold cacheへsilent fallbackせずnew Runを拒否する。Existing Runは元snapshot継続。
 
-## 6. Expression / Validation / Secret
+Python Action/Validator code hot reloadはJobRunner専用機構を作らず親development autoreloadへ任せる。
+
+## 7. Expression / Validation / Secret
 
 GitHub Actions風`${{ ... }}`。
 
@@ -135,7 +174,7 @@ Known Secret:
 
 変形Secretの完全検出は保証しない。
 
-## 7. Action / Validator Registry
+## 8. Action / Validator Registry
 
 両Registryは親bootstrapで各Process起動時に再構築。
 
@@ -158,7 +197,7 @@ Runtime Handle:
 - managed Artifact put/materialize
 - external Artifact reference
 
-## 8. Runner / Runner Pool
+## 9. Runner / Runner Pool
 
 Pool事前登録。未登録Run開始前error。`runs-on`省略はSystem `default_runner_pool`、default文字列`default`。
 
@@ -175,7 +214,7 @@ Pool事前登録。未登録Run開始前error。`runs-on`省略はSystem `defaul
 
 Priority signed64。External claimも同軸。
 
-## 9. Runner / IPC / Heartbeat
+## 10. Runner / IPC / Heartbeat
 
 Runner管理ProcessとAction子Process分離。Heartbeat Thread別。
 
@@ -187,19 +226,22 @@ Large Action Returnはworkdir reserved `result.json`へ書き、IPCはpath/size/
 
 Parent正常shutdownはWorkflow cancelではない。未完了running Attemptは次回runner_lost Recovery。
 
-## 10. Maintenance Loop / Timeout
+## 11. Maintenance Loop / Timeout
 
 Maintenance Loopはbusy-loopせずdeadline/event待機し、少なくとも:
 
 - `retry_not_before`
 - External Lease `expires_at`
 - concurrency wake
+- Retention due items
+- orphan temp/payload/artifact cleanup
+- expired idempotency cleanup
 
-を処理。Default max sleep5秒。Pause中もLease expiryは進む。Restart時overdue deadlineを先処理。
+を処理。Default max sleep5秒。Pause中もLease expiry/Retention housekeepingは進む。Restart時overdue deadline/due Retentionを再処理。
 
 Job `timeout-minutes`はinternalだけ、hidden default無し。ExternalはLease、Human期限無し、ReusableはChild内timeout。
 
-## 11. 状態 / 条件
+## 12. 状態 / 条件
 
 Job status:
 
@@ -233,7 +275,7 @@ Normal skipped dependencyはeffective successではなく後段default skip。Dy
 
 Cancel後はalwaysでもnew activation無し。
 
-## 12. JSON Output / PayloadStore
+## 13. JSON Output / PayloadStore
 
 Action/External resultは任意JSON-compatible value。
 
@@ -248,7 +290,7 @@ Default inline threshold=4MiB。
 
 Blob size/digest integrity。missing/corruption fail-closed。
 
-## 13. ArtifactStore
+## 14. ArtifactStore
 
 ArtifactはOutputと別の明示成果物。
 
@@ -268,7 +310,7 @@ External reference:
 
 Standard `LocalArtifactStore`。
 
-## 14. Dynamic Job
+## 15. Dynamic Job
 
 Root foreach / Nested `foreach.parent/items`。
 
@@ -281,7 +323,7 @@ Root foreach / Nested `foreach.parent/items`。
 - filesystem opaque ID
 - expansion preflightでAction/Validator version検証
 
-## 15. Reusable Workflow
+## 16. Reusable Workflow
 
 `uses`でChild Run。
 
@@ -297,7 +339,7 @@ Retry same binding。Missing snapshot versionはfail-closed。
 
 Parent/Child state非共有。Child direct public control禁止。
 
-## 16. External LLM / Human
+## 17. External LLM / Human
 
 External:
 
@@ -317,7 +359,7 @@ Human:
 - first-wins
 - Job Output null
 
-## 17. Retry / Recovery
+## 18. Retry / Recovery
 
 Retry=new Attempt、persistent Input/Definition/Action+Validator version/Dynamic iteration/Reusable binding固定。
 
@@ -343,7 +385,7 @@ Manual Retryはfailed Job + prior failed Attempt/Input Snapshot必須。Pre-Atte
 
 Completed/failure Run manual retryはsame Run reopen + run_attempt++。Recoveryだけでcompleted reopen無し。
 
-## 18. Same-Run Result Reuse
+## 19. Same-Run Result Reuse
 
 Automatic reuse same Workflow Runのみ。
 
@@ -359,14 +401,14 @@ state.getやundeclared Artifact materializeはineligible。
 
 Manual Retry後successful descendantsはkey再検証。Mismatch/ineligible/Payload/version問題は`successful_job_result_not_reusable`でnew Run要求。
 
-## 19. Pause / Cancel
+## 20. Pause / Cancel
 
 Pause:
 
 - running internal継続
 - new internal/External claim/Dynamic expansion停止
 - existing submit/review/Child進行可
-- Lease expiry継続
+- Lease expiry/Retention housekeeping継続
 
 Cancel:
 
@@ -376,7 +418,7 @@ Cancel:
 - internal graceful cancel
 - Child propagation
 
-## 20. Workflow State / Log
+## 21. Workflow State / Log
 
 State persistent get/set, last-write-wins, revision/history。CAS/increment無し。Child independent。
 
@@ -384,7 +426,7 @@ Execution Log=file、Event Log=append-only DB、Step=観測単位。
 
 Temp終了時削除、sandboxではない。
 
-## 21. Persistence / Idempotency
+## 22. Persistence / Idempotency / Retention
 
 SQLite WAL/FK/busy timeout。FK NO ACTION、Retention explicit delete order。
 
@@ -399,12 +441,27 @@ SQLite WAL/FK/busy timeout。FK NO ACTION、Retention explicit delete order。
 - concurrency case-sensitive
 - Payload integrity
 - Action/Validator snapshot/reuse metadata
+- Retention policy snapshot
 
 Idempotency scope=namespace+resource+AccessScope+Actor/client principal、TTL24h。Expired row replace可能。
 
-HTTP replayは初回status/bodyを維持するためadapter replay metadataを保存可能。
+Retention exact keys:
 
-## 22. Authorization / Service / MCP / HTTP
+```text
+run-history-days
+execution-logs-days
+event-days
+artifact-metadata-days
+managed-artifact-data-days
+```
+
+各`null=unlimited`、System default全null。Workflow specified > System > unlimited。Run start時effective policy snapshot。
+
+Non-terminal Run/current Log/current Artifactを期限だけで削除しない。Run history expiryはowned componentの最終上限。External Artifact実体は削除しない。
+
+Run削除等のRetention証跡はRun FKを持たないsystem-level `retention_deleted` / `retention_orphan_cleaned` Eventへ残し、通常`event-days`対象外・MVP無期限保持。
+
+## 23. Authorization / Service / MCP / HTTP
 
 Authentication親責任。全public read/write Authorization、default AllowAll。
 
@@ -433,14 +490,12 @@ MVP HTTP statusは200/201/400/401/403/404/409/413/500。422無し。Idempotent r
 
 Run infoにOutput/Log本文無し。Output readはJMESPath select可。MCP oversized full resultはno truncate error。
 
-## 23. Retention / Scheduler / CLI / WebUI
+## 24. Scheduler / CLI / WebUI
 
-Retention default unlimited。
-
-User Workflow Scheduler/Cron/CLIはMVP無し。Maintenance Loopは内部deadline処理でありScheduler機能ではない。
+User Workflow Scheduler/Cron/CLIはMVP無し。Maintenance Loopは内部期限/housekeeping処理でありWorkflow Scheduler機能ではない。
 
 WebUI画面構成だけ後続。Service/HTTP contractは固定済み。
 
-## 24. Source of Truth
+## 25. Source of Truth
 
 実装時は`docs/detailed-design/01`〜`13`がSource of Truth。衝突時は最新具体的詳細設計を優先し、基本設計も同期する。
