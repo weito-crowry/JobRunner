@@ -1,63 +1,52 @@
 # 08. Persistence 詳細設計
 
-- Status: Draft v0.4
+- Status: Draft v0.5
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 
 ## 1. 目的
 
-SQLite schema、PayloadStore / ArtifactStore metadata、transaction、unique/index、Migration、Recovery、Idempotencyの正規契約を定義する。
+SQLite schema、PayloadStore / ArtifactStore metadata、Result Reuse metadata、transaction、Migration、Recovery、Idempotencyを定義する。
 
 ## 2. Storage構成
 
 ```text
 SQLite
-├─ Runtime state / history / inline JSON
+├─ Runtime state/history/inline JSON
 ├─ Payload metadata
-└─ Artifact metadata
+├─ Artifact metadata
+└─ Reuse metadata
 
 PayloadStore
 └─ large JSON Output blob
 
 ArtifactStore
-└─ Actionが明示登録したmanaged artifact実体
+└─ explicitly managed artifact data
 ```
 
-MVP標準:
+MVP standard:
 
-- SQLite: Python stdlib `sqlite3`
-- PayloadStore: `LocalHybridPayloadStore`
-  - <= inline threshold: SQLite
-  - > threshold: durable filesystem JSON blob
-- ArtifactStore: `LocalArtifactStore`
-  - managed artifactをdurable filesystemへcopy
-
-Storage interfaceを抽象化し将来backend交換可能にする。
+- `sqlite3`
+- `LocalHybridPayloadStore`: <= threshold SQLite / > threshold filesystem
+- `LocalArtifactStore`: durable filesystem
 
 ## 3. SQLite設定
 
-Connection:
-
 ```text
 PRAGMA foreign_keys=ON
-PRAGMA busy_timeout=5000  # default configurable
-```
-
-DB:
-
-```text
+PRAGMA busy_timeout=5000
 PRAGMA journal_mode=WAL
 ```
 
-競合writeは必要に応じ `BEGIN IMMEDIATE`。長transaction禁止。
+競合writeは必要に応じ`BEGIN IMMEDIATE`。長transaction禁止。
 
 ## 4. ID / time / JSON
 
-外部IDはtype prefix + UUID4 hex。時刻はUTC RFC3339。
+IDはtype prefix + UUID4 hex。UTC RFC3339。
 
-Canonical JSON: UTF-8、NaN/Infinity禁止、object key deterministic serialization。
+Canonical JSONはUTF-8、NaN/Infinity禁止、deterministic object serialization。
 
-## 5. MVP tables
+## 5. Tables
 
 ```text
 schema_migrations
@@ -80,11 +69,9 @@ human_reviews
 idempotency_records
 ```
 
-Payload blobはtableを増やさずWorkflow Run / Attempt rowのstorage metadataで管理する。
-
 ## 6. Output payload columns
 
-Workflow OutputとAttempt Outputは同じshape。
+Workflow Run / Job AttemptのOutput:
 
 ```text
 output_storage_kind  NULL | inline | blob
@@ -96,44 +83,31 @@ output_digest        NULL | TEXT
 
 Constraint:
 
-- no output: all null
-- inline: `output_json NOT NULL`, blob_key null
-- blob: `output_json NULL`, blob_key NOT NULL
-- size/digestはoutputありなら必須
+- none: all null
+- inline: output_json set / blob_key null
+- blob: output_json null / blob_key set
+- outputありならsize/digest必須
 
-Blob keyはdata root相対のCore生成key。外部pathを受け取らない。
-
-## 7. PayloadStore write/read
+## 7. PayloadStore crash consistency
 
 Write:
 
-1. JSON/schema/success_if/SecretGuard完了
-2. canonical JSON bytes作成
-3. digest SHA-256
-4. threshold比較
-5. inlineまたはtemp blobへwrite
-6. DB state transition transactionでmetadata確定
-7. blobの場合DB commit後もdurable fileが存在することを保証
+1. result validation + SecretGuard
+2. canonical JSON bytes + SHA-256
+3. threshold判定
+4. blobなら `<key>.tmp` write/close -> atomic rename
+5. DB terminal transactionでmetadata commit
 
-### 7.1 crash consistency
+DB commit前crashのorphan blobはmaintenance cleanup。
 
-Blob writeは:
+Readでexistence/size/digest検証。不整合:
 
 ```text
-<key>.tmp -> fsync/close -> atomic rename -> DB metadata commit
+payload_missing
+payload_digest_mismatch
 ```
 
-を基本とする。
-
-DB commit前crashでorphan blobが残ることは許容し、maintenanceで削除。
-
-DBがblobを参照しているのにfileが無い状態は通常operationでは作らない。
-
-Read時にfile existence/size/digestを検証し、不整合は `payload_missing` / `payload_digest_mismatch`。
-
-### 7.2 Transparent read
-
-Repository/Serviceはstorage kindを隠蔽し、callerへ元のJSON valueを返す。
+Repository/Serviceはinline/blob差を隠し元JSON valueを返す。
 
 ## 8. `workflow_runs`
 
@@ -157,19 +131,32 @@ created_at/started_at/completed_at/updated_at
 
 ## 9. `job_runs`
 
-Job logical/current state:
-
 ```text
-id/workflow_run_id/job_key/template/dynamic parent metadata
-executor/action/version/uses/runs_on
-status/conclusion/priority/continue_on_error
+id
+workflow_run_id
+job_key/job_template_key/dynamic_key/parent_job_run_id/dynamic_expansion_id
+item_snapshot_json/iteration_context_json/source_order/order_rank
+executor/action_id/action_version/uses_ref/reusable_binding_id/runs_on
+status/conclusion
+terminal_reason nullable
+priority/continue_on_error
 timeout_seconds/retry_policy_json/retry_not_before
 current_attempt_no/current_attempt_id
-ready/queue/start/complete timestamps
+reuse_check_pending INTEGER NOT NULL DEFAULT 0 CHECK IN(0,1)
 current_failure_json
+ready_at/queued_at/started_at/completed_at/created_at/updated_at
 ```
 
-**Output payload実体/metadataのSource of Truthはsuccessful `job_attempts`。** `job_runs`へOutputを二重保存しない。
+`terminal_reason` example:
+
+```text
+condition_false
+dependency_skipped
+dependency_failed
+dynamic_empty
+cancelled
+execution_terminal
+```
 
 `UNIQUE(workflow_run_id, job_key)`。
 
@@ -181,6 +168,8 @@ ON job_runs(workflow_run_id)
 WHERE status='running' AND executor='internal';
 ```
 
+Output Source of Truthはsuccessful `job_attempts`。
+
 ## 10. `job_attempts`
 
 ```text
@@ -189,143 +178,142 @@ status/conclusion
 runner_id/runner_instance_id/runtime_instance_id
 input_json
 output_storage_kind/output_json/output_blob_key/output_size_bytes/output_digest
-reuse_key nullable
+reuse_eligible INTEGER NULL CHECK IN(0,1)
+reuse_context_json TEXT NULL
+reuse_key TEXT NULL
 failure_json
 started_at/completed_at/created_at
 ```
 
+Successful Attemptでは `reuse_eligible/reuse_context/reuse_key` を確定する。
+
+`reuse_context_json`はnon-secret:
+
+```text
+workflow_run_id
+job_key
+definition_hash
+persistent_input_digest
+direct_upstream_artifacts
+executor_identity
+ineligibility_reason optional
+```
+
 `UNIQUE(job_run_id, attempt_no)`。
 
-Attempt immutable history。Current Job Outputはcurrent successful Attemptから解決。
+## 11. Reuse key transaction
 
-## 11. Dynamic / Reusable
+Execution activation時にbase reuse contextを作る。Runtime Handle利用によりeligibilityが変わり得るため、最終 `reuse_eligible/key` はsuccessful terminal transition時に確定する。
 
-`dynamic_expansions`はroot/nested partial unique index。
+- `state_get` 使用 -> reuse_eligible=false
+- undeclared/dynamic Artifact materialize -> false
+- otherwise canonical reuse context SHA-256
 
-Full logical `job_key`はTEXT、固定長CHECK無し。
+Output Payload commitとreuse metadataとJob success transitionは同じlogical terminal operationで確定する。
 
-`reusable_bindings`: one binding / parent_job_run_id。
+## 12. Manual Retry reopen / reuse markers
+
+Completed/failure Runのmanual retry transaction:
+
+1. `run_attempt += 1`
+2. Run reopen
+3. target failed Job -> retry waiting
+4. target dependency closureのblocked/skipped descendants -> non-terminal activation待ちへ戻す
+5. successful descendants -> `reuse_check_pending=1`
+6. Event/idempotency
+
+Successful JobのAttempt/Output/Artifactを削除しない。
+
+Reuse check結果:
+
+- match -> `reuse_check_pending=0`, success維持、`job_result_reused`
+- mismatch/ineligible/payload missing -> Run failure `successful_job_result_not_reusable`
+
+MVPでは同Job Runへnew Inputのre-executionを自動作成しない。
+
+## 13. Dynamic / Reusable uniqueness
+
+`dynamic_expansions`: root/nested partial unique。Full `job_key` TEXT、固定長CHECK無し。
+
+`reusable_bindings`: one / parent_job_run_id。
 
 Child Run: one / parent_attempt_id partial unique。
 
-## 12. Workflow State
+## 14. State
 
-Current + append-only history。同transaction。
+Current + append-only historyを同transaction。State valueはSecretGuard対象。
 
-State valueはJSON-compatible。SecretGuard通過必須。
-
-## 13. Artifact metadata
+## 15. Artifact metadata / Store
 
 ```text
-id
-workflow_run_id
-job_run_id
-attempt_id
-name
-storage_kind      # managed | external
+id/workflow_run_id/job_run_id/attempt_id/name
+storage_kind = managed|external
 store_key nullable
 external_uri nullable
-media_type nullable
-size_bytes nullable
-digest nullable
-metadata_json nullable
-created_at
-data_deleted_at nullable
-metadata_deleted_at nullable
+media_type/size/digest/metadata
+created_at/data_deleted_at/metadata_deleted_at
 ```
 
-Constraint:
+ManagedはArtifactStore、Externalはparent data。
 
-- managed: `store_key`必須、external_uri null
-- external: `external_uri`必須、store_key null
+Managed putはwork_dir内source -> temp copy/Secret scan/digest -> atomic finalize -> metadata/Event。
 
-Managed Artifactの実体はArtifactStore。External Artifactの実体は親側。
+## 16. Events / Logs / Runners
 
-## 14. ArtifactStore transaction boundary
+Eventはappend-only + SecretGuard。
 
-Managed `put_file`:
+Execution Log DBはrelative path metadataのみ。
 
-1. source pathをAttempt work_dir内へcanonicalize
-2. Coreがartifact_id/store_keyを発行
-3. ArtifactStoreへtemp copy + digest/size計算
-4. atomic finalize
-5. Artifact metadata transaction insert + Event
+Runner fencingにruntime/runner instance + heartbeat/main_loop_tick。
 
-DB insert失敗時のorphan store objectはmaintenance削除。
+## 17. External / Human uniqueness
 
-External `register_reference`はmetadata transactionのみでCoreがURI fetchしない。
+- one Task / Attempt
+- one active Lease / Task
+- one Review / Attempt
 
-## 15. Events / Logs / Runners
-
-Eventsはappend-only structured data。SecretGuard通過。
-
-Execution Log DBはrelative path/size/time metadataのみ。
-
-Runner fencing用にrunner/runtime instance、heartbeat、main_loop_tickを保存。
-
-## 16. External / Human uniqueness
-
-- one External Task / Attempt
-- one active Lease / Task partial unique
-- one Human Review / Attempt
-
-## 17. Idempotency
+## 18. Idempotency
 
 ```text
 scope/operation/request_key PK
 request_hash/result_json/status/created_at/expires_at
 ```
 
-Default TTL 24h。
+Default TTL24h。
 
-Scope:
+Scope includes system namespace + resource + AccessScope + Actor/client principal。
 
-- system namespace
-- resource scope
-- AccessScope canonical identity
-- Actor/client principal
+TTL内replay/conflict。Expiry後row残存でも同transactionで置換してnew requestとして利用可能。
 
-TTL内same hash replay、different hash conflict。
+## 19. Concurrency
 
-Expiry後rowが残っていても同transactionでexpired rowを置換しsame keyをnew requestとして利用可能。
+Workflow start/slot releaseは`BEGIN IMMEDIATE`でholder count再確認。
 
-## 18. Concurrency / Retry transactions
+## 20. Migration
 
-Workflow start/slot releaseは `BEGIN IMMEDIATE` でholder count再確認。
+`migrations/NNN_name.sql` + `schema_migrations`。順序1回、fail-closed。
 
-Manual Retry reopen:
-
-- run_attempt++
-- completed/failure Runをreopen
-- target failed Job retry waiting
-- blocked/skipped descendants再評価
-- successful descendantは`03`のResult Reuse検証対象
-
-## 19. Migration
-
-`migrations/NNN_name.sql` + `schema_migrations`。順序通り1回、失敗fail-closed。
-
-## 20. Retention / cleanup
+## 21. Retention
 
 Default無期限。
 
-- Output blob: owning Run/Attempt retentionと一緒にPayloadStoreからdelete
-- managed Artifact: ArtifactStoreから実体delete + `data_deleted_at`
-- external Artifact: Coreは外部実体をdeleteしない
-- orphan `.tmp` / unreferenced blob/store objectはmaintenance削除
-- idempotency expired record削除可能
+- Output blob: owner Run/Attempt retentionでdelete
+- managed Artifact: ArtifactStore delete
+- external Artifact: external data deleteしない
+- orphan temp/blob/store object cleanup
+- expired idempotency cleanup
 
-## 21. 受入条件
+Successful result reuse対象Payload/managed Artifactがretentionで消えた場合、その結果は後続reuse checkで不適格になる。
 
-1. inline/spill boundary
-2. blob crash consistency/orphan cleanup
-3. transparent load
-4. missing/digest mismatch
-5. arbitrary JSON Output
-6. managed ArtifactStore copy
-7. external Artifact reference no fetch/delete
-8. internal running unique
-9. Dynamic/Reusable/External/Human unique
-10. state/Event SecretGuard
-11. idempotency scope/TTL
-12. retention managed data deletion
+## 22. 受入条件
+
+1. inline/blob constraints/crash consistency
+2. arbitrary JSON transparent read
+3. managed/external Artifact
+4. reuse_context/key persistence
+5. state_get reuse ineligible
+6. Manual Retry reuse_check_pending
+7. reuse match/mismatch transaction
+8. one-running/Dynamic/Reusable/External/Human unique
+9. idempotency/concurrency
+10. retention causes reuse failure not silent reuse
