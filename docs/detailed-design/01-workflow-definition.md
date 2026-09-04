@@ -1,16 +1,16 @@
 # 01. Workflow Definition 詳細設計
 
-- Status: Draft v0.6
+- Status: Draft v0.7
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 
 ## 1. 目的
 
-JobRunner の Workflow YAML とMVP基盤依存の正規契約を定義する。式評価、Dynamic Job、Reusable Workflow、Retry/Recovery、Storage schema は各専用詳細設計に従う。
+JobRunner の Workflow YAML、型、JSON Schema、canonical serialization、Action/Validator定義の正規契約を定義する。
 
 ## 2. MVP Python / OSS依存
 
-Pythonは **3.10以上**。
+Python **>=3.10**。
 
 ```text
 ruamel.yaml >=0.19.1,<0.20
@@ -20,27 +20,79 @@ cel-python >=0.5,<0.6
 jmespath >=1.1,<2
 ```
 
-PyPI `cel-python` は `cloud-custodian/cel-python` を指す。
+PyPI `cel-python` は cloud-custodian/cel-python。
 
-ライセンスは `ruamel.yaml/pydantic/jsonschema/jmespath = MIT`, `cel-python = Apache-2.0`。通常のCore依存として許容する。
+ライセンス: `ruamel.yaml/pydantic/jsonschema/jmespath=MIT`, `cel-python=Apache-2.0`。
 
-`ruamel.yaml 0.19.0` は導入上の既知問題を避けるため対象外。
+`ruamel.yaml 0.19.0` は導入上の既知問題を避け対象外。
 
-Process/SQLite/JSON/UUID等はPython標準libraryを優先する。
+Process/SQLite/JSON/UUID/hashlibはPython標準libraryを優先。
 
 ## 3. YAML基本原則
 
-1. canonical authoring formatはYAML。
-2. safe loaderを使用しcustom tag/任意コード実行禁止。
-3. mapping duplicate key、merge key `<<` はerror。
-4. unknown keyはerror。
-5. load後はtyped immutable `WorkflowDefinition`。
-6. Run開始時にruntime dependency含め再検証し実使用定義をsnapshot。
-7. 元YAML変更は既存Runへ反映しない。
-8. 数値fieldはNaN/Infinityを拒否する。
-9. SQLite INTEGERへ保存する整数はsigned 64-bit範囲。
+1. Canonical authoring format=YAML 1.2。
+2. `ruamel.yaml` safe loaderをYAML 1.2 modeで使用。
+3. custom tag/任意object construction禁止。
+4. duplicate mapping key reject。
+5. merge key `<<` reject。
+6. unknown key reject。
+7. load後typed immutable `WorkflowDefinition`。
+8. 数値NaN/Infinity reject。
+9. SQLite INTEGER対象はsigned64範囲。
+10. Run開始時再検証し実使用Definition snapshot固定。
 
-## 4. トップレベル
+YAML 1.1の暗黙boolean等へfallbackしない。
+
+## 4. Canonical JSON v1
+
+Definition hash、Input digest、Output digest、reuse key等で共通利用するserializationを `jobrunner.canonical-json.v1` と呼ぶ。
+
+Python標準`json.dumps`相当で以下を固定:
+
+```python
+json.dumps(
+    value,
+    ensure_ascii=False,
+    sort_keys=True,
+    separators=(",", ":"),
+    allow_nan=False,
+)
+```
+
+その結果のUnicode stringをUTF-8 encodeする。
+
+追加規則:
+
+- JSON object keyはstringのみ
+- duplicate keyは構築前段で禁止
+- NaN/Infinity禁止
+- Python独自型(datetime, Decimal, bytes, tuple等)を暗黙変換しない
+- tuple等内部typed modelはJSON treeへ明示変換してからcanonicalize
+- Unicode normalization(NFC等)を暗黙適用しない
+- `1` と `1.0` は異なるJSON表現として扱う
+
+Hash/digest:
+
+```text
+SHA-256(canonical-json-v1 UTF-8 bytes)
+lowercase hex 64 chars
+```
+
+Definition/reuse/output等で別々のJSON serializerを作らない。
+
+## 5. JSON Schema contract
+
+MVPで受理するJSON Schema draftは **Draft 2020-12のみ**。
+
+- `$schema` omitted -> Draft 2020-12として解釈
+- `$schema` present -> `https://json-schema.org/draft/2020-12/schema` のみ受理
+- 他Draft URIはdefinition validation error
+- `jsonschema.Draft202012Validator.check_schema()` 相当でDefinition load/start前にschema自体を検証
+- Runtime validationもDraft202012Validator semantics
+
+Format validation (`format: email`, `date-time`等) はMVP既定では**annotationのみで強制しない**。親がformat checker挙動へ依存しないよう固定する。業務format検証はCustom Validatorまたは明示pattern等を使う。
+
+## 6. トップレベル
 
 ```yaml
 name: Example Workflow
@@ -55,17 +107,25 @@ settings: {}
 jobs: {}
 ```
 
-必須: `name/version/jobs`。
+Required: `name/version/jobs`。
 
-`env` はRun内immutable static JSON-compatible literal。Expression/Secret参照禁止。
+`env`=immutable JSON-compatible literal、Expression/Secret禁止。
 
-## 5. Workflow ID / version / hash
+## 7. Workflow ID / version / hash
 
 Workflow IDは親登録名またはWorkflowResolver canonical reference。
 
-`version`は `1..9223372036854775807` の整数。定義同一性はtyped definition canonical JSONのSHA-256 `definition_hash`でも確認する。
+`version`=`1..signed64 max` integer。
 
-## 6. Workflow Input
+Definition hash:
+
+1. typed Definitionからruntime非依存Definition treeを作る
+2. `jobrunner.canonical-json.v1`
+3. SHA-256
+
+Source YAML bytesそのものではなく意味の正規化後Definitionでhashする。Source YAML全文も別途snapshot保存。
+
+## 8. Workflow Input
 
 標準型:
 
@@ -86,36 +146,44 @@ inputs:
     schema: optional
 ```
 
-- `type`: 必須
-- `required`: default false
-- `nullable`: default false
-- `default`: 任意
-- `schema`: optional JSON Schema
+- `type` required
+- `required` default false
+- `nullable` default false
+- `default` optional
+- `schema` optional Draft2020-12 schema
 
-`null`許可は `nullable: true` だけを正規表現とする。
+Null:
 
-- caller null -> nullable=true必須
-- `default:null` -> nullable=true必須
-- required=trueはkey存在を要求。nullable=trueなら値null可
+- `nullable:true`だけがInput fieldでnull許可する方法
+- caller null/default nullはnullable true必須
+- required=trueはkey存在を要求。nullable=trueならnull可
 - optional+default無し=missing
-- extra Input reject
 
-Run開始時に検証しsnapshot。
+Validation order:
 
-## 7. Workflow `outputs`
+1. key presence/extra
+2. nullable
+3. non-nullならbase `type`
+4. non-nullならoptional `schema`
+
+Input fieldの`schema`は**non-null valueだけ**へ適用する。`nullable`をJSON Schema側の`type:[...,null]`で二重定義しない。
+
+`schema`がbase `type`と矛盾することが静的に明白でも、最終Runtime validationでは両方満たす必要がある。推測でschemaを書き換えない。
+
+## 9. Workflow `outputs`
 
 ```yaml
 outputs:
   score: ${{ jobs.aggregate.outputs.score }}
 ```
 
-Workflow success確定直前に評価。失敗は `workflow_output_invalid`。
+Workflow success確定直前評価。失敗=`workflow_output_invalid`。
 
-Workflow Output全体はname mappingによるJSON object。PayloadStoreのinline/spillを使う。
+全体はname mappingによるJSON object。PayloadStore利用。
 
-## 8. Priority / Concurrency
+## 10. Priority / Concurrency
 
-Priorityはsigned 64-bit integer、default0、大きいほど高い。
+Priority=signed64 integer default0。
 
 ```yaml
 concurrency:
@@ -124,15 +192,13 @@ concurrency:
   on-limit: queue
 ```
 
-- group最終値: non-empty string必須
-- trim/lowercase等の暗黙正規化無し
-- case-sensitive完全一致
-- max-runs: 1..signed64 max
-- on-limit: queue|reject
+- group final=non-empty string
+- no trim/lowercase/Unicode normalization
+- case-sensitive exact match
+- max-runs 1..signed64 max
+- on-limit queue|reject
 
-Group不正ならRun row作成前にfailure。
-
-## 9. Workflow `settings`
+## 11. Workflow `settings`
 
 ```yaml
 settings:
@@ -142,57 +208,44 @@ settings:
   output-inline-threshold-bytes: 4194304
 ```
 
-- max-dynamic-jobs: integer >=0, default1000
-- external-lease-minutes: finite positive, default60
-- external-on-lease-expiry: requeue|fail
-- output-inline-threshold-bytes: positive integer, default4MiB
+- max-dynamic-jobs >=0 signed64
+- lease finite positive
+- expiry requeue|fail
+- threshold positive signed64 default4MiB
 
-4MiBはOutput最大値ではなくinline/spill切替閾値。
+4MiBはmaximumでなくinline/spill threshold。
 
-## 10. Job ID / Dependencies
+## 12. Job ID / Dependencies
 
-静的Job ID:
+Static Job ID:
 
 ```text
 ^[A-Za-z_][A-Za-z0-9_-]*$
 ```
 
-`[ ] /` はDynamic logical key用に予約。
+`[]/` reserved for Dynamic logical key。
 
-`needs`はstringまたはarray。missing/self/duplicate/cycleはerror。Dynamic `foreach.parent`もDAG edge。
+needs missing/self/duplicate/cycle reject。`foreach.parent`もDAG edge。
 
-## 11. Action / Validator identity
-
-Action Registry:
+## 13. Action / Validator identity
 
 ```text
-action_id: non-empty string
-action_version: non-empty string
+action_id/version: non-empty string
+validator_id/version: non-empty string
 ```
 
-Validator Registry:
+Registryは親bootstrapで各Process再構築。Version update親責任。Implicit string conversion無し。
 
-```text
-validator_id: non-empty string
-validator_version: non-empty string
-```
+Run startで参照Action/Validator ID+version snapshot。
 
-両Registryは親bootstrapでProcess起動時に再構築する。Version更新は親責任。integer等を暗黙string化しない。
-
-Workflow Run開始時に参照するAction/ValidatorのID+versionをsnapshotする。
-
-### Validator callable contract
-
-Custom Validatorは親側のtrusted Python callable。
-
-概念:
+### Validator callable
 
 ```python
 def validate_result(value, input_data) -> ValidationResult:
     ...
 ```
 
-`ValidationResult`:
+ValidationResult:
 
 ```text
 valid: boolean
@@ -202,16 +255,12 @@ retryable: boolean default false
 details: JSON-compatible optional
 ```
 
-規則:
+- read-only validation、result transform禁止
+- Runtime Handle/Secret value無し
+- heavy/I/O validationはnormal Job
+- exception=`validator_exception`, retryable=false
 
-- resultを変換・置換しない。read-only validationのみ
-- Runtime Handle/Secret valueを渡さない
-- 重い処理や長時間I/Oを行うValidationはnormal Jobとして実装する
-- unhandled exceptionは `validator_exception`, retryable=false
-
-MVP Validatorはtrusted lightweight callableとしてRuntime側で実行する。Sandbox/killable isolationは提供しない。
-
-## 12. Job共通field
+## 14. Job共通field
 
 ```yaml
 jobs:
@@ -236,158 +285,102 @@ jobs:
     external: null
 ```
 
-### `runs-on`
+- runs-on: internal only, default system pool name `default`, non-empty
+- executor: internal|external_llm|human; reusable uses `uses`
+- action: internal required
+- validator: internal/external optional; human/reusable forbidden
+- with: final Job Input object
+- if: boolean CEL default success()
+- success_if: internal/external only
+- continue-on-error: boolean/CEL, activation snapshot
+- priority: signed64
+- timeout-minutes: internal only finite positive
+- retry: `10`
+- outputs.schema: optional Draft2020-12 schema
+- external: external_llm only
 
-internalのみ。省略時System `default_runner_pool`、default文字列`default`。最終値non-empty string。未登録PoolはRun開始前error。
+## 15. Result validation order
 
-### `executor`
+Internal/External:
 
-`internal|external_llm|human`。省略時internal。Reusableは`uses`で識別。
-
-### `action`
-
-internal必須。external/human/reusableは禁止。
-
-### `validator`
-
-Optional Validator Registry ID。
-
-- internal: allowed
-- external_llm: allowed
-- human: forbidden
-- reusable: forbidden（Child Workflow内で検証する）
-
-未登録Validatorまたはversion解決不可はRun開始前error。
-
-### `with`
-
-最終Job Input object。Secret規則は`02/12`。
-
-### `if`
-
-boolean。default `${{ success() }}`。
-
-### `success_if`
-
-internal/externalのみ。Resultは任意JSON-compatible value。
-
-### `continue-on-error`
-
-boolean/CEL boolean、activation時snapshot。
-
-### `priority`
-
-signed 64-bit integer、default0。
-
-### `timeout-minutes`
-
-internalのみoptional、finite positive。external/human/reusableは禁止。
-
-### `retry`
-
-未指定automatic retry無し。詳細は`10`。
-
-### Job `outputs`
-
-`outputs.schema` はoptional JSON Schema。Action/External resultは任意JSON-compatible value。PayloadStoreでtransparent inline/spill。
-
-### `external`
-
-external_llmのみ。`lease-minutes` finite positive、`on-lease-expiry=requeue|fail`。
-
-## 13. Result validation order
-
-Internal/External resultの正規順序:
-
-1. JSON-compatible / canonical JSON validation
-2. optional `outputs.schema` JSON Schema
+1. JSON-compatible + canonical JSON v1
+2. optional Draft2020-12 Output Schema
 3. optional Custom Validator
-4. optional `success_if`
+4. optional success_if
 5. SecretGuard
-6. PayloadStore persistence
-7. success terminal transition
+6. PayloadStore
+7. terminal success
 
-Custom Validatorが `valid=false` の場合:
+Validator invalid:
 
 ```text
 category=validation
-code=<validator code or domain_validation_failed>
-message=<validator message>
-retryable=<validator result>
-details=<validator details>
+code=validator code or domain_validation_failed
+retryable=validator result
 ```
 
-## 14. Executor別constraint
+## 16. Executor constraints
 
-### internal
+Internal: action required; validator/runs-on/timeout optional。
 
-`action` required。`validator/runs-on/timeout-minutes` optional。`uses/external` forbidden。
+External: validator/external optional; action/uses/runs-on/timeout forbidden。
 
-### external_llm
+Human: action/validator/uses/runs-on/success_if/external/timeout forbidden。
 
-`validator/external` optional。`action/uses/runs-on/timeout-minutes` forbidden。
+Reusable: uses required; action/validator/executor/runs-on/success_if/external/timeout forbidden。
 
-### human
+## 17. Dynamic / Definition Snapshot
 
-`action/validator/uses/runs-on/success_if/external/timeout-minutes` forbidden。
+Dynamic syntaxは`05`。
 
-### reusable
+Run snapshot:
 
-`uses` required literal。`action/validator/executor/runs-on/success_if/external/timeout-minutes` forbidden。
-
-## 15. Dynamic syntax
-
-Root `foreach: <expr>`、Nested `foreach.parent/items`。詳細は`05`。
-
-## 16. Definition Snapshot
-
-保存:
-
-- workflow_id/version/name
-- source YAML全文
-- canonical typed JSON/hash
-- Workflow Input snapshot
-- Action ID/version snapshot
-- Validator ID/version snapshot
+- workflow id/version/name
+- source YAML
+- typed Definition JSON/hash
+- Workflow Input
+- Action ID/version
+- Validator ID/version
 - optional source_identity
 
-## 17. 検証
+## 18. 検証
 
 Load:
 
-- safe YAML/duplicate/merge/tag
+- YAML1.2 safe parse
+- duplicate/merge/tag
+- Pydantic schema/unknown keys
+- JSON Schema Draft/check_schema
 - Input nullable/default
-- Job/Dynamic cycle
-- executor field constraint
+- dependency cycles
 - numeric finite/range
 - CEL/JMESPath compile
-- reusable syntax
+- executor constraints
 
 Run start:
 
 - Input
-- Action/Validator ID+version
+- Action/Validator Registry versions
 - Runner Pool
-- concurrency group string
-- reusable resolution/cycle
-- Secret利用位置
-- runtime settings
+- concurrency string
+- Reusable resolution
+- Secret policy/settings
 
-Failure時Run rowを作らない。
+FailureならRun row無し。
 
-## 18. 受入条件
+## 19. 受入条件
 
-1. dependency install/import Python3.10
-2. ruamel.yaml 0.19.1 lower bound
-3. Input nullable
-4. Action/Validator version non-empty string
-5. Validator internal/external allowed, human/reusable reject
-6. Validator false/exception/retryable result
-7. validation order schema -> validator -> success_if -> SecretGuard
-8. concurrency group/case
-9. numeric finite/signed64
-10. arbitrary JSON Output
-11. transparent spill
-12. internal timeout / others reject
-13. Dynamic parent cycle
-14. definition hash/action+validator snapshot
+1. YAML1.2 booleans vs YAML1.1 ambiguity
+2. canonical JSON v1 exact bytes/hash golden cases
+3. 1 vs1.0 distinct digest
+4. Unicode no-normalization behavior
+5. Draft2020-12 only / other draft reject
+6. format annotation not enforced
+7. Input nullable + schema non-null application
+8. dependency install Python3.10
+9. Action/Validator identity
+10. concurrency identity
+11. numeric boundaries
+12. arbitrary JSON Output/spill
+13. Dynamic cycle
+14. deterministic Definition hash
