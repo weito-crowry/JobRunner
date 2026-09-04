@@ -1,9 +1,9 @@
 # 03. Runtime / Scheduling 詳細設計
 
-- Status: Draft v0.5
+- Status: Draft v0.6
 - 対象: MVP
 - 上位仕様: `docs/design.md`
-- 関連: `01`, `02`, `05`, `08`, `10`
+- 関連: `01`, `02`, `05`, `08`, `09`, `10`
 
 ## 1. 基本原則
 
@@ -16,7 +16,7 @@
 7. claim/state transitionはconditional transaction。
 8. Priority変更はpreemptしない。
 9. Job result自動再利用は同一Workflow Run内だけ。別Run/global cache無し。
-10. External Lease/Retry backoff等の期限処理はRuntime内部Maintenance Loopが担当する。
+10. External Lease/Retry backoff/Retention等の期限処理はRuntime内部Maintenance Loopが担当する。
 
 ## 2. Runtime起動
 
@@ -41,6 +41,7 @@ Start transaction:
 
 - Run snapshot
 - Action/Validator version snapshot
+- effective Retention policy snapshot
 - concurrency snapshot
 - static Job/Dynamic template metadata
 - Event
@@ -127,7 +128,7 @@ DB partial uniqueでもone-runningを保証。
 
 ## 8. Maintenance Loop
 
-Maintenance LoopはWorkflow Scheduler/Cronではなく、既存Runtime状態の**期限到来処理専用**の親Process内thread/task。
+Maintenance LoopはWorkflow Scheduler/Cronではなく、既存Runtime状態の**期限到来・housekeeping専用**の親Process内thread/task。
 
 対象:
 
@@ -135,9 +136,12 @@ Maintenance LoopはWorkflow Scheduler/Cronではなく、既存Runtime状態の*
 retry_not_before
 external lease expires_at
 concurrency wait再確認 wake-up
+retention due items
+orphan temp/payload/artifact cleanup候補
+expired idempotency cleanup
 ```
 
-Runner heartbeat/livenessはRunner Supervisorが担当し、Job timeoutはRunner自身が担当する。
+Runner heartbeat/livenessはRunner Supervisor、Job timeoutはRunner自身が担当する。
 
 ### 8.1 wait方式
 
@@ -168,7 +172,30 @@ Pause中はdeadline到来を記録してもnew activationしない。Resumeで�
 
 Pause中もLease clockは止めず、expiry policyは実行する。
 
-Runtime restart時は起動Recoveryで既に期限超過の項目を先に処理し、その後Maintenance Loopへ移行する。
+### 8.4 Retention sweep
+
+Retention policyは`01/08/09`に従いWorkflow Run開始時のeffective snapshotを使う。
+
+- policyが全項目unlimitedなら、そのRunに対する期限削除は行わない
+- 期限あり項目はcompleted_at/created_at等の各対象基準時刻からdueを判定
+- non-terminal Workflow RunのRun record/実行中Log/Current Artifactを期限だけで削除しない
+- Managed Artifact data、Output blob、Execution Log、Event、Artifact metadata、Workflow Run recordsは対象ごとのpolicyに従う
+- External Reference Artifactの外部実体は削除しない
+- relational row削除は`08`のFK依存順
+- 削除操作はidempotentで、部分失敗時に「削除済みdataをcurrentとして参照」しない
+- Run recordを最終削除する場合、Retention実施記録はRun row外のretention audit/event相当へ先に残す
+
+Retention sweepはdeadline精度を要求しないhousekeepingなので、`maintenance_max_sleep_seconds`以内の遅延を許容する。
+
+### 8.5 restart
+
+Runtime restart時は起動Recoveryで:
+
+1. overdue retry/Lease
+2. consistency repair/orphan cleanup候補
+3. due Retention
+
+をcurrent state条件付きで処理し、その後Maintenance Loopへ移行する。
 
 ## 9. Terminal後 activation
 
@@ -283,7 +310,7 @@ Pause:
 - running internal継続
 - new internal/External claim/Dynamic expansion禁止
 - existing External submit/Human review/started Child進行可
-- Maintenance LoopのLease expiryは継続
+- Maintenance LoopのLease expiry/Retention housekeepingは継続
 
 Resumeでactivation再評価。new Attemptは作らない。
 
@@ -331,6 +358,7 @@ Runtime restart:
 - paused維持
 - completed success Job保持
 - pending reuse check再開
+- due Retention/housekeeping再開
 
 Recoveryだけでcompleted Runをreopenしない。
 
@@ -343,9 +371,12 @@ Recoveryだけでcompleted Runをreopenしない。
 5. retry deadline wake <= max sleep lag
 6. external Lease expiry without external traffic
 7. paused Lease expiry processing
-8. restart overdue timer processing
-9. same-run reuse only
-10. reuse key includes Action+Validator version
-11. state.get/dynamic artifact ineligible
-12. Manual Retry descendant reuse
-13. no cross-Run reuse
+8. retention unlimited no delete
+9. retention due sweep/idempotency/FK order
+10. non-terminal current data not deleted by retention
+11. restart overdue timer/retention processing
+12. same-run reuse only
+13. reuse key includes Action+Validator version
+14. state.get/dynamic artifact ineligible
+15. Manual Retry descendant reuse
+16. no cross-Run reuse
