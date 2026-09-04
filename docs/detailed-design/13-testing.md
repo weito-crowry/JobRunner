@@ -1,6 +1,6 @@
 # 13. Testing 詳細設計
 
-- Status: Draft v2.4
+- Status: Draft v2.5
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`〜`12`
@@ -46,6 +46,9 @@ Definition:
 - YAML1.2
 - canonical-json-v1 golden
 - Draft2020-12 only
+- JSON Schema `$defs`/local fragment `$ref/$dynamicRef` allow
+- HTTP/file/relative external `$ref/$dynamicRef` reject at load
+- JSON Schema validation performs no network/file retrieval
 - duplicate/merge/custom tag/unknown key reject
 - Core/Pydantic strict no-coercion
 - bool not accepted as integer/number
@@ -169,7 +172,17 @@ Validator:
 - returned awaitable -> validator_contract_error
 - exception -> validator_exception
 
-## 6. Authorization / Runtime Handle / SecretGuard
+## 6. Authorization / Actor principal / Runtime Handle / SecretGuard
+
+Actor principal:
+
+- canonical `actor_principal_key` golden from actor_type/actor_id/AccessScope
+- source/claims/metadata do not affect principal key
+- same principal across MCP/HTTP/Python if injected actor/scope equal
+- `wf_task_claim/wf_task_submit` reject missing actor_id
+- Lease claimant_key exact actor principal
+- another principal cannot recover lease_id or submit with leaked lease_id
+- Idempotency uses same principal definition without duplicate AccessScope term
 
 Authorization:
 
@@ -250,10 +263,14 @@ Workflow Run status:
 
 - admitted initial/Child Run=`running`
 - `queued` only concurrency waiter
-- paused admitted holder keeps slot
-- paused concurrency waiter has no slot and is wake候補外
+- queued waiter has non-null `concurrency_queued_at`
+- admitted holder has `concurrency_queued_at=null`
+- initial/Child queue sets actual queue-entry timestamp
+- paused admitted holder keeps slot and queue timestamp null
+- paused concurrency waiter has no slot、preserves original queue timestamp and is wake候補外
 - resume holder -> running
-- resume waiter -> queued/concurrency
+- resume waiter -> queued/concurrency with same queue timestamp
+- Manual Retry reopen queue receives fresh retry-time queue timestamp, not original created_at
 
 Scheduling:
 
@@ -273,6 +290,8 @@ Scheduling:
 - multiple Runs
 - claim races
 - concurrency scope/workflow separation
+- concurrency waiter ordering = priority -> concurrency_queued_at -> ID
+- old Run Manual Retry does not jump ahead by old created_at
 
 ## 10. Maintenance / Recovery
 
@@ -286,12 +305,13 @@ Scheduling:
 - pending survives restart
 - runner_lost
 - root/Child priority repair
-- Workflow status/wait_reason + concurrency holder/waiter repair
+- Workflow status/wait_reason/concurrency_queued_at + holder/waiter repair
+- Recovery preserves saved queue timestamps
 - completed no reopen except explicit Manual Retry
 - orphan scanner does not delete unowned object younger than `orphan_cleanup_grace_seconds`
 - default grace300 / invalid `<=0` reject
 
-## 11. Runner / IPC / Step
+## 11. Runner / IPC / Step / timeout
 
 - handshake/envelope/terminal matrix
 - exact Attempt persistent_input
@@ -313,7 +333,11 @@ Scheduling:
 - Validator persistent Input only
 - fencing
 - cancel/result race first terminal wins
-- timeout deadline result rejection/grace cleanup only
+- timeout origin starts immediately after internal claim, before child spawn
+- timeout covers Action Runner bootstrap/handshake/action/result validation/PayloadStore through terminal commit
+- timeout before ready can terminate child
+- result received before deadline but terminal commit after deadline -> job_timeout
+- timeout grace is cleanup only
 
 ## 12. Execution Log / Event / Progress
 
@@ -361,8 +385,10 @@ Retry:
 - Secret binding fixed/value rotates only on re-execution
 - completed Run Manual Retry reacquires concurrency slot
 - concurrency reject leaves Run/Job unchanged
-- concurrency queue reopens `status=queued, wait_reason=concurrency`
+- concurrency queue reopens `status=queued, wait_reason=concurrency` with fresh `concurrency_queued_at`
 - reopen clears Run conclusion/completed/failure/current Workflow Output
+- retry backoff huge attempt number saturates to max without inf/NaN/OverflowError
+- backoff computation need not iterate O(attempt_no)
 
 Strict reuse:
 
@@ -415,7 +441,7 @@ Strict reuse:
 - Parent progress
 - Child concurrency scope uses Child workflow_id
 - admitted Child=running
-- Child concurrency queue creates Child queued/Parent waits
+- Child concurrency queue creates Child queued + fresh queue timestamp / Parent waits
 - Child concurrency reject creates no Child row and Parent Attempt fails
 - Retry after reject uses same binding and does not reread source
 - direct control reject
@@ -456,13 +482,16 @@ External:
 - claim race
 - claim order uses `available_at` then stable `job_key` before opaque IDs
 - lease expiry boundary `now >= expires_at`
-- no renew
+- no renew/transfer
 - requeue/fail
 - submit Retry later
 - submit+claim_next one tx/replay
+- claim/submit require actor_id
+- claimant_key exact actor_principal_key
 - task_info hides another claimant's lease_id
 - self claimant may recover current active lease_id
 - submit validates lease + claimant ownership
+- claim_next uses same principal
 
 Human:
 
@@ -478,7 +507,7 @@ Verify all18 tables:
 
 - exact columns/checks/indexes/FKs/Repository invariants
 - canonical fixed UTC timestamp format
-- Workflow queued/running/paused/completed + wait_reason/slot invariant
+- Workflow queued/running/paused/completed + wait_reason/slot/concurrency_queued_at invariant
 - System baseline/effective settings
 - Child binding baseline/settings/Retention
 - priority support
@@ -491,9 +520,9 @@ Verify all18 tables:
 - State current/history atomic + current Step producer
 - Artifact/log schema
 - Runner liveness
-- External Task config/Lease
+- External Task config/Lease + claimant principal
 - Human immutable
-- Idempotency
+- Idempotency canonical actor principal/no duplicate AccessScope
 - Reusable reject no Child row
 - Child-first Retention
 - migration gap/future
@@ -503,8 +532,9 @@ Verify all18 tables:
 - Core Service models strict/no-coercion
 - HTTP query explicit parse only
 - canonical timestamp response/filter normalization
-- admitted start=running / queue=queued
-- pause/resume holder vs waiter
+- admitted start=running / queue=queued + `concurrency_queued_at`
+- run list/info/start/retry queue timestamp consistency
+- pause/resume holder vs waiter preserves queue time
 - Run info jobs/Dynamic groups/attempts/Step exact shape
 - active_task/review/child IDs navigation
 - Input info/read refs only
@@ -515,25 +545,27 @@ Verify all18 tables:
 - namespaced MCP
 - exact HTTP incl Input/Output/State/Event
 - Log byte offset boundary validation
+- task claim/submit claimant identity from injected ActorContext, not public body
 - status/no422/idempotency replay
 - concurrency_limit_reached 409
+- claimant_identity_required 400
 - forbidden APIs
 
 ## 20. Idempotency / Concurrency
 
 - request hash
-- Actor/Scope isolation
+- canonical actor principal isolation
 - fast read advisory
 - BEGIN IMMEDIATE recheck
 - replay/conflict/expiry
 - no reserved
 - claim exactly one
-- submit claim_next replay
+- submit claim_next replay/same claimant
 - concurrency scope=`workflow_id + group`
 - holder=`running` or admitted paused
 - queued/paused waiter no slot
 - mixed max-runs conservative capacity
-- waiter head-of-line fairness
+- waiter head-of-line fairness by queue-entry time
 - Manual Retry concurrency reacquire atomicity
 
 ## 21. Retention
@@ -571,21 +603,21 @@ platform-matrix
 
 1. `01`〜`12`全受入条件対応
 2. Dependencies/extras/strict model parsing/source resolver
-3. Definition/System baseline/Priority/Registry/reload
+3. Definition/System baseline/Priority/Registry/reload/self-contained JSON Schema
 4. Expression context/Input/Secret binding/reuse safety
-5. Bootstrap/Action invocation/IPC/Runtime Auth
-6. Runner Pool/Scheduling/Run status/Concurrency
+5. Bootstrap/Action invocation/IPC/Runtime Auth/full-attempt timeout
+6. Runner Pool/Scheduling/Run status/Concurrency queue time
 7. Exact18-table schema/migrations
 8. Payload/Artifact immutability + retention
 9. Validator/SecretGuard/streaming redaction
 10. State immediate/reuse + public read APIs
-11. External/Human/Lease ownership
+11. External/Human/Lease claimant ownership
 12. Dynamic index/1000/nested/order/status/reuse
-13. Reusable source/baseline/priority/concurrency/artifact/schema/progress
-14. Retry/Recovery strict reuse/reopen/output invalidation
+13. Reusable baseline/priority/concurrency/artifact/schema/progress
+14. Retry/Recovery strict reuse/reopen/output invalidation/overflow-safe backoff
 15. Service/MCP/HTTP/Input/Output/State/Event
 16. Idempotency/concurrency/claim_next
-17. Common Log/Progress/single-open Step metadata
+17. Common Log/Progress/Step metadata
 18. Retention/orphan grace/audit
 
 WebUI E2Eは後続。
