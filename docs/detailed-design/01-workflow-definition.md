@@ -1,24 +1,42 @@
 # 01. Workflow Definition 詳細設計
 
-- Status: Draft v0.3
+- Status: Draft v0.4
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 
 ## 1. 目的
 
-JobRunner の Workflow YAML の正規契約を定義する。式評価、Dynamic Job、Reusable Workflow、Retry/Recovery、DB schema は各専用詳細設計に従う。
+JobRunner の Workflow YAML とMVP基盤依存の正規契約を定義する。式評価、Dynamic Job、Reusable Workflow、Retry/Recovery、Storage schema は各専用詳細設計に従う。
 
-## 2. 基本原則
+## 2. MVP Python / OSS依存
 
-1. canonical authoring format は YAML。
-2. safe loader を使用し、custom tag / 任意コード実行を禁止する。
-3. mapping の重複 key と YAML merge key `<<` は error。
-4. 未知 key は error。暗黙補正しない。
-5. load 後は typed immutable `WorkflowDefinition` に正規化する。
-6. Workflow Run 開始時に runtime dependency を含め再検証し、実使用定義を snapshot する。
-7. 実行開始後の元 YAML 変更は既存 Workflow Run に反映しない。
+Pythonは **3.10以上**。
 
-## 3. トップレベル
+Coreの基本依存は以下へ固定する。
+
+```text
+ruamel.yaml >=0.19,<0.20     # YAML 1.2 / duplicate key検出
+pydantic >=2.13,<3           # typed immutable models / request models
+jsonschema >=4.26,<5         # optional Input/Output JSON Schema
+cel-python >=0.5,<0.6        # CEL
+jmespath >=1.1,<2            # JSON projection/filter
+```
+
+MVP時点でいずれもPython 3.10で利用可能。YAMLは`ruamel.yaml`のduplicate key rejectを有効にし、merge key `<<` はJobRunner側でも明示rejectする。
+
+Process/SQLite/JSON/UUID等はPython標準libraryを優先する。
+
+## 3. YAML基本原則
+
+1. canonical authoring formatはYAML。
+2. safe loaderを使用しcustom tag/任意コード実行禁止。
+3. mapping duplicate key、merge key `<<` はerror。
+4. unknown keyはerror。
+5. load後はtyped immutable `WorkflowDefinition`。
+6. Run開始時にruntime dependency含め再検証し実使用定義をsnapshot。
+7. 元YAML変更は既存Runへ反映しない。
+
+## 4. トップレベル
 
 ```yaml
 name: Example Workflow
@@ -33,58 +51,46 @@ settings: {}
 jobs: {}
 ```
 
-必須は `name`, `version`, `jobs`。
+必須: `name/version/jobs`。
 
-- `inputs`: Workflow Input schema
-- `env`: Run 内 immutable static values。**Secret参照も含め Secret 用途には使用しない**
-- `outputs`: Workflow-level Output mapping
-- `priority`: integer、既定 0、大きいほど高優先
-- `concurrency`: Workflow Run concurrency
-- `settings`: JobRunner 固有設定
+### `env`
 
-## 4. Workflow ID / version / hash
+Run内immutable static **literal** values。JSON-compatible literalのみで、`${{ ... }}` expression自体をMVPでは禁止する。Secret参照も禁止。
 
-Workflow ID は YAML の `name` ではなく、親システム登録名または WorkflowResolver の canonical reference から決める。
+### `outputs`
 
-`version` は親側の明示 version。定義同一性は typed definition の canonical JSON を SHA-256 した `definition_hash` でも確認する。
+Workflow-level Output mapping。literalまたはexpression。
 
-## 5. Workflow Input
+## 5. Workflow ID / version / hash
 
-```yaml
-inputs:
-  symbol:
-    type: string
-    required: true
-  timeframe:
-    type: string
-    default: M5
+Workflow IDは親登録名またはWorkflowResolver canonical reference。
+
+`version`は親管理version。定義同一性はtyped definition canonical JSONのSHA-256 `definition_hash`も使用。
+
+## 6. Workflow Input
+
+標準型:
+
+```text
+string/integer/number/boolean/object/array
 ```
 
-標準型: `string / integer / number / boolean / object / array`。`null` 許可は schema で明示する。
+`null`許可は明示。Run開始時にrequired/extra/type/defaultを検証しsnapshot。
 
-Run開始時に required / extra / type / default を検証し、最終 Input を snapshot する。Run中は変更しない。
-
-## 6. `env`
-
-Workflow Run 内の固定値のみ。
-
-```yaml
-env:
-  MODE: research
-```
-
-`${{ secrets.* }}` は `env` では禁止。Secret は `02-expression-and-inputs.md` の規則に従い internal Action Job の `with` でのみ参照する。
-
-## 7. Workflow-level `outputs`
+## 7. Workflow `outputs`
 
 ```yaml
 outputs:
   score: ${{ jobs.aggregate.outputs.score }}
 ```
 
-Workflow `success` 確定直前に `jobs` context で評価する。評価 failure は `workflow_output_invalid` とし Workflow conclusion を `failure` にする。
+Workflow success確定直前に評価。失敗は `workflow_output_invalid`。
 
-## 8. Workflow concurrency
+Workflow OutputもJob Outputと同じPayloadStore規則で、小さいJSONはSQLite、大きいJSONはfilesystemへ透過spillする。
+
+## 8. Priority / Concurrency
+
+Priorityはinteger、既定0、大きいほど高い。
 
 ```yaml
 concurrency:
@@ -93,11 +99,7 @@ concurrency:
   on-limit: queue
 ```
 
-- `group`: fixed string または式
-- `max-runs`: integer >= 1
-- `on-limit`: `queue | reject`、既定 `queue`
-
-未指定時は無制限。
+`on-limit = queue|reject`。
 
 ## 9. Workflow `settings`
 
@@ -108,22 +110,32 @@ settings:
   max-dynamic-jobs: 1000
   external-lease-minutes: 60
   external-on-lease-expiry: requeue
-  max-job-output-bytes: 4194304
+  output-inline-threshold-bytes: 4194304
 ```
 
-未知 key は error。優先順位は Job override > Workflow settings > System default。
+- `max-dynamic-jobs`: integer >=0、default1000
+- external lease: default60分 / `requeue`
+- `output-inline-threshold-bytes`: positive integer、default4MiB
 
-## 10. Job ID
+**4MiBは最大OutputサイズではなくSQLite inline保存からfilesystem blobへ切り替える閾値。** MVPにhiddenなJob Output最大サイズは設けない。
 
-静的 Job ID:
+Unknown settingはerror。優先順位はWorkflow setting > System default。External専用値はJob `external` overrideが最優先。
+
+## 10. Job ID / Dependencies
+
+静的Job ID:
 
 ```text
 ^[A-Za-z_][A-Za-z0-9_-]*$
 ```
 
-`[` `]` `/` は Dynamic logical key 用に予約する。
+`[ ] /` はDynamic logical key用に予約。
 
-## 11. Job 共通 field
+`needs`はstringまたはarray。存在しないJob、self、duplicate、cycleはerror。
+
+Dynamic `foreach.parent`もDAG dependency edgeとしてcycle検証対象。
+
+## 11. Job共通field
 
 ```yaml
 jobs:
@@ -147,64 +159,59 @@ jobs:
     external: null
 ```
 
-### 11.1 `needs`
+### `runs-on`
 
-string または string array。存在しない Job、自己依存、duplicate、cycle は error。
+internalのみ。省略時System `default_runner_pool`、default文字列`default`。未登録PoolはRun開始前error。
 
-Dynamic `foreach.parent` も依存 edge として DAG cycle 検証対象に含める。
+### `executor`
 
-### 11.2 `runs-on`
+`internal|external_llm|human`。省略時internal。Reusableは`uses`で識別。
 
-internal Job の Runner Pool。省略時は System `default_runner_pool`、既定文字列 `default`。最終解決 Pool が未登録なら Run開始前 error。
+### `action`
 
-external/human/reusable では禁止。
+internal必須。external/human/reusableは禁止。
 
-### 11.3 `executor`
+### `with`
 
-`internal | external_llm | human`。省略時 `internal`。Reusable Workflow Job は `uses` で識別し `executor` は書かない。
+最終Job Input objectを構築。Secret規則は`02/12`。
 
-### 11.4 `action`
+### `if`
 
-- internal: 必須
-- external_llm / human / reusable: 禁止
+boolean。未指定 `${{ success() }}`。
 
-### 11.5 `with`
+### `success_if`
 
-Action / External / Human / Child Workflow Input。Secret参照の可否は `02` に従う。
+internal/externalのみ。**Action/External resultは任意のJSON-compatible valueでよい**ため、`outputs` context自体がscalar/list/object/nullのいずれにもなり得る。
 
-### 11.6 `if`
+### `continue-on-error`
 
-boolean式。未指定は `${{ success() }}`。
+boolean/CEL boolean、activation時snapshot。
 
-### 11.7 `success_if`
+### `timeout-minutes`
 
-internal / external_llm の Output validation 後に評価。human/reusable では禁止。
+internalのみoptional。external/human/reusableは禁止。
 
-### 11.8 `continue-on-error`
+### `retry`
 
-boolean または CEL boolean。activation 時に snapshot。Job failure 自体は保持し、依存進行と Workflow conclusion で許容 failure として扱う。
+未指定automatic retry無し。
 
-### 11.9 `timeout-minutes`
+### Job `outputs`
 
-positive number。未指定は timeout なし。
+`outputs` fieldはoptional JSON Schema定義用。
 
-**MVPで execution timeout を適用するのは internal Job のみ。**
+```yaml
+outputs:
+  schema:
+    type: array
+```
 
-- external_llm: `timeout-minutes` 禁止。待機制御は External Lease が担当
-- human: `timeout-minutes` 禁止。Review期限はMVPなし
-- reusable: `timeout-minutes` 禁止。子 Workflow 各Jobのtimeoutに委ねる
+実際のAction/External resultは **JSON-compatible value全般**を許可し、`needs.<job>.outputs` はそのvalueをそのまま返す。
 
-### 11.10 `retry`
+保存はPayloadStoreによりtransparent inline/spill。大きいJSONを理由にJob failureへしない。
 
-未指定は automatic retry なし。詳細は `10`。
+### `external`
 
-### 11.11 Job `outputs`
-
-internal/external result は JSON-compatible object。optional JSON Schema を指定可能。canonical UTF-8 JSON が `max-job-output-bytes` 超過なら `output_too_large`。
-
-### 11.12 `external`
-
-external_llm Jobのみ。
+external_llmのみ:
 
 ```yaml
 external:
@@ -212,42 +219,30 @@ external:
   on-lease-expiry: fail
 ```
 
-## 12. Executor別制約
+## 12. Executor別constraint
 
 ### internal
 
-- `action`: required
-- `runs-on`: optional
-- `timeout-minutes`: optional
-- `uses/external`: forbidden
+`action` required。`runs-on/timeout-minutes` optional。`uses/external` forbidden。
 
 ### external_llm
 
-- `action/uses/runs-on/timeout-minutes`: forbidden
-- `external`: optional
+`action/uses/runs-on/timeout-minutes` forbidden。`external` optional。
 
 ### human
 
-- `action/uses/runs-on/success_if/external/timeout-minutes`: forbidden
+`action/uses/runs-on/success_if/external/timeout-minutes` forbidden。
 
-### Reusable Workflow
+### reusable
 
-```yaml
-jobs:
-  child:
-    uses: ./workflows/child.yml
-    with: {}
-```
+`uses` required literal。`action/executor/runs-on/success_if/external/timeout-minutes` forbidden。
 
-- `uses`: required, literal only
-- `action/executor/runs-on/success_if/external/timeout-minutes`: forbidden
-
-## 13. Dynamic Job syntax
+## 13. Dynamic syntax
 
 Root:
 
 ```yaml
-foreach: ${{ needs.generate.outputs.items }}
+foreach: ${{ needs.generate.outputs }}
 ```
 
 Nested:
@@ -255,56 +250,53 @@ Nested:
 ```yaml
 foreach:
   parent: evaluate
-  items: ${{ iteration.parent.outputs.conditions }}
+  items: ${{ iteration.parent.outputs }}
 ```
 
-`parent` edge も DAG dependency として扱う。詳細は `05`。
+詳細は`05`。
 
 ## 14. Definition Snapshot
 
-Run開始時に保存:
+保存:
 
 - workflow_id/version/name
 - source YAML全文
-- canonical typed definition JSON
-- SHA-256 definition_hash
+- canonical typed JSON/hash
 - Workflow Input snapshot
 - Action ID/version snapshot
 - optional source_identity
 
-## 15. 検証段階
+## 15. 検証
 
-load時:
+load:
 
-- safe YAML
-- duplicate key / merge key / custom tag
-- schema / unknown key
-- Job ID / `needs` / Dynamic parent edge / cycle
+- safe YAML / duplicate / merge / custom tag
+- schema/unknown key
+- Job/Dynamic dependency cycle
 - executor field constraint
 - CEL/JMESPath compile
-- reusable reference syntax
-- retry/timeout/concurrency/settings
+- reusable syntax
+- retry/internal timeout/settings
 
-Run start時:
+Run start:
 
 - Input
 - Action ID/version
-- resolved Runner Pool
+- Runner Pool
 - reusable resolution/cycle
 - Secret利用位置
 - runtime settings
 
-失敗時は Workflow Run row を作らない。
+失敗時Run rowを作らない。
 
 ## 16. 受入条件
 
-1. duplicate/merge/custom tag拒否
-2. `env` Secret参照拒否
-3. Dynamic parent cycle検出
-4. internal timeout許可
-5. external/human/reusable timeout拒否
-6. executor別field conflict
-7. Workflow outputs
-8. output size limit
+1. dependency versions/import on Python3.10
+2. duplicate/merge/tag rejection
+3. env literal-only/expression reject
+4. arbitrary JSON Output scalar/list/object/null
+5. inline threshold 4MiBとtransparent spill
+6. Outputにhidden max無し
+7. internal timeout / others reject
+8. Dynamic parent cycle
 9. definition hash deterministic
-10. source変更後も既存Run snapshot不変
