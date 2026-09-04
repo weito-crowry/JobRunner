@@ -1,6 +1,6 @@
 # 13. Testing 詳細設計
 
-- Status: Draft v0.9
+- Status: Draft v1.0
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`〜`12`
@@ -14,10 +14,11 @@
 5. Definition/Expressionはtable-driven。
 6. 時刻依存はClock abstraction。
 7. 競合testはbarrier/hook。
+8. 完了判定はcoverage率より各詳細設計の受入条件対応を優先。
 
 ## 2. Foundation dependencies
 
-Python 3.10で:
+Python3.10で:
 
 ```text
 ruamel.yaml >=0.19.1,<0.20
@@ -27,310 +28,363 @@ cel-python >=0.5,<0.6
 jmespath >=1.1,<2
 ```
 
-のinstall/import/代表処理をCI確認する。
+をinstall/import/代表実行。
 
-追加確認:
+確認:
 
-- CEL custom function bindingで`jmespath(...)` helperを登録・実行できる
-- Windows Python3.10でcel-python/google-re2依存をinstallできる
-- dependency license inventoryが設計記載と一致する
+- CEL custom function bindingで`jmespath(...)` helper
+- Windows/Linux Python3.10
+- dependency license inventory
+- ruamel.yaml duplicate key reject/merge key explicit reject
 
-## 3. Definition / Expression
+## 3. Definition / Expression / Type boundaries
 
-- duplicate/merge/custom tag reject
-- unknown key
-- Input `nullable=false/true`
+- duplicate/merge/custom tag/unknown key reject
+- Input nullable false/true
 - required+nullable
-- `default:null` nullable true/false
+- default:null nullable true/false
 - extra Input reject
-- env literal-only / expression/Secret reject
+- env literal-only
 - bad needs / Dynamic parent cycle
-- executor field conflict
-- Action version empty/non-string reject
-- concurrency group non-string/null/empty reject
-- concurrency group case-sensitive identity
-- priority signed64 min/max/overflow
-- NaN/Infinity numeric field reject
+- executor field conflicts
+- Action/Validator ID/version non-empty string
+- unknown Action/Validator start failure
+- Validator internal/external allowed, human/reusable reject
+- concurrency group string/null/empty/case-sensitive
+- priority/version/count signed64 boundaries
+- NaN/Infinity numeric reject
 - external/human/reusable timeout reject
 - invalid CEL/JMESPath
-- null/missing/type strictness
-- normal skipped dependency -> downstream default skip
-- continue-on-error failure -> effective success
-- Dynamic group aggregate / Nested parent helper
+- null/missing strictness
+- skipped dependency -> downstream default skip
+- continue-on-error -> effective success
+- Dynamic group / Nested parent helper
+- order_by NaN/Infinity/mixed type reject
 
-## 4. JSON Output / PayloadStore
+## 4. Custom Validator
 
-Job result:
+Internal:
+
+- JSON Schema -> Validator -> success_if order
+- valid true
+- valid false + custom code/message/details/retryable
+- validator exception -> `validator_exception`, retryable=false
+- result unchanged after Validator
+- Validator receives persistent Input, not materialized Secret/Runtime Handle
+
+External:
+
+- task_submit Validator valid/invalid/exception
+- invalid result terminalizes current Task/Lease/Attempt
+- retryable Validator failure follows Retry policy with new Attempt/Task
+
+Reusable/Dynamic:
+
+- Child binding snapshots Validator versions
+- missing Child Validator version on Retry fail-closed
+- Dynamic expansion validates Validator version before any generated Job insert
+- Same-Run Reuse key includes Validator identity
+
+## 5. JSON Output / PayloadStore
+
+Positive result shapes:
 
 ```text
-null
-boolean
-number
-string
-array
-object
+null/boolean/number/string/array/object
 ```
 
-すべてpositive。
+Workflow Outputはobject。
 
-Workflow Outputはname mappingによるobjectになることを確認。
-
-Optional JSON Schemaを各shapeで検証。
-
-Transparent storage:
-
-- threshold-1 -> inline
-- threshold -> inline
-- threshold+1 -> blob
-- multi-MiB JSON -> success
-- downstream `needs.*.outputs` がinline/blob同一value
+- optional JSON Schema各shape
+- threshold-1 inline
+- threshold inline
+- threshold+1 blob
+- multi-MiB success
+- downstream inline/blob same value
 - Workflow Output spill
-- blob temp write -> atomic rename -> DB commit
-- DB commit failure orphan blob cleanup
-- referenced blob missing -> `payload_missing`
-- digest mismatch -> `payload_digest_mismatch`
-- Attempt history old Output維持
+- blob temp -> rename -> DB
+- DB commit failure orphan cleanup
+- payload missing/digest mismatch
+- Attempt history immutable
 
-## 5. Service / MCP / HTTP Adapter
+## 6. Service / MCP / HTTP Adapter
 
 Canonical names:
 
 - `wf_definition_list/info`
 - `wf_run_list/info`
-- ambiguous `wf_list/wf_info` alias無し
-- namespaced MCP names
+- no `wf_list/wf_info`
+- namespaced MCP collision reject
 
 Output:
 
-- `wf_run_info`はOutput metadataのみ、本文無し
-- `wf_output_info`はinline/blobで同じmetadata contract
-- `wf_output_read`はinline/blobで同じJSON value
-- Job current Output / specific Attempt Output / Workflow Outputのsource resolution
-- optional JMESPath `select`
-- invalid select -> structured error
-- MCP large full response -> `response_too_large`, silent truncate無し
-- selectで小さいresponseなら成功
-- Output read authorization / AccessScope
+- Run info body無し
+- output info/read inline/blob
+- current Job / Attempt / Workflow source resolution
+- JMESPath select
+- MCP response_too_large no truncate
 
-HTTP v1:
+HTTP:
 
-- 全canonical route/methodが`11`と一致
-- path ID percent-encoding
-- list/query mapping
-- `Idempotency-Key` -> Service request_id
-- bodyにduplicate request_idを持たせない
-- canonical HTTP error mapping 200/201/400/401/403/404/409/413/500
-- retry_input_unavailable -> 400 or 409ではなく`11`のcanonical domain mappingに従う（MVPでは400 validation/domain contract error）
+- exact v1 routes/methods from`11`
+- Definition info uses query `workflow_ref`, slash-containing IDs supported
+- opaque generated IDs in path
+- Idempotency-Key header mapping
+- no duplicate request_id body
+- status 200/201/400/401/403/404/409/413/500
+- no 422
+- idempotency replay preserves original 201/200 status/body
+- source_identity non-empty string when present
 
-## 6. SecretGuard
+## 7. SecretGuard
 
 SecretsProvider:
 
 - non-empty str success
-- empty str -> `secret_value_invalid`
-- bytes/number/object -> `secret_value_invalid`
+- empty/bytes/number/object -> `secret_value_invalid`
 - missing -> `secret_not_found`
 
-Current Attempt known Secret:
+Known Secret:
 
-- Output exact/substring/nested -> reject
-- large Output spill前reject
-- state.set -> reject
-- Artifact metadata/URI -> reject
-- Event/error -> reject
-- log -> redact
-- managed Artifact text/binary byte match -> reject
-- chunk境界match -> reject
+- Output substring/nested reject
+- spill前reject
+- state.set reject
+- Artifact metadata/URI reject
+- Event/error reject
+- log redact
+- managed Artifact byte match/chunk boundary reject
 - transformed Secretは保証外
 
-## 7. Scheduling / Claim
+## 8. Scheduling / Claim / Maintenance
 
-- Workflow priority
-- Job priority
+- Workflow/Job priority
 - Dynamic order/source
-- pool routing
-- one internal running / Workflow Run
-- multiple Workflow Runs parallel
+- Pool routing
+- one internal running / Run
+- multiple Runs parallel
 - pause/resume
-- non-preemptive priority update
-- internal claim exactly-one race
-- External claim同ordering
-- concurrency group `Foo` と `foo` は別group
+- non-preemptive priority
+- internal claim race exactly one
+- External claim same ordering
+- Concurrency group `Foo` != `foo`
 
-## 8. Runner / IPC
+Maintenance Loop:
 
-- start/ready/log/progress/step/error/exiting
-- Runtime Handle request_id correlation
-- state_get/set response
-- Artifact put/materialize response
-- Runtime request待ち中cancel
-- Action result file protocol
-- giant JSON resultでもIPC frame小さい
-- result path traversal reject
-- size/digest mismatch
-- child crash/hang
+- nearest-deadline waiting, no busy loop
+- new earlier deadline wakes wait
+- max sleep default5 seconds
+- retry_not_before due without external event
+- external Lease expiry without client traffic
+- Pause中Lease expiry continues
+- Pause中retry due does not start new Attempt
+- Resume starts due retry
+- restart processes overdue retry/Lease before normal scheduling
+- repeated due processing idempotent
+
+## 9. Runner / IPC
+
 - heartbeat/main-loop stall
+- Supervisor heartbeat scan lost exactly once
+- heavy Action heartbeat
+- start/ready/log/progress/step/error/exiting
+- Runtime Handle correlation
+- state/artifact request-response
+- ActionFailure code/retryable/details
+- unhandled exception retryable=false
+- request wait中cancel
+- result file protocol/large result frame small
+- path traversal/size/digest reject
+- child crash/hang
 - Parent shutdown vs Workflow cancel
 - old Runner fencing/restart suppression
 
-## 9. Timeout
+## 10. Retry / Failure policy
 
-- internal no-timeout long Action
-- internal timeout -> cancel/terminate -> retry
+Definition:
+
+- retry block absent -> max1 / disabled
+- `retry:{}` -> max2 / `failure.retryable` / zero backoff
+- max-attempts >=2
+- initial>=0/max>=initial/multiplier>=1 finite
+- backoff formula attempt2/3/4 and cap
+- retry condition type/error
+
+Core retryable map:
+
+- runner_lost true
+- job_timeout true
+- external_lease_expired true
+- payload_storage_failed true
+- action_exception/process_exit false
+- protocol/result/schema/success_if false
+- ActionFailure provided value preserved
+- Validator provided value preserved
+- version mismatch/human reject/secret/reuse/input unavailable false
+
+Automatic:
+
+- failed Attempt only
+- max-attempts
+- retry deadline created
+- retry condition false
+- condition error preserves original failure
+- manual Attempt beyond max does not restart automatic budget
+
+Manual:
+
+- prior failed Attempt + Input Snapshot required
+- pre-Attempt failure -> retry_input_unavailable/new Run
+- Action/Validator version availability
+- completed/failure Run reopen/run_attempt++
+- success/cancelled Run reject
+- target Input exact copy
+- blocked/skipped descendants re-evaluate
+- failed non-target no auto retry
+
+## 11. Timeout
+
+- internal no timeout long Action
+- internal timeout cancel/terminate -> retryable true
 - external/human/reusable timeout reject
 
-## 10. Dynamic Jobs
+## 12. Dynamic Jobs
 
 - 0/1/N
 - stable/index key
-- parent別same raw key
+- parent same raw key
 - percent encoding
 - fixed job_key length limit無し
-- 1000 allowed / 1001 rollback
-- nested 2/3+ depth
-- arbitrary-depth representative
-- parent edge cycle
+- 1000/1001 rollback
+- 2/3+ arbitrary representative depth
+- parent cycle
 - parent+needs helper
-- order type/order
+- order
+- Action+Validator preflight atomic rollback
 - expansion crash/restart
 - group status/conclusion
-- arbitrary JSON Output aggregation
-- full-key Artifact lookup
+- arbitrary JSON aggregation
+- full-key Artifact
 
-## 11. Reusable Workflow
+## 13. Reusable Workflow
 
 - registered ID
-- relative path caller source directory基準
+- caller-directory relative path
 - traversal/symlink escape
-- non-filesystem caller relative reject
-- binding固定 / Retry same binding
+- non-filesystem relative reject
+- binding Definition+Action+Validator versions
+- Retry same binding
+- missing Validator version fail-closed
 - Parent/Child Output/state isolation
 - cycle
 - direct Child control reject
 - Dynamic+Reusable
-- restart duplicate防止
-- Child Workflow Output spill
+- restart duplicate
+- Child Output spill
 
-## 12. Managed ArtifactStore
+## 14. ArtifactStore
 
-- put_file durable copy
-- source work_dir traversal reject
-- immutable same-name generations
-- managed materialize current work_dir
+Managed:
+
+- durable put
+- workdir traversal reject
+- immutable generations
 - materialize destination safety
 - Retry current generation
-- managed retention deletes data
-- store finalize後DB failure -> orphan cleanup/no metadata exposure
+- retention data delete
+- store finalize DB failure orphan cleanup
 
-External Artifact:
+External:
 
-- URI metadata register
+- URI metadata
 - no fetch
-- Core retention external data非削除
-- External LLM task_submit Artifactはexternal reference only
+- retention external data non-delete
+- External LLM reference only
 
-## 13. External LLM
+## 15. External / Human
 
-- arbitrary JSON result
-- large result spill
-- activation one Task/Attempt
-- candidate ordering / concurrent claim
-- claim_next same selection
-- lease requeue/fail
+External:
+
+- arbitrary result/large spill
+- one Task/Attempt
+- claim race/order/claim_next
+- Lease requeue/fail
+- overdue Maintenance processing
 - stale/cancel submit reject
-- Pause/recovery
+- Pause/Recovery
 
-## 14. Human
+Human:
 
 - pending/approve/reject
-- Job Output null
-- concurrent first-wins
+- Output null
+- first-wins
 - cancel/pause/retry
-- timeout無し
-
-## 15. Automatic / Manual Retry
-
-- auto retry default off
-- max-attempts / condition / backoff
-- Retry target Input fixed
-- failed Job with prior Attempt/Input Snapshot -> manual retry allowed
-- activation前failure with no Attempt/Input Snapshot -> `retry_input_unavailable`
-- `retry_input_unavailable` はsame Run retryせずnew Workflow Run要求
-- Service/API error mapping
-- manual retry completed/failure Run reopen
-- run_attempt++
-- success/cancelled Run retry reject
-- blocked/skipped descendants re-evaluate
-- failed non-target descendant not auto-retried
-- terminal Run not reopened by Recovery
+- no timeout/validator
 
 ## 16. Same-Run Result Reuse
 
-Scope:
+Scope same Run only, no cross-Run.
 
-- same Workflow Runだけ
-- cross-Run automatic reuse無し
+Key includes:
 
-Key:
-
-- persistent Input digest
+- persistent Input
 - direct upstream Artifact identity
-- entire Definition hash
-- executor identity/action version
+- Definition hash
+- executor/Action version
+- Validator identity/version
 
 Negative:
 
-- Input/Artifact/Definition/Action version changed
-- Payload missing/digest bad
-- state.get使用 -> ineligible
-- frozen dependency外Artifact dynamic materialize -> ineligible
+- changed component
+- Payload missing/digest
+- state.get
+- undeclared Artifact materialize
 
 Manual Retry descendant:
 
-- success + key match -> existing success + `job_result_reused`
-- mismatch/ineligible/Payload missing -> `successful_job_result_not_reusable`
-- same Job Runへchanged InputのAttemptを自動生成しない
-- new Workflow Run要求
-
-RetentionによるPayload/managed Artifact欠落もsilent reuse禁止。
+- match -> reused event/success
+- mismatch/ineligible/missing/version -> successful_job_result_not_reusable
+- no automatic changed-Input re-execution
+- new Run required
 
 ## 17. Recovery
 
-- Parent restart old running -> runner_lost
+- Parent restart running -> runner_lost
 - queued/waiting/backoff restore
-- Dynamic expansion duplicate無し
-- Child duplicate無し
-- reuse_check_pending restore
+- overdue deadline processing
+- Dynamic/Child duplicate無し
+- reuse pending restore
 - completed Run Recovery-only reopen無し
 
 ## 18. Persistence / Idempotency / Retention
 
 - migration/WAL/FK/busy timeout
-- unknown future schema version reject
-- output inline/blob column constraints
-- reuse context/key/eligible/pending
+- future schema reject
+- output inline/blob constraints
+- Action/Validator snapshots
+- retry/reuse metadata
 - internal running unique
 - Dynamic/Reusable/External/Human unique
 - state current/history atomic
-- concurrency race/case-sensitive group
-- FK NO ACTION / child-first explicit retention deletion
+- deadline indexes
+- concurrency race/case
+- FK NO ACTION/explicit retention order
 - idempotency Actor/AccessScope isolation
-- TTL replay/conflict
-- expired row replacement
+- TTL replay/conflict/expired replacement
+- HTTP adapter_meta original status replay
 - task_claim replay no extra Lease
 
 ## 19. Authorization / Security
 
 - AllowAll/Deny/filtered scope
 - all public read/write authorize
-- Definition list/info authorization
+- Definition list/info authorize
 - log path safety
-- Artifact URI no auto-fetch
+- Artifact URI no fetch
 - arbitrary shell無し
 
 ## 20. Platform / CI
 
-Windows 11 / Linux。
+Windows11/Linux。
 
 ```text
 lint/typecheck
@@ -345,19 +399,20 @@ platform-matrix
 ## 21. MVP completion gate
 
 1. `01`〜`12`受入条件対応
-2. dependency install/import Python3.10+ / Windows/Linux
-3. migration/FK retention semantics
-4. process integration Windows/Linux
-5. claim/concurrency races
-6. PayloadStore inline/spill/crash
-7. Service/MCP/HTTP adapter contract
-8. Managed ArtifactStore
-9. External/Human E2E
-10. Dynamic1000/nested/rollback
-11. Reusable binding/cycle
-12. SecretGuard + Secret value contract
-13. same-run Result Reuse
-14. Retry Input availability boundary
-15. idempotency scope/TTL
+2. dependencies Python3.10 Windows/Linux
+3. Validator contract
+4. migrations/FK retention
+5. process integration
+6. claim/concurrency/deadline races
+7. PayloadStore
+8. Service/MCP/HTTP contract
+9. ArtifactStore
+10. External/Human E2E
+11. Dynamic1000/nested/rollback
+12. Reusable binding/cycle/version
+13. SecretGuard
+14. Retry failure policy
+15. same-run Result Reuse
+16. idempotency scope/status replay
 
 WebUI E2Eは後続。
