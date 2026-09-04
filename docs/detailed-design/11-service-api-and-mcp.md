@@ -1,9 +1,9 @@
 # 11. Service API / MCP / HTTP 詳細設計
 
-- Status: Draft v0.7
+- Status: Draft v0.8
 - 対象: MVP
 - 上位仕様: `docs/design.md`
-- 関連: `01`, `03`, `07`, `08`, `10`, `12`
+- 関連: `01`, `03`, `07`, `08`, `09`, `10`, `12`
 
 ## 1. 基本原則
 
@@ -15,6 +15,7 @@
 6. Large Log/Output本文をRun infoへ埋め込まない。
 7. Workflow DefinitionとWorkflow RunをAPI名で分離。
 8. Service request/response modelを本書で固定し、Adapter独自fieldをCore意味へ持ち込まない。
+9. Job状態を任意に書き換えるgeneric mutation APIを提供しない。
 
 ## 2. 共通model規則
 
@@ -75,11 +76,7 @@ RunnerService
 
 ### `wf_definition_list`
 
-Request:
-
-```text
-limit/cursor
-```
+Request=`limit/cursor`。
 
 Order: canonical `workflow_id` ASC。
 
@@ -191,7 +188,7 @@ include_events_summary=false
 include_output_metadata=true
 ```
 
-`include_attempts=true` は `include_jobs`を暗黙true、`include_steps=true`はjobs+attemptsを暗黙trueにする。
+`include_attempts=true` は `include_jobs`を暗黙true、`include_steps=true`はjobs+attemptsを暗黙true。
 
 Response base:
 
@@ -210,15 +207,13 @@ Output/Log本文無し。
 
 ### 5.4 `wf_pause`
 
-Request: `workflow_run_id + request_id?`。
+Request=`workflow_run_id + request_id?`。
 
-Allowed: non-terminal root Run。Already pausedはsame state idempotent success。Child direct control reject。
-
-Response: Mutation summary。
+Allowed=non-terminal root Run。Already pausedはsame state idempotent success。Child direct control reject。
 
 ### 5.5 `wf_resume`
 
-Allowed: paused root Run。Already non-paused non-terminalへの再送は、同idempotency key replay以外 `invalid_state`。Response Mutation summary。
+Allowed=paused root Run。Already non-paused non-terminalへの新requestは`invalid_state`。同idempotency key replayは元resultを返す。
 
 ### 5.6 `wf_cancel`
 
@@ -230,9 +225,7 @@ reason optional string
 request_id optional
 ```
 
-Non-terminal root Run。Already cancelled terminalでsame request_idならreplay。異なるnew cancel requestは`invalid_state`。
-
-Response Mutation summary。
+Non-terminal root Run。Already cancelled terminalでsame request_idならreplay。別requestは`invalid_state`。
 
 ### 5.7 `wf_priority_update`
 
@@ -244,7 +237,7 @@ priority: signed64 integer
 request_id optional
 ```
 
-Root non-terminal Runのみ。Preempt無し。Response Mutation summary + `priority`。
+Root non-terminal Runのみ。Preempt無し。Response=Mutation summary + priority。
 
 ### 5.8 `wf_retry`
 
@@ -256,7 +249,7 @@ job_run_id
 request_id optional
 ```
 
-Eligibilityは`10`。Input override field自体をschemaに持たない。
+Eligibility=`10`。Input override fieldをschemaに持たない。
 
 Response:
 
@@ -269,13 +262,13 @@ retry_not_before nullable
 updated_at
 ```
 
-Manual Retry request時点ではnew Attemptを作らないため`attempt_id`を返さない。
+Manual Retry request時点ではnew Attemptを作らないためattempt_id無し。
 
 ## 6. Output operations
 
 ### `wf_output_info`
 
-Request exactly one source selector:
+Request exactly one:
 
 ```text
 workflow_run_id xor job_run_id xor attempt_id
@@ -284,7 +277,7 @@ workflow_run_id xor job_run_id xor attempt_id
 Response:
 
 ```text
-source_type = workflow_run|job_run|attempt
+source_type=workflow_run|job_run|attempt
 source_id
 available
 storage_kind nullable
@@ -294,11 +287,7 @@ digest nullable
 
 ### `wf_output_read`
 
-同じsource selector +:
-
-```text
-select: JMESPath string optional
-```
+同じselector + optional `select: JMESPath string`。
 
 Response:
 
@@ -309,15 +298,13 @@ selected: boolean
 value: any JSON-compatible value
 ```
 
-Output unavailableは`not_found`。Payload corruptionはstorage error。
-
-MCP response上限超過時silent truncateせず`response_too_large`。
+Output unavailable=`not_found`。Payload corruption=storage error。MCP上限超過は`response_too_large`、silent truncate無し。
 
 ## 7. External Task operations
 
 ### 7.1 `wf_task_info`
 
-Request: `task_id`。
+Request=`task_id`。
 
 Response:
 
@@ -337,40 +324,34 @@ created_at/completed_at
 Request:
 
 ```text
-task_id optional                 # specific available task
-workflow_run_id optional         # discovery filter
-job_template_key optional        # discovery filter
+task_id optional
+workflow_run_id optional
+job_template_key optional
 request_id optional
 ```
 
-`task_id`指定時は他discovery filter禁止。未指定時はfilterで次candidateを選ぶ。
+`task_id`指定時は他filter禁止。未指定時は通常priority orderingでcandidateを選ぶ。
 
-Claimant identityはActorContext/client principalからCoreが作り、request bodyの自由な`claimed_by`は受けない。
+Claimant identityはActorContext/client principalからCoreが作り、自由な`claimed_by` field無し。
 
-候補無しはerrorにせず:
+候補無し:
 
 ```json
 {"task": null}
 ```
 
-Success:
+Success task:
 
-```json
-{
-  "task": {
-    "task_id": "...",
-    "lease_id": "...",
-    "lease_expires_at": "...",
-    "workflow_run_id": "...",
-    "job_run_id": "...",
-    "attempt_id": "...",
-    "job_key": "...",
-    "input": {}
-  }
-}
+```text
+task_id
+lease_id
+lease_expires_at
+workflow_run_id
+job_run_id
+attempt_id
+job_key
+input
 ```
-
-Inputは任意JSON-compatible object（Job Input contract上object）。Secret無し。
 
 ### 7.3 `wf_task_submit`
 
@@ -403,12 +384,27 @@ submitted=true
 workflow_run_id/job_run_id/attempt_id
 job_status/job_conclusion
 failure nullable
-next_task nullable       # same shape as claim task object
+next_task nullable
 ```
 
-Validation/domain failureがsubmitをterminal failureとして受理した場合も`submitted=true`でfailureを返す。Lease conflict/stale/cancelはoperation errorで`submitted=false` responseを作らない。
+Validation/domain failureをterminal failureとして受理した場合も`submitted=true`。Lease conflict/stale/cancelはoperation error。
 
 `claim_next=true` のnext claim失敗/候補無しはsubmit本体をrollbackせず`next_task=null`。
+
+Idempotency replayでは初回submit responseをそのまま再生するため、初回に返した`next_task`も同じresponseとして返す。Replay時に別Taskを追加claimしない。
+
+### 7.4 MVPに存在しないLease操作
+
+以下のService operationはMVPに**存在しない**。
+
+```text
+wf_task_heartbeat
+wf_task_lease_renew
+wf_task_lease_extend
+wf_task_lease_transfer
+```
+
+対応するMCP tool/HTTP endpointも作らない。Lease lifetime変更はDefinition/System設定の次Attempt/Taskへ適用する。
 
 ## 8. Human Review operations
 
@@ -418,33 +414,15 @@ Request:
 
 ```text
 workflow_run_id optional
-status optional = pending|completed|cancelled
+status optional=pending|completed|cancelled
 limit/cursor
 ```
 
-Order: `created_at ASC, review_id ASC`。
-
-Item:
-
-```text
-review_id/workflow_run_id/job_run_id/attempt_id
-status/outcome nullable
-created_at/completed_at
-```
+Order=`created_at ASC, review_id ASC`。
 
 ### `wf_review_info`
 
-Request: `review_id`。
-
-Response:
-
-```text
-review_id/workflow_run_id/job_run_id/attempt_id
-status/outcome/comment
-input
-actor_summary nullable
-created_at/completed_at
-```
+Request=`review_id`。Review/input/outcome/comment/actor summary/timestampsを返す。
 
 ### `wf_review_submit`
 
@@ -468,13 +446,15 @@ job_status/job_conclusion
 completed_at
 ```
 
+Completed/cancelled Reviewへの別outcome再submitは`invalid_state`。Same idempotency keyだけreplay可能。
+
 ## 9. Artifact / Log / Runner operations
 
 ### `wf_artifact_info`
 
-Request: `artifact_id`。
+Request=`artifact_id`。Response=canonical public ArtifactRef + producer IDs + created/deleted metadata。Managed store_key/path無し。
 
-Response=public ArtifactRef + producer IDs + created/deleted metadata。Managed `store_key`/filesystem pathは返さない。
+Cross-run readもAuthorization対象。
 
 ### `wf_log_read`
 
@@ -487,41 +467,35 @@ limit_bytes optional 1..1048576 default 65536
 tail_lines optional 1..10000
 ```
 
-`tail_lines` と `offset_bytes` は同時指定禁止。Response:
-
-```text
-content string
-next_offset_bytes nullable
-truncated boolean
-size_bytes
-updated_at nullable
-```
+`tail_lines`と`offset_bytes`同時禁止。
 
 ### `wf_runner_info`
 
-Request:
+Request=`pool optional`。Response=`pools[{name,configured_count,runners[]}]`。
+
+## 10. 禁止するgeneric Job mutation
+
+MVP Public Serviceに以下を作らない。
 
 ```text
-pool optional non-empty string
+wf_job_mark_success
+wf_job_override_conclusion
+wf_job_skip
+wf_job_force_complete
+wf_review_rewrite
 ```
 
-Response:
+したがってMCP/HTTPにも対応tool/route無し。
 
-```text
-pools: [{name, configured_count, runners:[...]}]
-```
+- failed Jobをsuccessにしたい -> 原因修正後`wf_retry`
+- skip/許容failure -> Workflow Definitionの`if`/`continue-on-error`等で事前定義
+- Human Review -> pending状態へのapprove/rejectのみ
 
-Runner itemはrunner/instance/runtime ID, status, heartbeat, current job/attempt, restart/suppression summary。
+Core内部Recoveryもterminal success/failureを「管理者操作だから」という理由で上書きしない。
 
-## 10. MCP namespace / canonical tools
+## 11. MCP namespace / canonical tools
 
-`system_namespace` non-empty、推奨:
-
-```text
-^[a-z][a-z0-9_]*$
-```
-
-同一MCP server tool collisionをregistration時reject。
+`system_namespace` non-empty、推奨 `^[a-z][a-z0-9_]*$`。同一MCP server tool collisionをregistration時reject。
 
 Canonical public tools:
 
@@ -549,16 +523,15 @@ Canonical public tools:
 <ns>_wf_runner_info
 ```
 
-MCP schemaは上記Service requestから`request_id`を含める以外、Actor/AccessScopeを除いた同じfield意味を使う。
+Actor/AccessScopeはpublic tool inputへ露出しない。
 
-## 11. HTTP Adapter v1
+## 12. HTTP Adapter v1
 
-Standard prefix `/api/jobrunner/v1`。
+Standard prefix=`/api/jobrunner/v1`。
 
 ```text
 GET  /workflow-definitions
 GET  /workflow-definitions/info?workflow_ref=<encoded>
-
 POST /workflow-runs
 GET  /workflow-runs
 GET  /workflow-runs/{workflow_run_id}
@@ -567,36 +540,32 @@ POST /workflow-runs/{workflow_run_id}/resume
 POST /workflow-runs/{workflow_run_id}/cancel
 PATCH /workflow-runs/{workflow_run_id}
 POST /workflow-runs/{workflow_run_id}/jobs/{job_run_id}/retry
-
 GET  /workflow-runs/{workflow_run_id}/output-info
 GET  /workflow-runs/{workflow_run_id}/output
 GET  /jobs/{job_run_id}/output-info
 GET  /jobs/{job_run_id}/output
 GET  /attempts/{attempt_id}/output-info
 GET  /attempts/{attempt_id}/output
-
 GET  /external-tasks/{task_id}
 POST /external-tasks/claim
 POST /external-tasks/{task_id}/submit
-
 GET  /reviews
 GET  /reviews/{review_id}
 POST /reviews/{review_id}/submit
-
 GET  /artifacts/{artifact_id}
 GET  /attempts/{attempt_id}/log
 GET  /runners
 ```
 
-上記はprefix付きで解釈。Opaque generated IDのみpath parameter。Workflow referenceはquery/body。
+Opaque generated IDのみpath parameter。Workflow referenceはquery/body。
 
-HTTP Adapterはpathから取得したIDをService request fieldへinjectし、bodyに同じID fieldを重複要求しない。
-
-GET queryは対応Service read request fieldsへmapping。
+Path IDをService fieldへinjectし、bodyに同IDを重複要求しない。GET queryは対応read modelへmapping。
 
 State-changing HTTPはoptional `Idempotency-Key` header -> Service request_id。Bodyにrequest_id無し。
 
-## 12. HTTP status mapping
+Lease renew/heartbeat、Job skip/override用routeは存在しない。
+
+## 13. HTTP status mapping
 
 ```text
 200  read / successful non-create mutation
@@ -612,18 +581,9 @@ State-changing HTTPはoptional `Idempotency-Key` header -> Service request_id。
 
 422はMVP不使用。
 
-### Idempotency replay
+Idempotency replayは最初の成功status+bodyをそのまま再生。Persistence `adapter_meta_json`にoriginal statusを保持可能。
 
-最初の成功status+bodyをそのまま再生。
-
-- wf_start初回201 -> replay201
-- pause初回200 -> replay200
-
-Persistence `adapter_meta_json`にoriginal HTTP statusを保持可能。
-
-MCP`response_too_large`はtool error。HTTPが独自response上限を設定して拒否するなら413。
-
-## 13. Error model
+## 14. Error model
 
 ```text
 code
@@ -651,12 +611,14 @@ lease_expired
 runner_unavailable
 payload_missing
 payload_digest_mismatch
+artifact_access_forbidden
+artifact_data_unavailable
 response_too_large
 child_run_direct_control_forbidden
 internal_error
 ```
 
-## 14. Idempotency
+## 15. Idempotency
 
 対象:
 
@@ -671,9 +633,9 @@ Scope=namespace+resource+AccessScope+Actor/client principal。
 
 TTL内same hash replay/different hash conflict。TTL後expired row replace可。
 
-Persisted Service result + Adapter original HTTP status metadata。MCP/Pythonは同じService resultを各形式へ再構成。
+Persisted Service result + Adapter original HTTP status metadata。Replayで副作用を再実行しない。
 
-## 15. Validation order
+## 16. Validation order
 
 1. request schema
 2. Actor/AccessScope
@@ -685,21 +647,21 @@ Persisted Service result + Adapter original HTTP status metadata。MCP/Pythonは
 
 Secret値をrequest hash/Eventへ保存しない。
 
-## 16. Authorization / pagination
+## 17. Authorization / pagination
 
 全public operation authorize。Listはfiltered scope適用。
 
 Cursor opaque。`limit`共通1..200 default50。
 
-## 17. Python API
+## 18. Python API
 
 Canonical Service request/response modelを直接使う。Adapter独自意味変更禁止。
 
-## 18. Observability
+## 19. Observability
 
 State change Eventへactor/source/request_id。Request body/Secret/巨大payload無条件保存無し。
 
-## 19. 受入条件
+## 20. 受入条件
 
 1. Service request unknown field reject
 2. Actor/AccessScope caller injection禁止
@@ -710,12 +672,15 @@ State change Eventへactor/source/request_id。Request body/Secret/巨大payload
 7. retry no input override/no attempt id response
 8. output xor selector
 9. task specific/discovery claim + no-candidate null
-10. task submit terminal validation failure semantics
-11. review request/response
-12. log read parameter conflicts/ranges
-13. namespaced MCP collision
-14. HTTP path/body ID mapping
-15. slash-containing workflow_ref query
-16. Idempotency-Key/original status replay
-17. no 422
-18. all read/write authorization
+10. task submit idempotency replay does not claim new next task
+11. no lease heartbeat/renew/extend/transfer operation/tool/route
+12. review submit completed rewrite reject
+13. no manual Job skip/success override generic mutation
+14. artifact access errors/authorization
+15. log read parameter conflicts/ranges
+16. namespaced MCP collision
+17. HTTP path/body ID mapping
+18. slash-containing workflow_ref query
+19. Idempotency-Key/original status replay
+20. no 422
+21. all read/write authorization
