@@ -1,6 +1,6 @@
 # 09. Artifact / Log / Workflow State 詳細設計
 
-- Status: Draft v1.0
+- Status: Draft v1.1
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `02`, `03`, `04`, `08`, `11`, `12`
@@ -44,7 +44,7 @@ runtime.artifact.materialize(artifact_ref) -> local_path
 
 `register_external`: Core fetch無し。
 
-`materialize`: Managedのみ、§7。
+`materialize`: Managedのみ、§6。
 
 External LLM `task_submit.artifacts` はExternal Referenceのみ。Binary upload無し。
 
@@ -64,13 +64,7 @@ External LLM `task_submit.artifacts` はExternal Referenceのみ。Binary upload
 
 Externalのみ`uri`追加可能。
 
-Required:
-
-```text
-type=jobrunner_artifact
-artifact_id/name non-empty
-storage_kind=managed|external
-```
+Required=`type=jobrunner_artifact`, artifact_id/name non-empty, storage_kind=`managed|external`。
 
 Caller supplied metadataをSource of Truthにせずartifact_idでDB再resolve。Managed store path非公開。
 
@@ -78,13 +72,9 @@ Caller supplied metadataをSource of Truthにせずartifact_idでDB再resolve。
 
 Coreはcross-run Artifactを暗黙探索しない。
 
-### same Run
+Same Run: current Run owned Managed Artifactはdata/metadata/current Actor scope確認後利用可能。
 
-Current Run owned Managed Artifactはdata/metadata/current Actor scope確認後利用可能。
-
-### cross Run
-
-全て必須:
+Cross Runは全て必須:
 
 1. canonical ArtifactRefがcurrent persistent Job Inputに存在
 2. row/data存在、not deleted
@@ -95,9 +85,7 @@ Raw artifact_idだけでは不可。
 
 ArtifactRefを別Runへ渡してもsource Retention hold/pin無し。Sourceが削除されたらfail-closed。
 
-### External Reference
-
-Core materialize無し。
+External ReferenceはCore materialize無し。
 
 ## 7. Artifact generations / reuse
 
@@ -139,11 +127,11 @@ Attempt terminalでclose。Recoveryでopen Logを閉じる場合もclose metadat
 
 全量memory保持禁止。Periodic flush。
 
-CoreはExternal LLMだけ特別にPrompt/Resultを隠すpolicyを持たない。一方、**どのexecutorでもpersistent Input/Output全bodyをExecution Logへ自動複製しない**。Input/Output APIが本文のSource of Truth。Parent/Actionが明示logする場合は通常Log/SecretGuard規則。
+どのexecutorでもpersistent Input/Output全bodyをExecution LogへCoreが自動複製しない。Input/Output APIが本文のSource of Truth。Parent/Actionが明示logする場合は通常Log/SecretGuard規則。
 
 ### 10.1 Log verbosity
 
-Effective `execution_log_level`=`01` System -> Workflow設定。
+Effective `execution_log_level` は**当該Workflow Runの `effective_settings.execution_log_level` snapshot**を使う。Current System/Workflow source settingsをLog書込時に再参照しない。
 
 `normal`:
 
@@ -164,7 +152,7 @@ DebugでもSecret値やInput/Output全bodyをCoreが自動dumpしない。
 
 `wf_log_read`でattempt IDからoffset/tail。External path指定不可。
 
-Retentionでfile削除済みなら空文字を正常Logとして返さず`log_data_unavailable`相当metadata/errorを返す。
+Retentionでfile削除済みなら空文字を正常Logとして返さず`log_data_unavailable`を返す。
 
 ## 11. Event Log
 
@@ -189,31 +177,30 @@ Progress update/全log lineはEventへ複製しない。
 
 Retention audit=`retention_deleted|retention_orphan_cleaned`、owner FK無し、通常event retention外、MVP無期限。
 
-Public Event readは`11`の`wf_event_list`。
+Public Event read=`11 wf_event_list`。
 
 ## 12. Step
 
 Step=Job内部の観測単位。
 
-無し:
-
-```text
-needs
-Runner allocation
-independent Retry
-timeout
-Artifact ownership
-```
+無し=`needs`, Runner allocation, independent Retry, timeout, Artifact ownership。
 
 Open Step crash -> `incomplete`。
 
 ## 13. Job Progress
 
-Resolved mode=`01`:
+Resolved `progress_mode`はJob Run作成時にsnapshotする。
+
+Resolution:
 
 ```text
-auto|explicit|none
+Job progress.mode specified
+  > Workflow Run effective_settings.job_progress_mode
 ```
+
+Run effective setting自体は`01`のWorkflow setting > Run System baseline > defaultで既に確定済み。Current System/Workflow source settingsを後から再参照しない。
+
+Mode=`auto|explicit|none`。
 
 Action `progress` reportは`04`形式。DBにはlast explicit reportを保存する。
 
@@ -228,7 +215,7 @@ Non-terminal:
 - reportあり -> last report公開
 - report無し -> indeterminate (`current/total=null`)
 
-Terminalになったらlifecycle completionとして`fraction=1.0`を公開し、最後のmessage/report metadataは履歴表示用に残せる。Conclusion成功を意味しない。
+Terminalになったらlifecycle completionとして`fraction=1.0`を公開。Conclusion成功を意味しない。
 
 ### 13.3 `auto`
 
@@ -240,17 +227,13 @@ Terminalになったらlifecycle completionとして`fraction=1.0`を公開し�
 4. non-terminal -> 0.0
 5. terminal -> 1.0
 
-External/Humanはprogress更新APIをMVPに持たないため通常0->1。InternalはAction reportを利用可能。
+External/Humanはprogress更新APIをMVPに持たないため通常0->1。InternalはAction report利用可能。
 
 ProgressはConclusion判定へ使わない。
 
 ## 14. Workflow Progress
 
-Effective `workflow_progress_mode`:
-
-```text
-auto|none
-```
+Effective `workflow_progress_mode` は当該Workflow Runの `effective_settings.workflow_progress_mode` snapshotを使う。Mode=`auto|none`。
 
 `none` -> public Workflow progress=null。
 
@@ -260,9 +243,9 @@ auto|none
 - Generated Dynamic Job Runをcount
 - Reusable Parent Jobは1 JobとしてcountしChild fractionを内部fractionに使える
 - Dynamic template virtual group自体はcountしない
-- `fraction` indeterminateのnon-terminal Jobは0としてaggregate
+- indeterminate non-terminal Jobは0としてaggregate
 - terminal Jobはconclusionに関係なく1
-- Generated Job追加で分母増加可、したがってpercentageが一時的に下がることを許容
+- Generated Job追加で分母増加可、percentage一時低下を許容
 
 Known concrete Job=0でRun non-terminalなら0、Run terminalなら1。
 
@@ -289,7 +272,7 @@ Attempt execution開始時mkdir、終了後削除。Cleanup failureはJob conclu
 
 ## 17. Retention
 
-Source=`01` effective policy snapshot。
+Source=`workflow_runs.retention_policy_json` snapshot。
 
 ### Execution Log
 
@@ -316,10 +299,11 @@ Source=`01` effective policy snapshot。
 - non-terminal delete禁止
 - component retentionの最終上限
 - Output PayloadはRun/Attempt historyと共にdelete
+- Parent expiryはChild subtree上限
 
 ### Orphan cleanup
 
-Owner metadata無しtemp/payload/artifact objectはconsistency cleanup可能。system audit Eventを残す。
+Owner metadata無しtemp/payload/artifact objectはconsistency cleanup可能。System audit Eventを残す。
 
 ## 18. RetentionとReuse
 
@@ -332,6 +316,7 @@ Reuse対象Payload/Managed Artifactが削除済みならsilent reuse禁止。Cro
 - metadata/URI SecretGuard
 - External URI auto-fetch無し
 - cross-run explicit ref + Authorization
+- Runtime Handle state/artifact authorization=`12`
 - Log Secret redaction
 
 ## 20. 受入条件
@@ -339,16 +324,18 @@ Reuse対象Payload/Managed Artifactが削除済みならsilent reuse禁止。Cro
 1. Artifact generations/scope/Authorization
 2. cross-run no retention pin
 3. common Execution Log all four executor types
-4. normal/debug verbosity
+4. execution log level uses Run snapshot and survives System/source config change
 5. no automatic Input/Output body dump
 6. Log retention deleted-state read behavior
 7. Event Log + public event read link
 8. Step observation-only
-9. Job progress none/explicit/auto
-10. Reusable Child progress aggregation
-11. External/Human auto 0->1
-12. Workflow auto concrete-job aggregation
-13. Dynamic denominator growth/decrease allowed
-14. Progress no effect on conclusion
-15. state history/SecretGuard
-16. temp/retention/orphan cleanup
+9. Job progress resolution snapshot
+10. Job progress none/explicit/auto
+11. Reusable Child progress aggregation
+12. External/Human auto 0->1
+13. Workflow progress mode uses Run snapshot
+14. Workflow auto concrete-job aggregation
+15. Dynamic denominator growth/decrease allowed
+16. Progress no effect on conclusion
+17. state history/SecretGuard
+18. temp/retention/orphan cleanup
