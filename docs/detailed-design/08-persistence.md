@@ -1,6 +1,6 @@
 # 08. Persistence 詳細設計
 
-- Status: Draft v2.4
+- Status: Draft v2.5
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - Canonical JSON: `01` の `jobrunner.canonical-json.v1`
@@ -387,6 +387,8 @@ Pre-Attempt failureはrow無し。
 
 Internal claim=Job pending exact copy。External/Human/Reusable初回=直接snapshot。Retry=全executor pending経由。Secret禁止executor bindings=`[]`。
 
+Successful Attemptで`secret_bindings_json != []`なら`reuse_eligible=0`。Secret valueは保存しないため同一性を証明せず、古いOutputを自動再利用しない。
+
 ```sql
 CREATE INDEX ix_attempts_job ON job_attempts(job_run_id,attempt_no DESC);
 ```
@@ -400,13 +402,19 @@ sequence INTEGER NOT NULL CHECK(sequence>=1)
 name TEXT NOT NULL CHECK(length(name)>0)
 status TEXT NOT NULL
 conclusion TEXT NULL
-metadata_json TEXT NULL
+start_metadata_json TEXT NULL
+finish_metadata_json TEXT NULL
 started_at TEXT NOT NULL
 completed_at TEXT NULL
 UNIQUE(attempt_id,sequence)
 ```
 
 Status=`running|completed`, conclusion=`NULL|success|failure|cancelled|incomplete`。
+
+- `step_started`で`start_metadata_json`を保存
+- `step_finished`で`finish_metadata_json`を保存
+- start metadataをfinishで上書きしない
+- telemetry metadataはSecret redaction後JSON-compatible objectだけ保存
 
 ## 11. `dynamic_expansions`
 
@@ -477,6 +485,8 @@ Child Run作成時:
 - `effective_settings_json` <- binding child_effective_settings_json
 - `retention_policy_json` <- binding child_retention_policy_json
 - priority <- current root Run priority
+
+Concurrency `on-limit=reject`でChildを作らない場合もbinding/Parent Attempt failureは保存してよいが、`workflow_runs` Child rowは作らない。
 
 ## 13. `workflow_state` / `workflow_state_history`
 
@@ -866,7 +876,7 @@ Runner current pointerはrepair後。FK無効化禁止。
 - External Lease claim + idempotency
 - External submit + optional claim_next Lease + full idempotency
 - Human review first-wins + idempotency
-- Reusable binding + initial Child Run + Child concurrency admission
+- Reusable binding + Parent Attempt transition + Child concurrency admission; admit/queue時だけChild Run作成、reject時はChild row無しでParent Attempt failure
 - Manual Retry reopen + concurrency reacquire + Workflow Output clear + pending snapshot + idempotency
 - concurrency holder release/wake
 
@@ -891,21 +901,22 @@ Tests use`sqlite_master`/PRAGMA for exact table/column/index/FK/check。
 5. Root System baseline snapshot / Child copy
 6. explicit/omitted runs_on stored resolved
 7. all-executor queued pending invariant
-8. Attempt Secret bindings/input digest
-9. Dynamic expansion digest/unique
-10. Reusable binding Child System baseline/settings/Retention
-11. Child priority=root priority + update propagation
-12. State immediate nonrollback
-13. Artifact schema has no metadata soft-delete column
-14. Runner invariants/indexes
-15. External Task lease finite/config snapshot + expiry boundary
-16. Human immutable
-17. Idempotency request hash/scope/no-reserved/recheck/expiry boundary
-18. concurrency scope=(workflow_id,group)
-19. mixed max-runs conservative capacity + waiter ordering
-20. Manual Retry concurrency reacquire/output clear atomicity
-21. submit+claim_next atomic
-22. Result Reuse identities
-23. Child-first Retention
-24. migration verification
-25. Payload/Artifact crash consistency
+8. Attempt Secret bindings/input digest + secret-bound reuse_eligible=0
+9. Step start/finish metadata split
+10. Dynamic expansion digest/unique
+11. Reusable binding Child System baseline/settings/Retention + reject no Child row
+12. Child priority=root priority + update propagation
+13. State immediate nonrollback
+14. Artifact schema has no metadata soft-delete column
+15. Runner invariants/indexes
+16. External Task lease finite/config snapshot + expiry boundary
+17. Human immutable
+18. Idempotency request hash/scope/no-reserved/recheck/expiry boundary
+19. concurrency scope=(workflow_id,group)
+20. mixed max-runs conservative capacity + waiter ordering
+21. Manual Retry concurrency reacquire/output clear atomicity
+22. submit+claim_next atomic
+23. Result Reuse identities
+24. Child-first Retention
+25. migration verification
+26. Payload/Artifact crash consistency
