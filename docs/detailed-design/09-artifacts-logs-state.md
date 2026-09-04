@@ -1,6 +1,6 @@
 # 09. Artifact / Log / Workflow State 詳細設計
 
-- Status: Draft v1.2
+- Status: Draft v1.3
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `02`, `03`, `04`, `08`, `11`, `12`
@@ -306,7 +306,7 @@ Candidate due dateは以下のうちfiniteな最小:
 ```text
 created_at + managed_artifact_data_days
 created_at + artifact_metadata_days
-owner Run completed_at + run_history_days   # Run subtree削除時の最終上限
+owner Run completed_at + run_history_days
 ```
 
 ただしowner Run non-terminal中はRetention期限だけでdataを削除しない。
@@ -347,7 +347,7 @@ created_at + artifact_metadata_days
 
 Owner metadata無しtemp/payload/artifact objectはconsistency cleanup可能。System audit Eventを残す。
 
-Orphan scannerは現在進行中のprepare/finalizeと競合しないよう、Core system config `orphan_cleanup_grace_seconds`（default300、finite>=0）より新しいunowned filesystem objectを削除しない。これはhousekeeping設定でありWorkflow Run semanticsではないためRun snapshot対象外。
+Orphan scannerは現在進行中のprepare/finalizeと競合しないよう、Core system config `orphan_cleanup_grace_seconds`（default300、**finite > 0**）より新しいunowned filesystem objectを削除しない。これはhousekeeping設定でありWorkflow Run semanticsではないためRun snapshot対象外。
 
 ## 18. RetentionとReuse
 
@@ -386,5 +386,5 @@ Reuse対象Payload/Managed Artifactが削除済みならsilent reuse禁止。Cro
 19. state.get/state.set reuse ineligible
 20. Artifact data vs metadata retention precedence
 21. metadata row deletion semantics
-22. orphan cleanup grace race protection
+22. orphan cleanup grace >0 / race protection
 23. temp/retention/orphan cleanup
