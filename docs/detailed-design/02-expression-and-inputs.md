@@ -1,13 +1,13 @@
 # 02. Expression / Inputs / Outputs 詳細設計
 
-- Status: Draft v0.8
+- Status: Draft v1.0
 - 対象: MVP
 - 上位仕様: `docs/design.md`
-- 関連: `01-workflow-definition.md`, `09-artifacts-logs-state.md`
+- 関連: `01-workflow-definition.md`, `08-persistence.md`, `09-artifacts-logs-state.md`, `12-security-and-secrets.md`
 
 ## 1. 目的
 
-CEL/JMESPath、`${{ ... }}`、Input/Job Output/Workflow Output/Artifact/state/Secret参照、Custom Validator連携、condition helperの正規契約を定義する。
+CEL/JMESPath、`${{ ... }}`、Input/Output/Artifact/state/Secret参照、persistent Job Input、Custom Validator連携、condition helperの正規契約を定義する。
 
 ## 2. Expression実装
 
@@ -16,7 +16,7 @@ CEL/JMESPath、`${{ ... }}`、Input/Job Output/Workflow Output/Artifact/state/Se
 
 独自DSLは作らない。
 
-`jmespath(...)` はCEL custom function bindingとして登録する。親システム任意functionを自由登録する仕組みにはせず、JobRunnerが定義したhelperだけをCEL環境へ公開する。
+`jmespath(value, expression)` はCEL custom function bindingとしてJobRunnerが登録する。親システム任意functionの自由登録はMVPに含めない。
 
 ## 3. 式記法
 
@@ -27,11 +27,14 @@ with:
   label: "${{ inputs.symbol }}-${{ inputs.timeframe }}"
 ```
 
-scalar全体1式は評価結果の型を保持。文字列埋め込みはstring。object/listを暗黙stringifyしない。
+- scalar全体1式 -> 評価結果の型を保持
+- 通常の文字列埋め込み -> string
+- object/listを暗黙stringifyしない
+- Secretだけは`01`のfull-scalar ruleに従い文字列埋め込み禁止
 
 ## 4. Context
 
-評価場所に応じて:
+Context名:
 
 ```text
 inputs
@@ -49,11 +52,28 @@ job
 jobs
 ```
 
-許可外context参照はerror。
+利用可能contextはfieldごとに固定する。
+
+| Field | Allowed context |
+| --- | --- |
+| `concurrency.group` | `inputs, env, workflow` |
+| Root `foreach` | `inputs, needs, env, state, workflow, run, job` |
+| Nested `foreach.items` | Root + `iteration` |
+| `key` / `order_by.expr` | `inputs, needs, env, state, item, iteration, workflow, run, job` |
+| Job `if` | `inputs, needs, env, state, item, iteration, workflow, run, job` |
+| Job `with` | Job `if` context + `secrets` |
+| `continue-on-error` | Job `if` context |
+| `success_if` | `outputs, inputs, env, item, iteration` |
+| `retry.if` | `failure, inputs, env, state, item, iteration, workflow, run, job` |
+| Workflow top-level `outputs` | `jobs, inputs, env, state, workflow, run` |
+
+許可外context参照はDefinition validation error。実行時に必要contextがmissingならexpression error。
+
+`success_if` はJob result判定専用なので `needs/state/secrets/failure` を参照させない。
 
 ## 5. `inputs` / `env`
 
-`inputs`はRun start snapshot。Input fieldの`nullable`規則は`01`。
+`inputs`はWorkflow Run start snapshot。Input fieldの`nullable`規則は`01`。
 
 - missingと明示nullを区別
 - nullable=falseのnull reject
@@ -62,13 +82,85 @@ jobs
 
 `env`はJSON-compatible literal-only。Expression/Secret参照禁止。
 
-## 6. Secrets
+## 6. Secret reference
 
-`${{ secrets.* }}` はinternal Action Job `with`だけ。
+`${{ secrets.NAME }}` はinternal Action Job `with`だけ、かつ1 scalar全体でのみ許可。
 
-Persistent Inputにはreference markerだけ。値は各Attempt Action起動直前materialize。Secret value contractは`12`のnon-empty string。
+Definition evaluatorはSecret valueを解決せず**typed SecretRef**として扱う。
 
-## 7. `needs`
+Persistent JSONではSecret valueの代わりにcanonical reference stringを残す。
+
+```text
+${{ secrets.API_TOKEN }}
+```
+
+同じliteral stringを通常Inputとして受け取る場合と区別するため、別途`secret_bindings`を必ず保存する。
+
+Canonical binding:
+
+```json
+{
+  "pointer": "/auth/token",
+  "name": "API_TOKEN"
+}
+```
+
+Rules:
+
+- `pointer`=RFC 6901 JSON Pointer
+- `name`=`12`のSecret name syntax
+- bindingはpointer ASCでsort
+- pointer重複禁止
+- pointer先のpersistent valueは対応canonical reference stringでなければならない
+- Secretをobject keyとして使わない
+
+`secret_bindings=[]`ならSecret無し。
+
+Secret valueは各internal Attempt起動直前にRunnerがmaterializeする。Retryでbinding/nameは固定、value rotationは許容。
+
+## 7. Persistent Job Input
+
+最終Job Inputの論理型はJSON-compatible **object**。
+
+`with`:
+
+- `$base` optional 1個、評価結果object必須
+- `$base` shallow copy
+- 明示fieldでoverride
+- deep merge無し
+
+Activation時に作るpersistent snapshot:
+
+```text
+persistent_input      # JSON object; Secret位置はreference string
+secret_bindings       # sorted binding array
+input_digest          # SHA-256
+```
+
+`input_digest`:
+
+```text
+SHA-256(
+  canonical-json-v1({
+    "input": persistent_input,
+    "secret_bindings": secret_bindings
+  })
+)
+```
+
+Secret materialized valueはdigestへ入れない。
+
+Internal JobではRunner claimより前にこのsnapshotをDBへ保存する。External/Human/Reusableはactivation時Attempt作成と同時に保存する。Persistence exact columnsは`08`。
+
+Retryは基準failed Attemptの`persistent_input + secret_bindings + input_digest`をexact copyし、`with`を再評価しない。
+
+## 8. Validatorへ渡すInput
+
+Custom Validatorへ渡す`input_data`は**persistent_input**でありexecution inputではない。
+
+したがってSecret-backed fieldにはreference stringが見える。Secret valueは渡さない。ValidatorはSecret fieldの実値を業務判定に使わない。
+
+## 9. `needs`
 
 通常Job:
 
@@ -95,16 +187,13 @@ needs.<template>.artifacts
 - `outputs`: full job_key -> 任意JSON value
 - `artifacts`: full job_key -> named Artifact map
 
-Group status:
+Group status/conclusionは`05`。
 
-- 未確定/non-terminalあり: `running`
-- 全expansion確定 + 全generated Job terminal: `completed`
+## 10. Nested Dynamic parent
 
-0件もcompleted。Conclusionは`05`。
+`foreach.parent` は暗黙required dependency。
 
-## 8. Nested Dynamic parent
-
-`foreach.parent` は暗黙required dependency。Nested condition dependency set:
+Nested condition dependency set:
 
 ```text
 {foreach.parent} ∪ declared needs
@@ -112,11 +201,15 @@ Group status:
 
 同じparentを`needs`へ重複記載しない。
 
-## 9. `state`
+## 11. `state`
 
-read-only expression。`state.set`はRuntime Handle。Job Inputへ解決した値はsnapshot。
+Expressionではread-only current Workflow state map。`state.set`はRuntime Handle。
 
-## 10. `item` / `iteration`
+`with`へ解決したstate valueはpersistent Input snapshotへ固定される。
+
+Job `if`/retry等でstateを読む場合はその評価時点のcurrent stateを使う。
+
+## 12. `item` / `iteration`
 
 `iteration.current`:
 
@@ -134,7 +227,7 @@ outputs/artifacts
 
 `outputs`は任意JSON value。
 
-## 11. `failure`
+## 13. `failure`
 
 ```text
 category/code/message/retryable/details
@@ -142,18 +235,23 @@ category/code/message/retryable/details
 
 Retry condition等で利用。
 
-## 12. `outputs` context
+## 14. `outputs` context / `success_if`
 
-`success_if`内のcurrent Job result。scalar/list/object/nullすべて許可。
-
-例:
+`success_if`内の`outputs`はcurrent Job result。scalar/list/object/nullすべて許可。
 
 ```yaml
 success_if: ${{ outputs == true }}
 success_if: ${{ outputs.failed_count < 3 }}
 ```
 
-## 13. Workflow Output用 `jobs`
+Evaluation:
+
+- boolean true -> success候補
+- boolean false -> `success_condition_failed`
+- non-boolean -> `expression_type_error`
+- evaluation error -> `expression_evaluation_error`
+
+## 15. Workflow Output用 `jobs`
 
 トップレベルWorkflow `outputs`評価時だけ使用。
 
@@ -161,17 +259,7 @@ success_if: ${{ outputs.failed_count < 3 }}
 jobs.<job>.status/conclusion/outputs/artifacts
 ```
 
-## 14. Job Input構築
-
-最終Job InputはJSON-compatible object。
-
-`$base` optional 1個、object必須。shallow copy + 明示field override。deep merge無し。
-
-Retryはpersistent Input snapshotを再利用。
-
-ArtifactRefを`with`/Workflow Input等から含めることを許可する。ArtifactRefは通常JSON値としてpersistent Inputへsnapshotされるが、Coreは`09`のcanonical ArtifactRef shapeとして認識する。
-
-## 15. Job Output
+## 16. Job Output
 
 Action/External Job resultは任意JSON-compatible value:
 
@@ -179,49 +267,35 @@ Action/External Job resultは任意JSON-compatible value:
 null / boolean / number / string / array / object
 ```
 
-Canonical JSON:
+Validation pipeline:
 
-- UTF-8
-- NaN/Infinity禁止
-- deterministic object serialization可能
-
-### 15.1 Result validation pipeline
-
-正規順序:
-
-1. JSON-compatible / canonical JSON validation
-2. optional JSON Schema (`outputs.schema`)
-3. optional Custom Validator (`validator`)
+1. JSON-compatible / canonical-json-v1
+2. optional Draft2020-12 `outputs.schema`
+3. optional Custom Validator
 4. optional `success_if`
 5. SecretGuard
 6. PayloadStore persistence
 
-Custom Validatorは`01`のValidator Registry callable。Validatorへ渡すInputはpersistent Job Inputで、materialized Secret valueは渡さない。Validatorはresultを変換しない。
-
-### 15.2 Transparent PayloadStore
-
-Canonical JSON bytes:
+### 16.1 Transparent PayloadStore
 
 ```text
-size <= output-inline-threshold-bytes
-  -> SQLite inline
-size > threshold
-  -> durable filesystem blob
+size <= effective output-inline-threshold-bytes -> SQLite inline
+size > threshold -> durable PayloadStore blob
 ```
 
-Default threshold=4MiB。Validation最大値ではない。
+Default 4MiB。Validation最大値ではない。
 
-`needs.*.outputs`, `success_if`, Service Output readはstorage kindを意識せず同じJSON valueを得る。
+`needs.*.outputs`, `success_if`, Service Output readはstorage kind非依存。
 
-Blob load時はsize/digest検証。欠落/破損はstorage failure。
+Blob readはexistence/size/digest検証。欠落/破損fail-closed。
 
-### 15.3 Attempt history
+### 16.2 Attempt history
 
-OutputはAttempt単位immutable。Failed/cancelled AttemptのOutputはcurrentとして公開しない。Current Job Outputはcurrent successful Attemptから解決。
+OutputはAttempt単位immutable。Failed/cancelled Attempt Outputはcurrent公開しない。Current Job Outputはcurrent successful Attemptから解決。
 
-## 16. Workflow Output
+## 17. Workflow Output
 
-トップレベルYAML `outputs` は **name -> expression/literal のmapping** なので、Workflow Output全体のcanonical resultはJSON objectになる。
+トップレベルYAML `outputs` はname -> expression/literal mappingなので、Workflow Output全体はJSON object。
 
 ```yaml
 outputs:
@@ -229,65 +303,39 @@ outputs:
   report: ${{ jobs.report.artifacts.report }}
 ```
 
-各field値は任意JSON-compatible value。ArtifactRefもJSON-compatible field値として明示公開可能。
+ArtifactRefもfield値として許可。
 
-Workflow Output object自体もPayloadStoreのinline/spill規則を使う。
+Workflow Output objectもPayloadStore inline/spill。ReusableではParent Job Outputになる。
 
-Reusable WorkflowではこのWorkflow Output objectがParent Job Outputになる。
+未指定/empty -> `{}`。
 
-`outputs: {}` または未指定ならWorkflow Outputは `{}`。
+## 18. ArtifactRef / explicit data flow
 
-## 17. ArtifactRef / explicit data flow
+ArtifactはOutputとは別のimmutable成果物。Canonical ArtifactRef shapeは`09`。
 
-ArtifactはOutputとは別のimmutable成果物。Managed ArtifactはArtifactStore、External ReferenceはURI metadata。
+### same Run
 
-Canonical ArtifactRef shapeは`09`をSource of Truthとする。
+`needs.<job>.artifacts.*` のArtifactRefをJob Inputへmapping可能。
 
-### 17.1 同一Workflow Run
+### cross Run / Reusable Child
 
-`needs.<job>.artifacts.*` から得たArtifactRefを後段Job Inputへmapping可能。同じRun内での明示Artifact参照は通常の依存data flow。
+Coreは別Run Artifactを暗黙探索・自動reuseしない。利用にはArtifactRefをWorkflow/Job InputまたはWorkflow Outputへ明示的に含める。
 
-### 17.2 別Workflow Run / Reusable Child
-
-CoreはArtifactを別Runへ暗黙探索・自動reuseしない。
-
-別Workflow RunのArtifactを使うには、呼出側がArtifactRefをWorkflow/Job InputまたはWorkflow Outputへ**明示的に含める**必要がある。
-
-例:
-
-```yaml
-jobs:
-  child:
-    uses: ./child.yml
-    with:
-      source_artifact: ${{ needs.export.artifacts.dataset }}
-```
-
-Child側は`inputs.source_artifact`としてArtifactRefを受け取る。
-
-Managed Artifactのcross-run materializeは:
+Managed cross-run materialize条件:
 
 1. ArtifactRefがcurrent persistent Job Input内に存在
-2. Artifact metadataが存在しdata未削除
-3. current ActorContext/AccessScopeでsource Artifact readがAuthorizationProviderにより許可
+2. metadata/data存在
+3. current ActorContext/AccessScopeでsource Artifact read許可
 
-を全て満たす場合のみ許可する。
+External ReferenceはCore materialize対象外。
 
-External ReferenceはCore materialize対象外で、URIを解釈するかはAction/親側責任。
+Persistent Input内ArtifactRefはinput_digestへ固定。Persistent Input外Artifact materializeは`reuse_eligible=false`。
 
-### 17.3 Result Reuse
-
-Persistent Input内のArtifactRefはInput digestに含まれるため、明示cross-run ArtifactRefはreuse keyへ間接的に固定される。
-
-Runtime中にpersistent Inputへ含まれないArtifactをmaterializeした場合は`03`の`reuse_eligible=false`。
-
-## 18. `continue-on-error`
+## 19. `continue-on-error`
 
 activation時booleanへ評価しsnapshot。Retryで再評価しない。
 
-利用可能: `inputs/needs/env/state/item/iteration/workflow/run/job`。
-
-## 19. Condition helper
+## 20. Condition helper
 
 Effective success:
 
@@ -299,28 +347,15 @@ Effective success:
 - `success()`: dependency set全件effective success。空ならtrue
 - `failure()`: non-allowed failure/blockedあり
 - `cancelled()`: Workflow cancelまたはdependency cancelled
-- `always()`: dependencies terminalならtrue。ただしWorkflow cancel後のnew activation不可
+- `always()`: dependencies terminalならtrue。ただしWorkflow cancel後new activation不可
 
-未指定`if`は`success()`。
+未指定`if`=`success()`。
 
-通常Job skipped dependency -> downstream default skip。
-
-Dynamic groupは個別skipをaggregateしgroup conclusionがsuccessになり得る。
-
-## 20. `success_if`
-
-JSON Schema + Custom Validator成功後に評価する。
-
-- boolean true -> success
-- boolean false -> `success_condition_failed`
-- non-boolean -> `expression_type_error`
-- expression error -> `expression_evaluation_error`
-
-Payload persistenceはSecretGuard後。
+通常Job skipped dependency -> downstream default skip。Dynamic groupは`05`のaggregate conclusionを使う。
 
 ## 21. `order_by` / JMESPath
 
-Order criterionはnon-null stringまたは**finite number**。同criterion内で全candidate同型。
+Order criterionはnon-null stringまたはfinite number。同criterion内で全candidate同型。
 
 禁止:
 
@@ -328,7 +363,7 @@ Order criterionはnon-null stringまたは**finite number**。同criterion内で
 bool/object/array/null/NaN/Infinity/混在型
 ```
 
-`jmespath(value, expression)`はJSON-compatible valueを対象とし、結果型は利用field側で検証する。
+`jmespath(value, expression)`結果型は利用field側で検証。
 
 ## 22. 評価タイミング
 
@@ -336,33 +371,36 @@ bool/object/array/null/NaN/Infinity/混在型
 | --- | --- |
 | concurrency group | Run start前 |
 | Dynamic foreach/key/order | expansion |
-| if | dependencies terminal後 |
+| Job if | dependencies terminal後 |
 | continue-on-error | activation |
-| with | activation/Attempt1前 |
-| Secret | 各internal Attempt child起動前 |
+| with/persistent Input | activation/Attempt1前 |
+| Secret materialize | 各internal Attempt child起動前 |
 | retry if | failed Attempt後 |
-| JSON Schema | Job result canonical validation後 |
+| JSON Schema | result canonical validation後 |
 | Custom Validator | JSON Schema後 |
-| success_if | Custom Validator後 |
+| success_if | Validator後 |
 | Job Payload persistence | success_if/SecretGuard後 |
 | Workflow outputs | Workflow success確定直前 |
 
+Manual Retry後のsuccessful descendantは`03/10`に従い、current dependency contextで`if`と**expected persistent Input**を再評価してreuse可否を決める。
+
 ## 23. 受入条件
 
-1. Job Output scalar/list/object/null
-2. Workflow Output always object
-3. optional JSON Schema各型
-4. Custom Validator execution order/invalid/exception
-5. 4MiB inline/spill
-6. large Output downstream透過参照
-7. blob欠落/破損fail-closed
-8. skipped/default condition
-9. Nested parent helper
-10. Secret利用位置
-11. Input nullable/missing/null strictness
-12. success_if non-boolean reject
-13. order_by NaN/Infinity reject
-14. same-run ArtifactRef mapping
-15. explicit cross-run/Reusable ArtifactRef mapping
-16. cross-run Artifact materialize Authorization
-17. implicit cross-run Artifact lookup無し
+1. field別context allow/deny matrix
+2. Secret full-scalar only
+3. Secret binding JSON Pointer / sorting / duplicate reject
+4. persistent_input + bindings input_digest golden
+5. Internal pre-claim Input snapshot persistence
+6. Retry exact persistent Input/binding copy
+7. Validator receives no Secret value
+8. Job Output scalar/list/object/null
+9. Workflow Output object
+10. optional JSON Schema各型
+11. Custom Validator order
+12. inline/spill透過
+13. skipped/default condition
+14. Nested parent helper
+15. Input nullable/missing/null strictness
+16. success_if context/type restriction
+17. order_by NaN/Infinity reject
+18. same-run/cross-run ArtifactRef mapping
