@@ -1,6 +1,6 @@
 # 11. Service API / MCP / HTTP 詳細設計
 
-- Status: Draft v1.2
+- Status: Draft v1.3
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `03`, `07`, `08`, `09`, `10`, `12`
@@ -12,23 +12,44 @@
 3. Public read/writeはAuthorizationProvider必須。
 4. State-changing operationはoptional `request_id`。
 5. MCP toolは親namespace必須。
-6. Large Input/Output/Log本文をRun infoへ埋め込まない。
+6. Large Input/Output/State/Log本文をRun infoへ埋め込まない。
 7. Workflow DefinitionとWorkflow RunをAPI名で分離。
 8. Canonical request/response modelを本書で固定。
 9. Generic Job state override API無し。
+10. Core Service modelはstrict/no-coercion。
 
-## 2. 共通model
+## 2. 共通model / Adapter parsing
 
-Pydantic typed model + JSON-compatible serialization。
+Pydantic typed model + JSON-compatible serialization。`01` strict type semanticsを使う。
 
 - Core ID=opaque string
 - ActorContext/AccessScopeはAdapter/parentから別argument注入
 - Python/MCP `request_id` optional
 - HTTPは`Idempotency-Key` header -> request_id
 - Unknown request field reject
-- Timestamp=`08` canonical UTC fixed form `YYYY-MM-DDTHH:MM:SS.ffffffZ`
+- Timestamp=`08` canonical UTC `YYYY-MM-DDTHH:MM:SS.ffffffZ`
 
-Timestamp input filterも同形式へparse/normalizeしてからServiceへ渡す。Naive/local offset文字列をcanonical responseへそのままechoしない。
+### 2.1 Core model
+
+Core Service modelは文字列からinteger/boolean等へcoerceしない。
+
+```text
+"50" != 50
+"true" != true
+true != 1
+```
+
+Python/MCPはtyped JSON値をそのままCore modelへ渡す。
+
+### 2.2 HTTP query/path parser
+
+HTTPはtransport上query/pathが文字列なのでAdapterだけがschemaに従って明示parseする。
+
+- integer query: ASCII base-10、fieldのsigned/nonnegative rangeを検証。float/exponent/whitespace coercion無し
+- boolean query: exact lowercase `true|false` のみ
+- timestamp query: canonical UTC形式へparse/normalize後Coreへ渡す。invalid -> 400
+- enum/string:文字列のまま、trim/lowercaseを勝手にしない
+- JSON bodyはJSON parserが作った型をCoreへ渡し、`"1"`をinteger fieldへ変換しない
 
 Pagination:
 
@@ -46,6 +67,7 @@ WorkflowDefinitionService
 WorkflowRunService
 InputService
 OutputService
+WorkflowStateService
 ExternalTaskService
 HumanReviewService
 ArtifactService
@@ -64,13 +86,7 @@ Item=`workflow_id/name/version/description/definition_hash/source_kind/source_di
 
 ### `wf_definition_info`
 
-Request:
-
-```text
-workflow_ref non-empty
-include_source_yaml=false
-include_jobs=true
-```
+Request=`workflow_ref,include_source_yaml=false,include_jobs=true`。
 
 Response:
 
@@ -83,8 +99,6 @@ outputs_definition
 jobs nullable
 source_yaml nullable
 ```
-
-HTTPはworkflow_refをqueryへ。
 
 ## 5. Workflow Run
 
@@ -100,27 +114,14 @@ source_identity non-empty optional
 request_id optional
 ```
 
-Priority resolution:
+Priority=request value if present, otherwise Workflow Definition priority。
 
-```text
-request priority present -> request value
-omitted -> Workflow Definition priority
-```
+Response=`workflow_run_id,workflow_id,status,conclusion,priority,wait_reason,created_at`。
 
-Response:
+Run start時`01/08` snapshot固定。Concurrency scope=`(workflow_id,group)`。
 
-```text
-workflow_run_id
-workflow_id
-status/conclusion
-priority
-wait_reason
-created_at
-```
-
-Run start時`01/08` System baseline/effective settings/Retention/Registry version snapshot固定。
-
-Concurrency scopeは`(workflow_id, resolved group)`。QueueならRun作成、`status=queued, wait_reason=concurrency`。`on-limit=reject`ならRun ID無しで`concurrency_limit_reached`。
+- queue -> Run作成、`status=queued, wait_reason=concurrency`
+- reject -> Run ID無し `concurrency_limit_reached`
 
 ### 5.2 `wf_run_list`
 
@@ -153,11 +154,7 @@ include_events_summary=false
 include_output_metadata=true
 ```
 
-Implications:
-
-- attempts -> jobs
-- steps -> attempts -> jobs
-- artifacts -> jobs
+Implications: attempts -> jobs、steps -> attempts、artifacts -> jobs。
 
 Base Response:
 
@@ -175,22 +172,27 @@ dynamic_groups nullable
 events_summary nullable
 ```
 
-`include_jobs=true`:
-
-- `jobs` = concrete Job Run list
-- `dynamic_groups` = Definition上のDynamic template aggregate list
-
 Concrete Job item:
 
 ```text
 job_run_id/job_key/job_template_key
 executor/status/conclusion
 priority/progress
-current_attempt_id
+current_attempt_id nullable
+current_task_id nullable
+current_review_id nullable
+current_child_workflow_run_id nullable
 failure nullable
 current_artifacts nullable
 attempts nullable
 ```
+
+Navigation resolution:
+
+- current_task_id = current Attemptに属するExternal Task ID
+- current_review_id = current Attemptに属するHuman Review ID
+- current_child_workflow_run_id = current Attemptから作られたChild Run ID
+- executor不一致/未作成/terminal history onlyならnullable
 
 Dynamic group item:
 
@@ -203,8 +205,6 @@ generated_job_count
 failure nullable
 ```
 
-Nested templateもWorkflow Run全体aggregate groupとして1 item。
-
 Attempt item:
 
 ```text
@@ -215,25 +215,20 @@ output_metadata nullable
 failure nullable
 started_at/completed_at
 log_metadata
+external_task_id nullable
+review_id nullable
+child_workflow_run_id nullable
 steps nullable
 artifacts nullable
 ```
 
+Attempt navigation IDはそのAttemptに属するexact rowを返す。Concurrency rejectでReusable Child未作成なら`child_workflow_run_id=null`。
+
 `log_metadata`=`available,size_bytes,updated_at?,deleted_at?`。
 
-`include_steps=true`でStep summary、`include_artifacts=true`かつAttempts含有時はAttempt全generation ArtifactRef/producer metadata。Attempts未指定の`current_artifacts`はcurrent successful Attemptのcurrent named Artifact mapだけ。
+`events_summary`=`count,latest_event_type?,latest_created_at?`。
 
-`events_summary`:
-
-```text
-count
-latest_event_type nullable
-latest_created_at nullable
-```
-
-Authorization後callerが閲覧可能な当該Run owner Eventだけを集計。Retention済みEventはcount対象外。
-
-Input/Output/Log/Event本文無し。
+Input/Output/State/Log/Event本文無し。
 
 ### 5.4 `wf_pause`
 
@@ -241,37 +236,21 @@ Non-terminal root Run。Already paused=same-state success。
 
 ### 5.5 `wf_resume`
 
-Paused root Run。New requestでnon-pausedならinvalid_state。Replayはstored result。
-
-Paused concurrency holderはslotを保持しているため通常は同slotでresumeする。`wait_reason=concurrency`のpaused waiterを許可する実装ではresume後もslot取得までqueued待機とする。
+Paused root Run。New requestでnon-pausedならinvalid_state。Concurrency waiterならslot取得までqueued待機。
 
 ### 5.6 `wf_cancel`
 
-Request=`workflow_run_id,reason?,request_id?`。Non-terminal root only。
-
-Cancel/result race=`10`。
+Request=`workflow_run_id,reason?,request_id?`。Non-terminal root only。Race=`10`。
 
 ### 5.7 `wf_priority_update`
 
-Request=`workflow_run_id,priority,request_id?`。
+Root non-terminal only。root + all non-terminal descendant Child Runへ同値伝播。Preempt無し。
 
-Root non-terminal Runのみ。1 transactionでroot + 全non-terminal descendant Child Run priorityを同値へ更新。Running Job preempt無し。
-
-Response:
-
-```text
-workflow_run_id
-priority
-updated_descendant_count
-status/conclusion
-updated_at
-```
-
-Child direct update=`child_run_direct_control_forbidden`。
+Response=`workflow_run_id,priority,updated_descendant_count,status,conclusion,updated_at`。
 
 ### 5.8 `wf_retry`
 
-Request=`workflow_run_id,job_run_id,request_id?`。Input override field無し。
+Request=`workflow_run_id,job_run_id,request_id?`。Input override無し。
 
 Response:
 
@@ -286,41 +265,25 @@ retry_not_before nullable
 updated_at
 ```
 
-Request時点new Attempt無し。
+Non-terminal retryはrun_attempt不変。Completed failure reopenは`10`。
 
-Non-terminal Run retryはrun_attemptを増やさない。Completed failure Run retryは`10`どおりreopenしてrun_attemptを増やし、Workflow Output current pointerをclearする。
+Concurrency reacquire:
 
-Completed RunのConcurrency再取得で:
-
-- queue -> success response、`run_status=queued, wait_reason=concurrency`
-- reject -> `concurrency_limit_reached` 409、Run/Job state変更無し
+- queue -> success response、Run queued/concurrency
+- reject -> `concurrency_limit_reached` 409、state変更無し
 
 ## 6. Input inspection
 
-Input本文はRun infoへ埋め込まず専用API。
-
 ### `wf_input_info`
 
-Exactly one selector:
+Exactly one selector=`workflow_run_id xor job_run_id xor attempt_id`。
 
-```text
-workflow_run_id xor job_run_id xor attempt_id
-```
-
-Resolution:
-
-- workflow_run_id -> Workflow Run input snapshot
-- attempt_id -> exact Attempt persistent Input
-- job_run_id:
-  1. queued + pending snapshotあり -> pending Input
-  2. otherwise current_attempt_idあり -> current/latest Attempt Input
-  3. otherwise unavailable
+Job resolution: pending snapshot -> current/latest Attempt -> unavailable。
 
 Response:
 
 ```text
-source_type=workflow_run|job_run|attempt
-source_id
+source_type/source_id
 available
 resolved_from=workflow|pending_job|attempt|null
 input_digest nullable
@@ -328,24 +291,11 @@ has_secret_bindings boolean
 size_bytes nullable
 ```
 
-Workflow InputはSecret binding無し。`size_bytes`=canonical-json-v1 UTF-8 byte size。
-
 ### `wf_input_read`
 
-Same selector + optional `select: JMESPath string`。
+Same selector + optional JMESPath `select`。
 
-Response:
-
-```text
-source_type/source_id
-resolved_from
-selected boolean
-value any JSON object/value
-```
-
-Job/Attempt Inputはpersistent Inputを返し、materialized Secret valueは絶対に返さない。Secret fieldはreference stringのまま。
-
-Unavailable=`input_data_unavailable`。MCP response上限超過=`response_too_large`、silent truncate無し。
+Job/Attemptはpersistent Inputを返し、Secret valueはreference stringのまま。Unavailable=`input_data_unavailable`。
 
 ## 7. Output
 
@@ -355,34 +305,96 @@ Exactly one selector=`workflow_run_id xor job_run_id xor attempt_id`。
 
 Response=`source_type/source_id/available/storage_kind/size_bytes/digest`。
 
-Manual Retryでcompleted Runをreopenした直後のWorkflow Run Outputは`available=false`。Past Attempt/Job Outputは履歴selectorで引き続き読める。
+Reopened Run直後はWorkflow Output `available=false`。Past Attempt/Job Outputは読める。
 
 ### `wf_output_read`
 
-Same selector + optional JMESPath `select`。
+Same selector + optional JMESPath `select`。MCP oversized=`response_too_large`、silent truncate無し。
 
-Response=`source_type/source_id/selected/value`。
+## 8. Workflow State read / history
 
-MCP response上限超過=`response_too_large`、silent truncate無し。
+Public mutation APIはMVPに持たない。State writeはinternal Action Runtime Handleだけ。
 
-## 8. External Task
+全操作は`workflow_state.read` Authorization。
 
-### `wf_task_info`
+### 8.1 `wf_state_list`
 
-Request=`task_id`。
+Request:
+
+```text
+workflow_run_id
+limit/cursor
+```
+
+Order=`name ASC`。
+
+Item:
+
+```text
+name
+revision
+size_bytes
+updated_at
+```
+
+`size_bytes`=current `value_json` canonical UTF-8 bytes。
+
+### 8.2 `wf_state_read`
+
+Request=`workflow_run_id,name non-empty`。
 
 Response:
 
 ```text
-task_id/workflow_run_id/job_run_id/attempt_id
-status/input
-current_lease nullable
-claim_history_summary
-output_metadata/failure nullable
-created_at/completed_at
+workflow_run_id
+name
+revision
+value any JSON
+size_bytes
+updated_at
 ```
 
-External InputにはSecretが存在しない。
+Missing=`not_found`。
+
+### 8.3 `wf_state_history`
+
+Request:
+
+```text
+workflow_run_id
+name optional
+include_values boolean default false
+limit/cursor
+```
+
+Order=`created_at DESC,history_id DESC`。name指定時も同orderで、revisionは補助field。
+
+Item:
+
+```text
+history_id
+name
+revision
+job_run_id nullable
+attempt_id nullable
+step_id nullable
+actor nullable
+created_at
+old_value optional
+new_value optional
+```
+
+`include_values=false`ではold/newをresponseに含めない。`true`では保存済みJSON値を返す。
+
+Large State/history valueはRun info/Listへ埋めず、read/historyでのみ返す。Adapter/MCP response上限超過=`response_too_large`、silent truncate無し。
+
+State historyはAttempt failure後も残り得る。これは`09` immediate/nonrollback semanticsどおり。
+
+## 9. External Task
+
+### `wf_task_info`
+
+Response=`task_id/workflow_run_id/job_run_id/attempt_id/status/input/current_lease?/claim_history_summary/output_metadata?/failure?/timestamps`。
 
 ### `wf_task_claim`
 
@@ -390,100 +402,47 @@ Request=`task_id? / workflow_run_id? / job_template_key? / request_id?`。Task I
 
 Task object=`task_id/lease_id/lease_expires_at/workflow_run_id/job_run_id/attempt_id/job_key/input`。
 
-Candidate ordering=`07`。Task `available_at`を使用しJob `ready_at`を使わない。
-
-ClaimantはActor/client principalからCore生成。
+Ordering=`07`、Task `available_at`使用。
 
 ### `wf_task_submit`
 
 Request=`task_id,lease_id,result,artifacts=[],claim_next=false,request_id?`。
 
-Response:
+Response=`submitted=true,workflow_run_id,job_run_id,attempt_id,job_status,job_conclusion,failure?,next_task?`。
 
-```text
-submitted=true
-workflow_run_id/job_run_id/attempt_id
-job_status/job_conclusion
-failure nullable
-next_task nullable
-```
+`claim_next=true`はsubmit + optional next Lease + idempotencyをsame transaction。`now >= lease_expires_at`はresult不採用。
 
-Validation failureをterminal failureとして受理した場合もsubmitted=true。
+Lease heartbeat/renew/extend/transfer無し。
 
-`claim_next=true`はsubmit terminal state + optional next Lease + full response/idempotencyを同一DB transaction。Replay時追加claim無し。
+## 10. Human Review
 
-`now >= lease_expires_at`は`lease_expired` conflictでresult不採用。
+`wf_review_list`: filters=`workflow_run_id?,status?,limit,cursor`, order created_at ASC/id ASC。
 
-Lease heartbeat/renew/extend/transfer API無し。
+`wf_review_info`: review_id -> Input/outcome/comment/actor/timestamps。
 
-## 9. Human Review
+`wf_review_submit`: review_id,outcome approve|reject,comment?,request_id?。Rewrite不可。
 
-### `wf_review_list`
-
-Filters=`workflow_run_id?,status?,limit,cursor`。Order=`created_at ASC,review_id ASC`。
-
-### `wf_review_info`
-
-Request=`review_id`。Input/outcome/comment/actor/timestamps。
-
-### `wf_review_submit`
-
-Request=`review_id,outcome approve|reject,comment?,request_id?`。
-
-Completed/cancelled rewrite不可。同idempotency key replayのみ元response。
-
-## 10. Artifact / Log / Event / Runner
+## 11. Artifact / Log / Event / Runner
 
 ### `wf_artifact_info`
 
-Request=`artifact_id`。Response=canonical public ArtifactRef + producer/deletion metadata。Store path無し。Cross-run read Authorization必須。
-
-Artifact metadata retentionでrow削除済みなら`not_found`。
+artifact_id -> public ArtifactRef + producer/deletion metadata。Store path無し。Metadata retention後=`not_found`。
 
 ### `wf_log_read`
 
-Request:
-
-```text
-attempt_id
-offset_bytes>=0 optional
-limit_bytes 1..1048576 default65536
-tail_lines 1..10000 optional
-```
-
-Tailとoffset同時禁止。
-
-Response=`content,next_offset_bytes?,truncated,size_bytes,updated_at?`。
-
-Deleted log=`log_data_unavailable`。
+Request=`attempt_id,offset_bytes?,limit_bytes?,tail_lines?`。Tail/offset同時禁止。Deleted=`log_data_unavailable`。
 
 ### `wf_event_list`
 
-Request:
+Request=`workflow_run_id?,job_run_id?,attempt_id?,types?,created_from?,created_to?,include_payload=true,limit,cursor`。
 
-```text
-workflow_run_id optional
-job_run_id optional
-attempt_id optional
-types array<non-empty string> optional
-created_from/created_to optional
-include_payload boolean default true
-limit/cursor
-```
-
-複数owner filter指定時は同じresource chainであることを検証。不一致=`validation_failed`。
-
-No owner filterでもAuthorizationProvider filtered scope必須。
-
-Order=`created_at DESC,event_id DESC`。
-
-Item=`event_id/type/version/owner IDs/runner_id/actor/source/request_id/payload?/created_at`。
+複数owner filterはsame resource chain必須。Order=`created_at DESC,event_id DESC`。
 
 ### `wf_runner_info`
 
 Request=`pool?`。Response=`pools[{name,configured_count,runners[]}]`。
 
-## 11. 禁止generic mutation
+## 12. 禁止generic mutation
 
 無し:
 
@@ -493,13 +452,15 @@ wf_job_override_conclusion
 wf_job_skip
 wf_job_force_complete
 wf_review_rewrite
+wf_state_set
+wf_state_delete
 ```
 
-Failed Jobは原因修正後Retry。Skip/許容failureはDefinitionで事前定義。
+State mutationはtrusted internal Action Runtime Handleのみ。
 
-## 12. MCP namespace / canonical tools
+## 13. MCP namespace / canonical tools
 
-`system_namespace` non-empty、推奨`^[a-z][a-z0-9_]*$`。Tool collision registration時reject。
+`system_namespace` non-empty、推奨`^[a-z][a-z0-9_]*$`。Collision reject。
 
 ```text
 <ns>_wf_definition_list
@@ -516,6 +477,9 @@ Failed Jobは原因修正後Retry。Skip/許容failureはDefinitionで事前定�
 <ns>_wf_input_read
 <ns>_wf_output_info
 <ns>_wf_output_read
+<ns>_wf_state_list
+<ns>_wf_state_read
+<ns>_wf_state_history
 <ns>_wf_task_info
 <ns>_wf_task_claim
 <ns>_wf_task_submit
@@ -530,7 +494,7 @@ Failed Jobは原因修正後Retry。Skip/許容failureはDefinitionで事前定�
 
 Actor/AccessScopeはtool inputへ露出しない。
 
-## 13. HTTP Adapter v1
+## 14. HTTP Adapter v1
 
 Prefix=`/api/jobrunner/v1`。
 
@@ -557,6 +521,9 @@ GET  /jobs/{job_run_id}/output-info
 GET  /jobs/{job_run_id}/output
 GET  /attempts/{attempt_id}/output-info
 GET  /attempts/{attempt_id}/output
+GET  /workflow-runs/{workflow_run_id}/state
+GET  /workflow-runs/{workflow_run_id}/state/read?name=<encoded>
+GET  /workflow-runs/{workflow_run_id}/state-history
 GET  /external-tasks/{task_id}
 POST /external-tasks/claim
 POST /external-tasks/{task_id}/submit
@@ -569,15 +536,13 @@ GET  /events
 GET  /runners
 ```
 
-Opaque Core IDsのみpath parameter。Workflow ref=query/body。
+`state-history` query supports `name`, `include_values`, pagination。
 
-Path IDはAdapterがService fieldへinject。Body重複要求無し。
+Opaque Core IDsのみpath parameter。Workflow ref/state name等はquery/bodyで安全にURL encode。
 
 State-changing HTTP optional `Idempotency-Key` header。Body request_id無し。
 
-Lease renew/heartbeat/Job skip/override route無し。
-
-## 14. HTTP status
+## 15. HTTP status
 
 ```text
 200 read / successful non-create mutation
@@ -593,14 +558,10 @@ Lease renew/heartbeat/Job skip/override route無し。
 
 422無し。Idempotency replayはoriginal successful status/body。
 
-## 15. Error model
+## 16. Error model
 
 ```text
-code
-message
-retryable
-field/path optional
-details optional
+code/message/retryable/field-or-path?/details?
 ```
 
 代表:
@@ -632,73 +593,50 @@ child_run_direct_control_forbidden
 internal_error
 ```
 
-## 16. Idempotency
+## 17. Idempotency
 
-対象:
+対象=`wf_start/wf_pause/wf_resume/wf_cancel/wf_retry/wf_priority_update/wf_task_claim/wf_task_submit/wf_review_submit`。
 
-```text
-wf_start/wf_pause/wf_resume/wf_cancel/wf_retry/wf_priority_update
-wf_task_claim/wf_task_submit/wf_review_submit
-```
+Identity=`scope + operation + request_id`。Request hash=`08` canonical Service request excluding request_id/transport fields。
 
-Identity=`scope + operation + request_id`。
+Flow=Schema -> Actor/Scope -> Auth -> optional fast lookup -> prepare -> `BEGIN IMMEDIATE` -> key/hash再確認 -> domain state再確認 -> side effect+full result row commit -> response。
 
-`request_hash`=`08` canonical Service request excluding request_id/transport fields。
+No reserved row。TTL内same hash replay/different conflict。`now >= expires_at`でreplace可。
 
-Flow:
+## 18. Authorization / pagination
 
-1. request schema
-2. Actor/AccessScope
-3. Authorization
-4. optional fast lookup
-5. domain/expensive validation + temp prepare
-6. `BEGIN IMMEDIATE`
-7. key/hash再確認
-8. current domain state再確認
-9. side effect + full result + completed idempotency row commit
-10. Adapter response
+全public operation authorize。State list/read/history=`workflow_state.read`。List/Eventはfiltered scope。Limit1..200 default50。
 
-DB `reserved` row無し。Concurrent same-keyはSQLite write serialization + commit recheck。
+## 19. Python API
 
-TTL内same hash=replay、different hash=conflict。`now >= expires_at`でexpired、replace可。
+Canonical strict Service request/response modelを直接使用。Adapter独自意味変更禁止。
 
-## 17. Authorization / pagination
-
-全public operation authorize。Input readも通常resource read権限を要求。List/Eventはfiltered scope。Cursor opaque。Limit1..200 default50。
-
-## 18. Python API
-
-Canonical Service request/response modelを直接使用。Adapter独自意味変更禁止。
-
-## 19. Observability
+## 20. Observability
 
 State change Eventへactor/source/request_id。Request body/Secret/巨大payloadを無条件保存しない。
 
-## 20. 受入条件
+## 21. 受入条件
 
-1. Definition/Run separation
-2. canonical timestamp exact format
-3. request unknown field/Actor injection reject
-4. root start priority default/override
-5. concurrency start queue/reject code
-6. priority update descendant propagation/Child direct reject
-7. Run info concrete jobs + Dynamic group queued/running/completed
-8. include attempts/steps/artifacts implications
-9. events_summary exact shape
-10. Input info/read selector/current pending resolution
-11. Input read never materializes Secret
-12. Output selector/read + reopen output unavailable
-13. wf_retry nonterminal/completed run_attempt semantics
-14. wf_retry concurrency reacquire queue/reject response
-15. task claim no-candidate null + available_at ordering delegation
-16. expired Lease submit reject
-17. submit+claim_next same transaction/replay
-18. no lease renew APIs
-19. Human rewrite/manual Job mutation無し
-20. Artifact metadata retention -> not_found
-21. Artifact/Log errors
-22. Event filters/order/resource-chain validation
-23. namespaced MCP collision
-24. HTTP exact routes/Idempotency-Key/status/no422
-25. idempotency canonical hash/no-reserved/commit recheck/expiry
-26. all read/write Authorization
+1. strict/no-coercion Core Service models
+2. HTTP explicit integer/boolean/timestamp parsing
+3. Definition/Run separation
+4. root start priority/concurrency queue/reject
+5. priority update propagation
+6. Run info concrete Jobs/Dynamic groups exact shapes
+7. Job/Attempt task-review-child navigation IDs
+8. Input info/read Secret reference only
+9. Output read/reopen unavailable
+10. State list metadata-only/current read/history values optional
+11. State history persists failed Attempt writes
+12. no public State mutation
+13. State Authorization
+14. wf_retry run_attempt/concurrency response
+15. task available_at ordering/expired Lease
+16. submit+claim_next transaction/replay
+17. Human mutation restrictions
+18. Artifact/Log/Event contracts
+19. namespaced MCP includes State tools
+20. HTTP exact State routes
+21. status/no422
+22. idempotency commit recheck/expiry
+23. all read/write Authorization
