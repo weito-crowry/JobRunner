@@ -1,6 +1,6 @@
 # 06. Reusable Workflows 詳細設計
 
-- Status: Draft v1.3
+- Status: Draft v1.4
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `02`, `03`, `05`, `08`, `09`, `10`, `11`, `12`
@@ -41,11 +41,23 @@ ArtifactRefも通常`with`値として渡す。
 
 `uses` Jobでは`action/validator/executor/runs-on/success_if/external/timeout-minutes`禁止。`outputs.schema`はoptional。
 
-## 4. `uses` reference
+## 4. `uses` reference / Resolver source contract
 
 `uses`=literal stringのみ。
 
-Relative reference基準=caller Workflow source file directory。
+MVPで**実行可能な全Workflow参照**はWorkflowResolverから以下を取得できることを必須とする。
+
+```text
+canonical workflow_id
+UTF-8 YAML source bytes
+source_kind
+source_display
+filesystem_base_dir optional
+```
+
+Registered Workflow IDも最終的には現在のYAML source bytesを返す。Typed objectだけを返してsource YAML bytesを提供できない登録方式はMVPの実行対象にしない。Source bytes unavailable=`workflow_source_unavailable`。
+
+Relative reference基準=caller Workflow sourceの`filesystem_base_dir`。
 
 - filesystem callerのみrelative可
 - `.yml|.yaml`
@@ -63,13 +75,11 @@ Parent concrete Job最初のactivation時にreferenceを解決し、`reusable_bi
 
 **新binding作成時はWorkflowResolver cacheだけを使わず、`01 §19.2`と同じexecution-time source readを行う。**
 
-Filesystem/registered source resolverがsource bytesを持つ場合:
-
 1. reference resolve
-2. current Child source bytesを1 logical readで取得
+2. current Child UTF-8 YAML source bytesを1 logical readで取得
 3. そのbytesをparse/strict validate/hash
 4. source YAML + typed Definition/hashを同じbytesから作る
-5. invalidならold cacheへfallbackせずParent activation failure
+5. invalid/source unavailableならold cacheへfallbackせずParent activation failure
 
 Binding作成後はChild sourceを再読込しない。Parent Retry/new Child Runはbinding snapshotを使う。
 
@@ -125,7 +135,7 @@ Child concurrency expressionはChild Input/envで評価し、scope=`(child_workf
 
 ### 6.1 Concurrencyなし / slotあり
 
-1 transactionでParent Attempt -> waiting_child、Child Run、parent/child relation、static Job rows、Event/Execution Logを作る。
+1 transactionでParent Attempt -> waiting_child、Child Run `status=running`、parent/child relation、static Job rows、Event/Execution Logを作る。
 
 Childはresolver/System configを再読込せずbinding snapshotを使う。
 
@@ -139,7 +149,7 @@ Child wait_reason=concurrency
 Parent Job/Attempt=waiting_child
 ```
 
-slot取得後に通常Scheduling開始。
+slot取得後にChild `status=running, wait_reason=NULL`へ変更して通常Scheduling開始。
 
 ### 6.3 `on-limit=reject`
 
@@ -310,6 +320,7 @@ Concurrency rejectでChild未作成のfailed Parent Attemptはrelation無しが�
 
 ```text
 workflow_not_found
+workflow_source_unavailable
 workflow_reference_invalid
 workflow_relative_reference_unavailable
 workflow_cycle_detected
@@ -327,23 +338,25 @@ child_run_direct_control_forbidden
 
 ## 21. 受入条件
 
-1. relative/registered reference/path safety
-2. first binding always reads current Child source bytes
-3. invalid current Child source never falls back to cache
-4. Retry does not reread Child source
-5. Child System baseline inherits Parent Run snapshot
-6. Child effective settings/Retention snapshot
-7. nested Child same baseline
-8. binding Definition+Action+Validator versions
-9. Child priority/root update propagation
-10. Child concurrency workflow_id scope
-11. Child queue -> Child queued/Parent waiting
-12. Child reject -> no Child row/Parent failure
-13. Retry after reject same binding
-14. Reusable Parent outputs.schema
-15. Child state isolation
-16. ArtifactRef both directions/no mirror
-17. cross-run Artifact authorization
-18. Parent progress
-19. cycle/depth/direct Child control
-20. Dynamic+Reusable/recovery duplicate prevention
+1. all executable refs provide UTF-8 YAML source bytes
+2. relative/registered reference/path safety
+3. first binding always reads current Child source bytes
+4. invalid/unavailable Child source never falls back to cache
+5. Retry does not reread Child source
+6. Child System baseline inherits Parent Run snapshot
+7. Child effective settings/Retention snapshot
+8. nested Child same baseline
+9. binding Definition+Action+Validator versions
+10. admitted Child=running / queued only for concurrency wait
+11. Child priority/root update propagation
+12. Child concurrency workflow_id scope
+13. Child queue -> Child queued/Parent waiting
+14. Child reject -> no Child row/Parent failure
+15. Retry after reject same binding
+16. Reusable Parent outputs.schema
+17. Child state isolation
+18. ArtifactRef both directions/no mirror
+19. cross-run Artifact authorization
+20. Parent progress
+21. cycle/depth/direct Child control
+22. Dynamic+Reusable/recovery duplicate prevention
