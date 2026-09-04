@@ -1,6 +1,6 @@
 # 13. Testing 詳細設計
 
-- Status: Draft v2.6
+- Status: Draft v2.7
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`〜`12`
@@ -277,16 +277,29 @@ Runner liveness/restart:
 - unexpected exit including exit0 is failure unless planned
 - restart mode `never` suppresses immediately
 - restart mode `on_failure` only failures restart
-- `max_restarts=0` suppresses first failure
-- rolling window counts automatic restart launches per runtime+pool+runner logical slot
+- one Runner failure produces exactly one restart decision row
+- `restart_ordinal` is populated for allowed and suppressed decisions
+- suppressed decision has `scheduled_for/start_instance=NULL`
+- `max_restarts=0` suppresses first failure with ordinal1
+- rolling window counts only `suppressed=0` automatic restart launch decisions per runtime+pool+runner logical slot
+- suppressed rows do not consume launch budget
 - window expiry naturally restores budget
 - restart ordinal/backoff uses overflow-safe saturation
 - scheduled restart canceled by Parent shutdown is not launched
 - Parent Runtime restart uses new runtime_instance_id/new restart budget
 - restart_suppressed reason visible
 
-Workflow Run status:
+Workflow Run timestamps/status:
 
+- `created_at` = row creation and immutable
+- `started_at` = first admission to `running`, not row creation by definition
+- initial admitted/no-concurrency Run has `started_at=created_at`
+- initial/Child concurrency waiter has `started_at=null`
+- first later slot admission sets `started_at` exactly once
+- `workflow_started` Event emitted exactly with first `started_at` assignment
+- never-admitted waiter cancelled -> completed/cancelled with `started_at=null`
+- Manual Retry reopen preserves original `started_at`
+- `completed_at` is terminal time, cleared on reopen and replaced on re-terminal
 - admitted initial/Child Run=`running`
 - `queued` only concurrency waiter
 - queued waiter has non-null `concurrency_queued_at`
@@ -331,8 +344,8 @@ Scheduling:
 - pending survives restart
 - runner_lost
 - root/Child priority repair
-- Workflow status/wait_reason/concurrency_queued_at + holder/waiter repair
-- Recovery preserves saved queue timestamps
+- Workflow status/wait_reason/concurrency_queued_at/started_at + holder/waiter repair
+- Recovery preserves saved queue/start timestamps
 - completed no reopen except explicit Manual Retry
 - orphan scanner does not delete unowned object younger than `orphan_cleanup_grace_seconds`
 - default grace300 / invalid `<=0` reject
@@ -378,6 +391,7 @@ Execution Log:
 Event:
 
 - transitions append-only
+- `workflow_started` means first Run admission, not queued row creation
 - `dynamic_index_key_fallback` exactly once per fallback expansion
 - explicit dynamic key emits no fallback Event
 - retention audit exclusion
@@ -412,7 +426,8 @@ Retry:
 - completed Run Manual Retry reacquires concurrency slot
 - concurrency reject leaves Run/Job unchanged
 - concurrency queue reopens `status=queued, wait_reason=concurrency` with fresh `concurrency_queued_at`
-- reopen clears Run conclusion/completed/failure/current Workflow Output
+- reopen preserves `created_at/started_at`, clears/replaces `completed_at`
+- reopen clears Run conclusion/failure/current Workflow Output
 - retry backoff huge attempt number saturates to max without inf/NaN/OverflowError
 - backoff computation need not iterate O(attempt_no)
 
@@ -468,8 +483,9 @@ Strict reuse:
 - Parent outputs.schema
 - Parent progress
 - Child concurrency scope uses Child workflow_id
-- admitted Child=running
-- Child concurrency queue creates Child queued + fresh queue timestamp / Parent waits
+- admitted Child=running with started_at=created_at
+- Child concurrency queue creates Child queued + fresh queue timestamp + started_at null / Parent waits
+- later Child admission sets started_at once
 - Child concurrency reject creates no Child row and Parent Attempt fails
 - Retry after reject uses same binding and does not reread source
 - direct control reject
@@ -535,6 +551,7 @@ Verify all18 tables:
 
 - exact columns/checks/indexes/FKs/Repository invariants
 - canonical fixed UTC timestamp format
+- Workflow created_at/started_at/completed_at exact semantics
 - Workflow queued/running/paused/completed + wait_reason/slot/concurrency_queued_at invariant
 - System baseline/effective settings
 - Child binding baseline/settings/Retention
@@ -548,7 +565,7 @@ Verify all18 tables:
 - State current/history atomic + current Step producer
 - Artifact/log schema
 - Runner liveness
-- runner_restarts row fields/restart ordinal/window/suppression semantics
+- runner_restarts exactly-one decision row + restart ordinal for suppressed/allowed + schedule NULL rules
 - External Task config/Lease + claimant principal
 - Human immutable
 - Idempotency canonical actor principal/no duplicate AccessScope
@@ -561,9 +578,11 @@ Verify all18 tables:
 - Core Service models strict/no-coercion
 - HTTP query explicit parse only
 - canonical timestamp response/filter normalization
+- Run start/list/info/retry expose created_at/started_at/completed_at semantics
+- initial concurrency waiter exposes started_at null
 - admitted start=running / queue=queued + `concurrency_queued_at`
 - run list/info/start/retry queue timestamp consistency
-- pause/resume holder vs waiter preserves queue time
+- pause/resume holder vs waiter preserves queue/start time
 - Run info jobs/Dynamic groups/attempts/Step exact shape
 - active_task/review/child IDs navigation
 - Input info/read refs only
@@ -595,6 +614,7 @@ Verify all18 tables:
 - queued/paused waiter no slot
 - mixed max-runs conservative capacity
 - waiter head-of-line fairness by queue-entry time
+- first admission atomically sets started_at + workflow_started Event
 - Manual Retry concurrency reacquire atomicity
 
 ## 21. Retention
@@ -636,7 +656,7 @@ platform-matrix
 4. Reusable preflight vs binding-time fresh snapshot
 5. Expression context/Input/Secret binding/reuse safety
 6. Bootstrap/Action invocation/IPC/Runtime Auth/full-attempt timeout
-7. Runner Pool/Scheduling/Run status/Concurrency queue time/exact restart policy
+7. Runner Pool/Scheduling/Run timestamps/status/Concurrency queue time/exact restart policy
 8. Exact18-table schema/migrations
 9. Payload/Artifact immutability + retention
 10. Validator/SecretGuard/streaming redaction
