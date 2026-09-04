@@ -1,13 +1,13 @@
 # 09. Artifact / Log / Workflow State 詳細設計
 
-- Status: Draft v0.6
+- Status: Draft v0.7
 - 対象: MVP
 - 上位仕様: `docs/design.md`
-- 関連: `01`, `02`, `04`, `08`, `11`, `12`
+- 関連: `02`, `04`, `08`, `11`, `12`
 
 ## 1. 目的
 
-ArtifactStore、Artifact参照、Execution/Event Log、Workflow state、Progress/Step、Run directory、Retentionを定義する。
+ArtifactStore、ArtifactRef、Artifact参照境界、Execution/Event Log、Workflow state、Progress/Step、Run directory、Retentionを定義する。
 
 ## 2. Artifactの2種類
 
@@ -49,27 +49,77 @@ runtime.artifact.materialize(artifact_ref) -> local_path
 
 `register_external`: Core fetch無し。
 
-`materialize`: Managedのみcurrent Attempt work_dir配下へ。External referenceはCore標準unsupported。
+`materialize`はManaged Artifactのみ。許可条件は§7。
 
 ## 5. External LLM Artifact
 
 `task_submit.artifacts` はExternal Reference Artifactのみ。MVP task protocol binary upload無し。
 
-## 6. Artifact reference shape
+## 6. Canonical ArtifactRef
 
-```text
-artifact_id
-name
-storage_kind=managed|external
-media_type optional
-size_bytes optional
-digest optional
-uri optional  # external only
+Public/Expression/Inputで使うArtifactRefはJSON object:
+
+```json
+{
+  "type": "jobrunner_artifact",
+  "artifact_id": "art_...",
+  "name": "dataset",
+  "storage_kind": "managed",
+  "media_type": "application/json",
+  "size_bytes": 1234,
+  "digest": "sha256:..."
+}
 ```
 
-Managed `store_key`/filesystem pathはpublicへ露出しない。
+Externalの場合のみ `uri` を追加可能。
 
-## 7. Current Artifact / generations
+Required:
+
+```text
+type = jobrunner_artifact
+artifact_id non-empty
+name non-empty
+storage_kind = managed|external
+```
+
+Optional metadata fieldはArtifact rowから生成する。Caller supplied objectの`name/storage_kind/uri/size/digest`を権限や実体のSource of Truthにしない。Coreは`artifact_id`でDB metadataを再読込し、refとの整合を検証する。
+
+Managed `store_key`/filesystem pathはArtifactRefへ露出しない。
+
+## 7. Artifact scope / materialize authorization
+
+Coreはcross-run Artifactを暗黙探索しない。
+
+`runtime.artifact.materialize(ref)` は次を満たすManaged Artifactだけ許可する。
+
+### 7.1 same Workflow Run
+
+Artifact owner `workflow_run_id == current workflow_run_id` なら、current Run内部data flowとして利用可能。ただしdata未削除・Artifact metadata整合・current Actor/AccessScopeのRun accessを満たすこと。
+
+### 7.2 different Workflow Run
+
+Artifact ownerが別Runの場合、以下を**全て**要求する。
+
+1. canonical ArtifactRefがcurrent Jobのpersistent Input JSON tree内に存在する
+2. Artifact row/dataが存在し`data_deleted_at IS NULL`
+3. current ActorContext/AccessScopeに対してAuthorizationProviderがsource Artifact readを許可
+4. refのartifact_idとDB metadataが一致
+
+これにより、単に他Runのartifact_idを知っているだけではmaterializeできない。
+
+Parentが過去Run Artifactを明示Workflow Inputとして渡すこと、Reusable parentがChild `with`へArtifactRefを渡すことは許可される。
+
+### 7.3 External Reference
+
+Coreはmaterializeしない。ArtifactRefの`uri`をAction/親側が解釈するかは親責任。
+
+### 7.4 Reuse eligibility
+
+- persistent Inputに含まれるArtifactRefはInput digestへ固定される
+- same-run direct upstream Artifactは`03`のdirect_upstream_artifactsへも固定
+- persistent Input外のArtifactをRuntime中にmaterializeした場合は`reuse_eligible=false`
+
+## 8. Current Artifact / generations
 
 Artifact immutable。Retry/re-execution same nameでもnew artifact_id。
 
@@ -78,15 +128,19 @@ Artifact immutable。Retry/re-execution same nameでもnew artifact_id。
 1. current successful Attempt
 2. そのAttemptのnon-deleted同名Artifact最新
 
+返す値はCanonical ArtifactRef。
+
 Old generationはmetadata retentionまで履歴保持。Dynamic groupはfull logical `job_key` map。
 
-## 8. Output Payloadとの違い
+## 9. Output Payloadとの違い
 
 Job/Workflow JSON Outputは`02/08` PayloadStoreがauto inline/spill。
 
 ArtifactはActionが明示作成する別概念。Large JSON Outputを手動Artifact化する必要無し。
 
-## 9. Run directory
+ArtifactRef自体はJSON-compatibleなので、Job/Workflow OutputやInputへ明示的に含められる。Artifact実体をOutput JSONへ埋め込む意味ではない。
+
+## 10. Run directory
 
 ```text
 jobrunner-data/
@@ -99,7 +153,7 @@ jobrunner-data/
 
 Filesystem pathはopaque internal ID。
 
-## 10. Execution Log
+## 11. Execution Log
 
 Attemptごとfile。Runnerがstructured log/stdout/stderr/diagnosticをappend。
 
@@ -109,7 +163,7 @@ Periodic flush。全量memory保持禁止。
 
 Log close timeはAttempt terminal時。Recoveryでopen logを閉じる場合もclose metadataを確定する。
 
-## 11. Event Log
+## 12. Event Log
 
 通常Eventはappend-only structured audit。代表:
 
@@ -128,15 +182,15 @@ retry_scheduled/manual_retry_requested
 
 Progress/全log lineはEvent tableへ複製しない。
 
-Retention実施証跡は`08`の**system-level retention audit Event** (`retention_deleted`, `retention_orphan_cleaned`) を使う。これはRun FKを持たず通常`event-days`対象外、MVP無期限保持。
+Retention実施証跡は`08`のsystem-level retention audit Event (`retention_deleted`, `retention_orphan_cleaned`)。Run FK無し、通常`event-days`対象外、MVP無期限保持。
 
-## 12. Step
+## 13. Step
 
 Step=観測単位。`needs`/Runner allocation/independent Retry/timeout/Artifact ownership無し。
 
 Open Step中crashはAttempt terminal/Recovery時にfailure/incompleteへ閉じる。
 
-## 13. Progress
+## 14. Progress
 
 ```text
 current >=0
@@ -146,7 +200,7 @@ message/unit optional
 
 Workflow progressは表示用。Dynamic展開で分母増加可。Conclusion不使用。
 
-## 14. Workflow state
+## 15. Workflow state
 
 `env`=literal-only immutable static、Secret禁止。
 
@@ -161,7 +215,7 @@ Persistent、last-write-wins、revision/history。CAS/atomic increment/distribut
 
 State persistenceはSecretGuard。Child Workflow独立namespace。
 
-## 15. Temp lifecycle
+## 16. Temp lifecycle
 
 Attempt execution開始時mkdir、終了後削除。
 
@@ -169,7 +223,7 @@ Cleanup failureはJob conclusion不変、warning/Event/maintenance cleanup候補
 
 Temp=sandboxではない。
 
-## 16. Retention policy
+## 17. Retention policy
 
 Source of Truth=`01`の5項目 + `08.workflow_runs.retention_policy_json` snapshot。
 
@@ -183,34 +237,33 @@ managed-artifact-data-days
 
 `null=unlimited`。System default全null。Workflow指定項目がSystemをoverride。
 
-### 16.1 Execution Log
+### 17.1 Execution Log
 
 - due基準=Attempt completed/Log close time
 - running/non-terminal Attemptのcurrent logは削除しない
-- due削除後`wf_log_read`は存在しないLogを明示`not_found`/retained-away相当metadataとして扱い、空Logと偽装しない
+- due削除後`wf_log_read`は空Logと偽装しない
 
-### 16.2 Normal Event
+### 17.2 Normal Event
 
 - due基準=`created_at`
 - `event-days`で削除可能
 - system-level retention audit Eventは除外
 
-### 16.3 Managed Artifact data
+### 17.3 Managed Artifact data
 
 - due基準=Artifact `created_at`
 - owner Workflow Run non-terminal中は期限だけで削除しない
 - ArtifactStore delete成功後`data_deleted_at`
-- current reference解決では`data_deleted_at IS NULL`のみusable
-- data削除後のmaterializeは明示failure
+- current reference/materializeは`data_deleted_at IS NULL`のみusable
 
-### 16.4 Artifact metadata
+### 17.4 Artifact metadata
 
 - due基準=Artifact `created_at`
 - owner Run non-terminal中は削除しない
-- Managed dataが残る場合、metadata先行削除禁止。必要ならdata deleteを先に行う
+- Managed dataが残る場合metadata先行削除禁止
 - External metadata削除でも外部実体は触らない
 
-### 16.5 Run history
+### 17.5 Run history
 
 - due基準=Workflow Run `completed_at`
 - non-terminal Run削除禁止
@@ -218,40 +271,44 @@ managed-artifact-data-days
 - component別retentionが長くてもrun-history expiryが最終上限
 - Output Payloadは独立retention無し、Run/Attempt historyと共に削除
 
-### 16.6 Orphan cleanup
+### 17.6 Orphan cleanup
 
 Crashでowner metadataを持たないtemp/payload/artifact store objectはMaintenance cleanup可能。
 
 通常Retention policyとは別のconsistency cleanup。system-level `retention_orphan_cleaned` audit Eventを残す。
 
-## 17. RetentionとResult Reuse
+## 18. RetentionとResult Reuse
 
-Successful descendant reuse対象のPayload/Managed ArtifactがRetentionで既に消えている場合、silent reuse禁止。
+Successful descendant reuse対象Payload/Managed ArtifactがRetentionで既に消えている場合、silent reuse禁止。
 
-`03/10`のreuse validationでpayload/artifact availability不一致を検出し `successful_job_result_not_reusable` へ。
+`03/10`のreuse validationでavailability不一致を検出し `successful_job_result_not_reusable` へ。
 
-## 18. Security
+## 19. Security
 
 - put source/current materialize destinationはwork_dir内
 - Managed store key/path Core生成
 - Artifact metadata/URI SecretGuard
 - External URI auto-fetch無し
+- cross-run materializeはpersistent Input明示 + Authorization必須
 - Retention audit payloadもSecretGuard
 
-## 19. 受入条件
+## 20. 受入条件
 
 1. managed put_file/generations
 2. traversal reject/materialize safety
-3. external no fetch/delete
-4. Output Payloadとの分離
-5. Execution Log read/no Run info body
-6. State history/SecretGuard
-7. temp cleanup
-8. retention inheritance snapshotは`01/08`と一致
-9. Log/Event/Artifact data/metadata cutoff
-10. non-terminal retention guard
-11. managed data_deleted_at/current reference behavior
-12. run-history FK cleanup
-13. retention audit Event survives normal event retention
-14. orphan cleanup audit
-15. retention loss causes reuse fail-closed
+3. canonical ArtifactRef validation/DB re-resolve
+4. same-run Artifact materialize
+5. explicit cross-run ArtifactRef materialize + authorization
+6. raw cross-run artifact_id only reject
+7. External Artifact core materialize reject
+8. Output Payloadとの分離
+9. Execution Log read/no Run info body
+10. State history/SecretGuard
+11. temp cleanup
+12. retention inheritance/cutoff
+13. non-terminal retention guard
+14. managed data_deleted_at/current reference behavior
+15. run-history FK cleanup
+16. retention audit survives normal event retention
+17. orphan cleanup audit
+18. retention loss causes reuse fail-closed
