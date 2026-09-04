@@ -1,19 +1,19 @@
 # 11. Service API / MCP / HTTP 詳細設計
 
-- Status: Draft v0.5
+- Status: Draft v0.6
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 
 ## 1. 基本原則
 
-1. Web/MCP/Python APIは同じService layer。
+1. MCP/HTTP/Python APIは同じService layer。
 2. AdapterはDB/Storeを直接更新しない。
 3. Public read/writeはAuthorizationProviderを通す。
 4. State-changing operationはoptional `request_id`。
 5. MCP public tool名は親namespace必須。
 6. Large Log/Output本文をRun infoへ埋め込まない。
-7. **Workflow Definition と Workflow Run をAPI名で明確に分ける。**
-8. HTTP Adapterのroute contractは本書で固定し、WebUI画面設計へ委譲しない。
+7. Workflow Definition と Workflow Run をAPI名で明確に分ける。
+8. HTTP route contractは本書で固定し、WebUI画面設計へ委譲しない。
 
 ## 2. Service
 
@@ -37,8 +37,6 @@ State-changing public callでactor_idが無ければAdapterがclient/session pri
 
 ## 4. Workflow Definition operations
 
-Canonical logical names:
-
 ```text
 wf_definition_list
 wf_definition_info
@@ -46,9 +44,9 @@ wf_definition_info
 
 ### `wf_definition_list`
 
-親Workflow Resolver/Registryから現在利用可能なDefinitionを列挙するread-only operation。
+現在利用可能なDefinitionを列挙するread-only operation。
 
-最低限返す:
+最低限:
 
 ```text
 workflow_id
@@ -60,24 +58,21 @@ source_kind
 source_display optional
 ```
 
-Raw source YAML全体は既定responseへ含めない。
+Raw YAML全体は既定responseへ含めない。
 
 ### `wf_definition_info`
 
-Canonical workflow IDまたは解決可能referenceを指定し、Definition metadataとInput/Output schema、Job summaryを返す。
-
-Option:
+Canonical `workflow_id`またはresolverが受理するreferenceをrequest fieldとして受け、Definition metadata、Input/Output schema、Job summaryを返す。
 
 ```text
-include_source_yaml=false default
-include_jobs=true default
+workflow_ref
+include_source_yaml=false
+include_jobs=true
 ```
 
-Secret valueはDefinitionに存在しない。
+HTTPではworkflow ID/referenceをpath segmentへ埋め込まずquery parameterで渡す。Filesystem/Registry由来のcanonical IDに`/`等が含まれてもrouting semanticsと衝突させないためである。
 
 ## 5. Workflow Run operations
-
-Canonical logical names:
 
 ```text
 wf_start
@@ -90,19 +85,21 @@ wf_retry
 wf_priority_update
 ```
 
-`wf_list` / `wf_info` という曖昧aliasはMVP canonical APIとして提供しない。
+曖昧な`wf_list/wf_info` canonical aliasはMVPで提供しない。
 
 ### `wf_start`
 
 Request:
 
 ```text
-workflow reference
+workflow_ref
 inputs
 priority optional
 source_identity optional
 request_id optional
 ```
+
+`source_identity`はpresentならnon-empty string。Git SHA/package version/build ID等のopaque parent metadataで、Coreは内容解釈しない。
 
 Validation failureではRunを作らない。
 
@@ -140,30 +137,13 @@ size_bytes
 digest
 ```
 
-Output body/Execution Log本文は含めない。Inlineで小さくても同じcontract。
+Output body/Execution Log本文は含めない。
 
 ### `wf_retry`
 
-`workflow_run_id + job_run_id`。
+`workflow_run_id + job_run_id`。Eligibilityは`10`。
 
-Eligibilityは`10-retry-recovery-cancel.md`をSource of Truthとし、少なくとも:
-
-- target Job conclusion=`failure`
-- latest failed Attemptが存在
-- persistent Input Snapshotが存在
-- success/cancelled Runではない
-
-を要求する。
-
-Attempt/Input Snapshot無しは:
-
-```text
-retry_input_unavailable
-```
-
-でsame Run retryを拒否する。Input変更不可。Completed/failure Runはexplicit reopen。
-
-Child Run direct controlは禁止。
+Attempt/Input Snapshot無し -> `retry_input_unavailable`。Input変更不可。Child direct control禁止。
 
 ## 6. Output operations
 
@@ -172,23 +152,20 @@ wf_output_info
 wf_output_read
 ```
 
-Sourceはexactly one:
+Source exactly one:
 
 - Workflow Run current Workflow Output
 - Job Run current successful Output
 - specific Attempt Output
 
-`wf_output_read` はPayloadStoreを透過loadして元JSON valueを返す。
+`wf_output_read`はPayloadStoreを透過load。
 
-### `select`
+Optional `select` はJMESPath。
 
-Optional JMESPath expression。
-
-- full Output load + integrity verify後に評価
-- returned valueもJSON-compatible
-- select無しはfull Output
-- MCP response上限超過時はsilent truncateせず `response_too_large`
-- Python/HTTPはtransport能力に応じstreaming可能だがJSON意味を変えない
+- full Output integrity verify後評価
+- select無しfull Output
+- MCP response上限超過時silent truncateせず `response_too_large`
+- Python/HTTPはstreaming可能だがJSON意味を変えない
 
 ## 7. External Task operations
 
@@ -218,15 +195,13 @@ wf_log_read
 wf_runner_info
 ```
 
-`wf_artifact_info`はmetadata/history。Managed Artifact実体downloadをMVP public Service必須にはしない。
+Artifact infoはmetadata/history。Managed実体downloadはMVP public Service必須ではない。
 
 Log readはattempt_id + offset/tail。External path不可。
 
 ## 10. MCP namespace / canonical tools
 
-Core logical nameの先頭に親namespaceを付ける。
-
-例:
+Core logical nameの先頭に親namespace。
 
 ```text
 Core: wf_run_info
@@ -234,9 +209,15 @@ Novel: novel_wf_run_info
 FX: fx_wf_run_info
 ```
 
-`system_namespace`必須。親はtool subsetを非公開可能。
+`system_namespace`はnon-empty、推奨正規表現:
 
-MVP canonical public tool:
+```text
+^[a-z][a-z0-9_]*$
+```
+
+Adapter登録時に同一MCP server内tool name collisionを検出してrejectする。
+
+MVP canonical public tools:
 
 ```text
 <ns>_wf_definition_list
@@ -264,17 +245,19 @@ MVP canonical public tool:
 
 ## 11. HTTP Adapter v1
 
-親システムがmount pathを変更できるが、JobRunner内の標準prefixは:
+Standard prefix:
 
 ```text
 /api/jobrunner/v1
 ```
 
+親システムはこのrouter全体を別mount prefixの下へ載せられるが、JobRunner内部route suffixを変更しない。
+
 Canonical routes:
 
 ```text
 GET  /api/jobrunner/v1/workflow-definitions
-GET  /api/jobrunner/v1/workflow-definitions/{workflow_id}
+GET  /api/jobrunner/v1/workflow-definitions/info?workflow_ref=<encoded>
 
 POST /api/jobrunner/v1/workflow-runs
 GET  /api/jobrunner/v1/workflow-runs
@@ -282,7 +265,7 @@ GET  /api/jobrunner/v1/workflow-runs/{workflow_run_id}
 POST /api/jobrunner/v1/workflow-runs/{workflow_run_id}/pause
 POST /api/jobrunner/v1/workflow-runs/{workflow_run_id}/resume
 POST /api/jobrunner/v1/workflow-runs/{workflow_run_id}/cancel
-PATCH /api/jobrunner/v1/workflow-runs/{workflow_run_id}       # priority only in MVP
+PATCH /api/jobrunner/v1/workflow-runs/{workflow_run_id}
 POST /api/jobrunner/v1/workflow-runs/{workflow_run_id}/jobs/{job_run_id}/retry
 
 GET  /api/jobrunner/v1/workflow-runs/{workflow_run_id}/output-info
@@ -305,11 +288,12 @@ GET  /api/jobrunner/v1/attempts/{attempt_id}/log
 GET  /api/jobrunner/v1/runners
 ```
 
-Path IDはURL percent-encodingする。`workflow_id`のcanonical stringをpath segmentとして扱う。
+Opaque generated IDs (`wr_`, `jr_`, etc.)だけをpath parameterに使う。Workflow referenceはquery/body field。
 
 ### Query mapping
 
 ```text
+workflow-definitions/info -> workflow_ref, include_source_yaml, include_jobs
 workflow-runs list -> status/conclusion/workflow_id/created_from/created_to/limit/cursor
 reviews list -> workflow_run_id/status/limit/cursor
 output -> select optional
@@ -318,30 +302,44 @@ log -> offset/limit/tail_lines
 
 ### Idempotency header
 
-HTTP state-changing requestはoptional:
+State-changing HTTP requestはoptional:
 
 ```text
 Idempotency-Key: <opaque client key>
 ```
 
-をService `request_id`へmappingする。HTTP bodyに別の`request_id` fieldを重複して持たせない。
+をService `request_id`へmapping。Bodyに別`request_id`を持たせない。
 
 ## 12. HTTP status mapping
 
+MVP canonical mapping:
+
 ```text
-200  read / idempotent replay / successful state change
-201  workflow start等でnew resource作成
-400  request/definition/input/expression validation
+200  read / successful non-create state change
+201  successful new top-level Workflow Run creation
+400  request/definition/input/expression/domain contract validation
 401  parent authenticationでunauthenticated
 403  authorization forbidden
 404  not_found policy時
-409  conflict/invalid_state/idempotency_conflict/lease conflict
-413  HTTP Adapterが明示response/request size policyで拒否する場合
-422  domain valueは構文上validだがcontract不適合の場合に使用可。MVPでは400へ統一してもよい
+409  state conflict / idempotency conflict / lease ownership conflict
+413  Adapterの明示request/response size policyで拒否
 500  internal_error
 ```
 
-**MVP canonical mappingは validation/domain contract errorを400へ統一する。** 422は将来拡張用で、Adapterごとに勝手に使い分けない。
+MVPでは422を使用しない。
+
+### Idempotency replay status
+
+Idempotency replayは**最初の成功responseのHTTP status + bodyをそのまま再生**する。
+
+例:
+
+- 初回`wf_start`=201 -> replayも201
+- 初回pause=200 -> replayも200
+
+そのため「replayは常に200」という特別規則は設けない。Persistenceのidempotency resultはAdapterがoriginal statusを復元できるmetadataを保持する。
+
+`response_too_large` はMCP固有のtool errorが基本。HTTPで同様のAdapter上限を設けて拒否する場合は413。
 
 ## 13. Error model
 
@@ -396,13 +394,13 @@ Identity:
 scope + operation + request_id
 ```
 
-Scopeはsystem namespace + resource + AccessScope + Actor/client principal。
+Scope=system namespace + resource + AccessScope + Actor/client principal。
 
-TTL内same hash replay / different hash conflict。TTL後はexpired rowをtransactional replacementしてsame keyをnew requestとして利用可能。
+TTL内same hash replay / different hash conflict。TTL後expired row transactional replacement可。
+
+Persisted resultにはService response bodyに加えAdapter replay用original HTTP status metadataを持てる。MCP/Pythonは同じService resultを各Adapter形式へ再構成する。
 
 ## 15. Validation order
-
-State change:
 
 1. request schema
 2. Actor/AccessScope
@@ -416,15 +414,15 @@ Secret値をrequest hash/Eventへ保存しない。
 
 ## 16. Read authorization / pagination
 
-Definition list/info、Run list/info、output、task、review、artifact、log、runnerを全てauthorize。
+Definition list/info、Run list/info、output、task、review、artifact、log、runner全てauthorize。
 
-ListはProviderのfiltered scopeをqueryへ適用。
+Listはfiltered scope適用。
 
 List/Event/Artifact historyはopaque cursor pagination。
 
 ## 17. Python API
 
-Python APIも同じcanonical logical operationを呼ぶ。Adapter独自の意味変更を禁止する。
+Python APIもcanonical logical operation。Adapter独自の意味変更禁止。
 
 ## 18. Observability
 
@@ -432,19 +430,20 @@ State change Eventへactor/source/request_id。Request body/Secret/巨大payload
 
 ## 19. 受入条件
 
-1. Definition list/info と Run list/infoが別operation
-2. ambiguous `wf_list/wf_info` canonical alias無し
-3. namespaced MCP canonical names
+1. Definition/Run operation separation
+2. no wf_list/wf_info alias
+3. namespaced MCP collision reject
 4. all read/write Authorization
-5. Run info Output body無し
-6. output info/read inline/blob透過
-7. output JMESPath select
-8. MCP large response fail-closed/no truncate
-9. retry_input_unavailable Service mapping
-10. HTTP v1 exact routes/methods
-11. HTTP Idempotency-Key mapping
-12. HTTP error status mapping
-13. task/review operations
-14. child direct control reject
-15. idempotency scope/TTL
-16. cursor pagination
+5. Run info body separation
+6. output info/read/select
+7. MCP large response no truncate
+8. retry_input_unavailable mapping
+9. HTTP Definition info query route supports slash-containing ID
+10. HTTP exact routes/methods
+11. Idempotency-Key mapping
+12. replay preserves original 201/200 status
+13. no HTTP 422 in MVP
+14. task/review operations
+15. child direct control reject
+16. idempotency scope/TTL
+17. cursor pagination
