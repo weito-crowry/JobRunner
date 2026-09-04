@@ -1,9 +1,9 @@
 # 12. Security / Secrets 詳細設計
 
-- Status: Draft v0.4
+- Status: Draft v0.5
 - 対象: MVP
 - 上位仕様: `docs/design.md`
-- 関連: `02`, `04`, `08`, `09`, `11`
+- 関連: `01`, `02`, `04`, `08`, `09`, `11`
 
 ## 1. 基本原則
 
@@ -47,8 +47,20 @@ current ownership不一致のlate update reject。
 
 ```python
 class SecretsProvider:
-    def get(self, name, actor, scope): ...
+    def get(self, name, actor, scope) -> str: ...
 ```
+
+MVPのSecret valueは **non-empty Python `str`** に限定する。空string、bytes、number、object等はrejectする。
+
+Invalid provider value:
+
+```text
+category=security
+code=secret_value_invalid
+retryable=false
+```
+
+Binary secret等が将来必要なら別typed secret contractとして拡張し、MVPで暗黙変換しない。
 
 Secret name:
 
@@ -76,13 +88,13 @@ Missing Secretはchild起動前 `secret_not_found`。
 
 ## 6. Attempt Secret Set
 
-Runnerはcurrent internal AttemptでmaterializeしたSecret値をAttempt専用Secret Setとして保持する。
+Runnerはcurrent internal Attemptでmaterializeしたnon-empty Secret stringをAttempt専用Secret Setとして保持する。
 
 - persistenceしない
 - Event/debug metadataへ出さない
 - Attempt終了時memory referenceを破棄
 
-String SecretをUTF-8 bytesへencodeした値もmanaged file scan用に保持する。
+各Secret stringをUTF-8 bytesへencodeした値もmanaged file scan用に保持する。
 
 ## 7. Structured SecretGuard
 
@@ -141,7 +153,7 @@ Redaction前raw lineを別sinkへ保存しない。
 - Secretを複数fragmentへ分割
 - current AttemptへSecretsProviderからmaterializeされていない別機密値
 
-保証は「current AttemptでJobRunnerが知っているSecretのexact substring/byte sequence」。
+保証は「current AttemptでJobRunnerが知っているSecretのexact substring/UTF-8 byte sequence」。
 
 ## 11. Process environment
 
@@ -181,14 +193,16 @@ Providerは`forbidden/not_found` policyを選べる。Error detailsもSecretGuar
 ## 16. 受入条件
 
 1. all public read/write authorization
-2. Secret参照位置
-3. per-Attempt Secret Set non-persistent
-4. Output/State/Event/Error metadata guard
-5. PayloadStore spill前guard
-6. managed Artifact text/binary exact byte match reject
-7. chunk境界Secret match
-8. external Artifact contentはscanしない/metadata guard
-9. Log redaction
-10. transformed Secret非保証
-11. Runner fencing
-12. safe YAML/path safety
+2. Secret name syntax
+3. Secret value non-empty str / invalid type reject
+4. Secret参照位置
+5. per-Attempt Secret Set non-persistent
+6. Output/State/Event/Error metadata guard
+7. PayloadStore spill前guard
+8. managed Artifact text/binary exact byte match reject
+9. chunk境界Secret match
+10. external Artifact contentはscanしない/metadata guard
+11. Log redaction
+12. transformed Secret非保証
+13. Runner fencing
+14. safe YAML/path safety
