@@ -1,12 +1,13 @@
 # 08. Persistence 詳細設計
 
-- Status: Draft v0.8
+- Status: Draft v0.9
 - 対象: MVP
 - 上位仕様: `docs/design.md`
+- Canonical JSON: `01-workflow-definition.md` の `jobrunner.canonical-json.v1`
 
 ## 1. 目的
 
-SQLite schema、PayloadStore / ArtifactStore metadata、Action/Validator snapshot、Result Reuse、deadline、Migration、Recovery、Idempotencyを定義する。
+SQLite schema、PayloadStore / ArtifactStore metadata、Action/Validator snapshot、Result Reuse、deadline、Retention、Migration、Recovery、Idempotencyを定義する。
 
 ## 2. Storage構成
 
@@ -16,7 +17,7 @@ SQLite
 ├─ Payload metadata
 ├─ Artifact metadata
 ├─ Action/Validator identity
-└─ Reuse/idempotency metadata
+└─ Reuse/idempotency/retention metadata
 
 PayloadStore
 └─ large JSON Output blob
@@ -25,11 +26,7 @@ ArtifactStore
 └─ explicitly managed artifact data
 ```
 
-MVP standard:
-
-- `sqlite3`
-- `LocalHybridPayloadStore`: <= threshold SQLite / > threshold filesystem
-- `LocalArtifactStore`: durable filesystem
+MVP standard=`sqlite3`, `LocalHybridPayloadStore`, `LocalArtifactStore`。
 
 ## 3. SQLite設定
 
@@ -39,29 +36,23 @@ PRAGMA busy_timeout=5000
 PRAGMA journal_mode=WAL
 ```
 
-競合writeは必要に応じ`BEGIN IMMEDIATE`。長transaction禁止。
+競合writeは必要時`BEGIN IMMEDIATE`。長transaction禁止。
 
-Text identity比較はSQLite `BINARY` semanticsを基本とし、Concurrency groupはcase-sensitive完全一致。
+Text identityはBINARY semantics。Concurrency group case-sensitive。
 
 ## 4. ID / time / JSON / numeric
 
-IDはtype prefix + UUID4 hex。UTC RFC3339。
+ID=type prefix + UUID4 hex。UTC RFC3339。
 
-Canonical JSONはUTF-8、NaN/Infinity禁止、deterministic object serialization。
+JSON persistent/digest対象は`jobrunner.canonical-json.v1`。別serializer禁止。
 
-SQLite INTEGERへ保存する外部入力整数はsigned 64-bit範囲。Priority/version/count等はDB到達前validation。
-
-Action/Validator ID+version、Runner Pool、Concurrency group等の必須identityはnon-empty TEXT。
+SQLite INTEGER外部入力=signed64範囲。必須identity=non-empty TEXT。
 
 ## 5. Foreign Key policy
 
-Implicit cascade delete無し。
+FK原則`ON DELETE NO ACTION`。Implicit cascade無し。
 
-- FK原則 `ON DELETE NO ACTION`
-- Retention Serviceが依存順に明示削除
-- FK無効化で強行しない
-
-少なくとも leaf data -> attempt-owned -> job-owned -> child runs -> root run の順。
+Retention Serviceがleaf -> attempt-owned -> job-owned -> child runs -> root run順に明示削除。FK無効化禁止。
 
 ## 6. Tables
 
@@ -86,36 +77,29 @@ human_reviews
 idempotency_records
 ```
 
-Maintenance Loop専用tableは作らず `job_runs.retry_not_before` と `external_leases.expires_at` をdeadline Source of Truthにする。
+Deadline専用table無し。`retry_not_before` / `expires_at`がSource of Truth。
 
 ## 7. Output payload columns
 
-Workflow Run / Job Attempt:
-
 ```text
-output_storage_kind  NULL | inline | blob
-output_json          NULL | TEXT
-output_blob_key      NULL | TEXT
-output_size_bytes    NULL | INTEGER >=0
-output_digest        NULL | TEXT
+output_storage_kind  NULL|inline|blob
+output_json          NULL|TEXT
+output_blob_key      NULL|TEXT
+output_size_bytes    NULL|INTEGER >=0
+output_digest        NULL|TEXT
 ```
 
-- none: all null
-- inline: output_json set / blob_key null
-- blob: output_json null / blob_key set
-- outputありならsize/digest必須
+none=all null、inline=json only、blob=blob key only、Outputありならsize/digest必須。
 
 ## 8. PayloadStore crash consistency
 
-1. result validation + SecretGuard
-2. canonical JSON + SHA-256
+1. validation/SecretGuard
+2. canonical-json-v1 bytes + SHA-256
 3. threshold
 4. blob temp write -> atomic rename
-5. DB terminal transaction metadata
+5. DB terminal transaction
 
-DB commit前crashのorphan blobはmaintenance cleanup。
-
-Readでexistence/size/digest verify。不整合 `payload_missing|payload_digest_mismatch`。
+DB commit前orphan blobはmaintenance cleanup。Readはexistence/size/digest verify。
 
 ## 9. `workflow_runs`
 
@@ -132,6 +116,7 @@ definition_yaml/definition_json/definition_hash
 input_json
 action_versions_json TEXT NOT NULL
 validator_versions_json TEXT NOT NULL
+retention_policy_json TEXT NOT NULL
 output_storage_kind/output_json/output_blob_key/output_size_bytes/output_digest
 failure_json/source_identity
 
@@ -142,15 +127,25 @@ parent_workflow_run_id/parent_job_run_id/parent_attempt_id/root_workflow_run_id/
 created_at/started_at/completed_at/updated_at
 ```
 
+`retention_policy_json` exact shape:
+
+```text
+run_history_days: integer>=1|null
+execution_logs_days: integer>=1|null
+event_days: integer>=1|null
+artifact_metadata_days: integer>=1|null
+managed_artifact_data_days: integer>=1|null
+```
+
+Run start時effective policyをcanonical JSONでsnapshot。後からSystem/Workflow source設定が変わっても既存Run policyを暗黙変更しない。
+
 Checks:
 
 ```text
-status = queued|running|paused|completed
-conclusion = NULL|success|failure|cancelled
+status=queued|running|paused|completed
+conclusion=NULL|success|failure|cancelled
 completed <=> conclusion non-NULL
 concurrency_group NULL or length>0
-concurrency_max_runs NULL or >=1
-concurrency_on_limit NULL|queue|reject
 source_identity NULL or length>0
 ```
 
@@ -174,20 +169,11 @@ current_failure_json
 ready_at/queued_at/started_at/completed_at/created_at/updated_at
 ```
 
-Checks:
+Executor/status/conclusion checksは`01/03`とexact一致。
 
-```text
-executor = internal|external_llm|human|reusable
-status = queued|running|waiting_external|waiting_review|waiting_child|completed
-conclusion = NULL|success|failure|cancelled|skipped|blocked
-internal -> action_id/action_version non-empty, runs_on non-empty
-external/human/reusable -> action_id/action_version/runs_on NULL
-validator pair either both NULL or both non-empty
-human/reusable -> validator pair NULL
-internal timeout_seconds NULL or finite >0
-```
+Validator pair both null or both non-empty。Human/Reusable validator無し。Internal timeout finite>0。
 
-`UNIQUE(workflow_run_id, job_key)`。
+`UNIQUE(workflow_run_id,job_key)`。
 
 ```sql
 CREATE UNIQUE INDEX uq_one_running_internal_per_run
@@ -206,29 +192,21 @@ runner_id/runner_instance_id/runtime_instance_id
 input_json TEXT NOT NULL
 output_storage_kind/output_json/output_blob_key/output_size_bytes/output_digest
 reuse_eligible INTEGER NULL CHECK IN(0,1)
-reuse_context_json TEXT NULL
-reuse_key TEXT NULL
-failure_json
+reuse_context_json/reuse_key/failure_json
 started_at/completed_at/created_at
-UNIQUE(job_run_id, attempt_no)
+UNIQUE(job_run_id,attempt_no)
 ```
 
-Attempt status:
+Attempt status=`running|waiting_external|waiting_review|waiting_child|completed`。
 
-```text
-running|waiting_external|waiting_review|waiting_child|completed
-```
-
-Attempt開始前failureはJob Run failureで表現しInput snapshot無し。
+Pre-Attempt failureはJob Runで表現しInput snapshot無し。
 
 ## 12. Reuse context
 
-Successful terminal時に:
+Successful terminal時:
 
 ```text
-workflow_run_id
-job_key
-definition_hash
+workflow_run_id/job_key/definition_hash
 persistent_input_digest
 direct_upstream_artifacts
 executor_identity
@@ -236,29 +214,24 @@ validator_identity
 ineligibility_reason optional
 ```
 
-を確定。
+canonical-json-v1 SHA-256。
 
-- state_get -> ineligible
-- undeclared/dynamic Artifact materialize -> ineligible
-- otherwise canonical context SHA-256 `reuse_key`
+state_get/undeclared Artifact materialize -> ineligible。
 
-Output commit + reuse metadata + Job successを同logical terminal operationで確定。
+Output commit + reuse metadata + Job success same logical terminal operation。
 
 ## 13. Manual Retry reopen
 
-1. latest failed Attempt + input_json存在
-2. 無ければ `retry_input_unavailable`, no state change
-3. current Action/Validator/Reusable binding version availability確認
-4. run_attempt++
-5. Run reopen
-6. target retry waiting
-7. blocked/skipped descendants reset
-8. successful descendants reuse_check_pending=1
-9. Event/idempotency
+1. failed Attempt/input存在
+2. 無し -> retry_input_unavailable no change
+3. Action/Validator/Binding version availability
+4. run_attempt++/Run reopen
+5. target retry waiting
+6. blocked/skipped reset
+7. successful reuse_check_pending
+8. Event/idempotency
 
-Reuse mismatch/version unavailable/ineligible/payload missingは `successful_job_result_not_reusable` または明示version mismatch。
-
-## 14. Deadline indexes / Maintenance
+## 14. Deadline indexes
 
 ```sql
 CREATE INDEX ix_job_retry_due
@@ -270,115 +243,95 @@ ON external_leases(expires_at)
 WHERE status='active';
 ```
 
-Deadline処理はconditional transaction。二重expiry/retry wakeを副作用化しない。
+Conditional transaction、due二重処理は副作用化しない。
 
 ## 15. Dynamic / Reusable uniqueness
 
-Dynamic expansion root/nested partial unique。Full `job_key` TEXT固定長CHECK無し。
+Dynamic root/nested expansion partial unique。Full job_key fixed length CHECK無し。
 
-Reusable binding one / parent_job_run_id。BindingはChild Action+Validator version snapshotを持つ。
+Reusable binding one/parent_job_run_id。BindingにChild Action+Validator versions。
 
-Child Run one / parent_attempt_id partial unique。
+Child Run one/parent_attempt_id。
 
 ## 16. State
 
-Current + append-only history同transaction。State valueはSecretGuard対象。
+Current + append-only history same transaction。SecretGuard対象。
 
 ## 17. Artifact metadata / Store
 
 ```text
 id/workflow_run_id/job_run_id/attempt_id/name
-storage_kind = managed|external
+storage_kind=managed|external
 store_key/external_uri
 media_type/size/digest/metadata
 created_at/data_deleted_at/metadata_deleted_at
 ```
 
-Managed putはwork_dir内source -> temp copy/Secret scan/digest -> atomic finalize -> metadata/Event。
+Managed put=temp copy/Secret scan/digest/atomic finalize/metadata Event。DB failure orphan cleanup。
 
-Store finalize後DB failureはorphan cleanup対象。
+## 18. Event persistence / retention audit
 
-## 18. Events / Logs / Runners
+通常Eventは`workflow_run_id`等をnullable参照として持つが、Run row削除後もRetention実施事実を残すため、**system-level retention audit Eventはworkflow_run_id=NULL** としpayloadへdeleted resource type/opaque ID/countを記録する。
 
-Event append-only + SecretGuard。Execution Log DBはrelative path metadata。
+Run削除前にsystem-level `retention_deleted` Eventをcommitし、対象RunにFK依存させない。
 
-Runner fencingにruntime/runner instance + heartbeat/main_loop_tick。
+SecretGuard対象。
 
 ## 19. External / Human uniqueness
 
-- one Task / Attempt
-- one active Lease / Task
-- one Review / Attempt
+- one Task/Attempt
+- one active Lease/Task
+- one Review/Attempt
 
-## 20. Idempotency records
-
-Canonical schema:
+## 20. Idempotency
 
 ```text
-scope TEXT NOT NULL
-operation TEXT NOT NULL
-request_key TEXT NOT NULL
-request_hash TEXT NOT NULL
-result_json TEXT NOT NULL
-adapter_meta_json TEXT NULL
-status TEXT NOT NULL
-created_at TEXT NOT NULL
-expires_at TEXT NOT NULL
-PRIMARY KEY(scope, operation, request_key)
+scope/operation/request_key PK
+request_hash/result_json/adapter_meta_json/status/created_at/expires_at
 ```
 
-Default TTL=24h。
+Default TTL24h。Scope=namespace+resource+AccessScope+Actor/client principal。
 
-Scope includes namespace + resource + AccessScope + Actor/client principal。
+TTL内replay/conflict、expired replace可。Result/adapter metadata SecretGuard対象。
 
-TTL内:
-
-- same hash -> first Service result replay
-- different hash -> idempotency_conflict
-
-TTL後:
-
-- expired rowが残っていても同transactionでreplaceしてnew requestを受理可能
-
-`adapter_meta_json` はService意味を変えないtransport replay補助metadata。HTTP Adapterは初回successful status code (`200|201`等)を保存でき、replayでoriginal statusを復元する。MCP/Python固有transport object本体をDBへ保存しない。
-
-`result_json` / `adapter_meta_json` はSecretGuard対象。
-
-Side effect + Service result + idempotency rowは同transaction。Filesystem blob prepareを伴う場合はPayloadStore crash consistencyに従う。
+Side effect + idempotency result same transaction。
 
 ## 21. Concurrency
 
-Start/slot releaseは`BEGIN IMMEDIATE`でholder count再確認。Group non-empty TEXT `COLLATE BINARY`。
+Start/slot release `BEGIN IMMEDIATE` holder recount。Group BINARY case-sensitive。
 
 ## 22. Migration
 
-`migrations/NNN_name.sql` + `schema_migrations`。順序1回、fail-closed。Unknown future schema versionは起動拒否。
+`migrations/NNN_name.sql` + `schema_migrations`。Ordered once、fail-closed、unknown future version reject。
 
-## 23. Retention
+## 23. Retention deletion rules
 
-Default無期限。
+Policy source=`workflow_runs.retention_policy_json`。
 
-- Output blob owner retention delete
-- managed ArtifactStore delete
-- external Artifact実体deleteしない
-- orphan temp/blob/store cleanup
-- expired idempotency cleanup
-- relational rows依存順削除
+- Run age base: `completed_at`; non-terminal Runはrun-history retention削除対象外
+- Execution Log age base: Attempt `completed_at`; running Attempt logは削除しない
+- Event age base: Event `created_at`
+- Artifact metadata/data age base: Artifact `created_at`
+- Managed Artifact dataをmetadataより先にdelete可。`data_deleted_at`記録
+- External Artifact dataはCore delete無し
+- Output PayloadはRun/Attempt履歴所有物としてrun-history deletion時にdelete
 
-Reuse対象Payload/Artifact欠落はsilent reuseしない。
+Run history deletionはowned FK rowsが残らないよう依存順に処理する。Component policyが長くてもrun-history expiryが上限。
 
 ## 24. 受入条件
 
-1. inline/blob constraints/crash consistency
-2. Action/Validator snapshot columns
-3. validator identity reuse key
-4. signed64/string/source_identity boundaries
-5. concurrency BINARY
-6. FK NO ACTION / retention ordering
-7. deadline indexes / idempotent due processing
-8. managed/external Artifact
-9. Manual Retry Input/version existence
-10. one-running/Dynamic/Reusable/External/Human unique
-11. idempotency adapter_meta original HTTP status replay
-12. expired idempotency replace
-13. migration future version reject
+1. canonical-json-v1 persistence/digest
+2. inline/blob crash consistency
+3. retention_policy snapshot
+4. non-terminal Run retention safety
+5. component retention age bases
+6. system-level retention audit survives Run delete
+7. Action/Validator snapshot/reuse
+8. signed64/string/source identity
+9. concurrency/FK semantics
+10. deadline indexes
+11. Artifact orphan cleanup
+12. Retry Input/version
+13. uniqueness constraints
+14. idempotency original HTTP status metadata
+15. future migration reject
