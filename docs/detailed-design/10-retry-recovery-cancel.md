@@ -1,6 +1,6 @@
 # 10. Retry / Recovery / Cancel 詳細設計
 
-- Status: Draft v1.0
+- Status: Draft v1.1
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `02`, `03`, `04`, `05`, `07`, `08`, `11`
@@ -11,12 +11,13 @@
 2. Failed Attempt rowを書き換えない。
 3. Retry Input/Secret bindings/Definition/Action/Validator/Dynamic iteration/Reusable binding固定。
 4. Automatic Retryは`retry` block明示時のみ。
-5. Manual Retryはfailed Job指定。
+5. Manual Retryはfailed concrete Job指定。
 6. Retryにはfailed Attempt persistent Input snapshot必須。
 7. Internal timeoutのみ。未指定無期限。
-8. Cancel=graceful。
+8. Cancel=graceful。Cancel commit後の成功結果は採用しない。
 9. Recoveryだけでcompleted Run reopen無し。
 10. Manual Retry後successful descendantは`03/05` strict reuse必須。
+11. completed RunをManual Retryでreopenする場合はConcurrency slotを再取得する。
 
 ## 2. Structured Failure
 
@@ -131,6 +132,8 @@ status = queued
 
 **new Attemptはまだ作らない。**
 
+Due判定は `now >= retry_not_before`。`retry_not_before=NULL`は即時due。
+
 Due後:
 
 - internal -> Runner claimがpending snapshotをnew Attemptへcopy
@@ -139,8 +142,6 @@ Due後:
 - reusable -> new Attempt + Child Runへcopy
 
 Attempt作成後pending fieldsはclear可能。
-
-この方式で全executorのRetry Inputを同じ規則にする。
 
 ## 6. Automatic Retry flow
 
@@ -158,7 +159,7 @@ Failed Attempt terminal時:
 
 Retry condition errorはRetryせず元failure維持 + diagnostic/Event。
 
-Validation/domain failureをExternal submitで受けた場合もこのflow。Submit transaction内でnew Attempt/Taskは作らない。
+External submit validation/domain failureもこのflow。Submit transaction内でnew Attempt/Taskは作らない。
 
 ## 7. Manual Retry eligibility
 
@@ -178,32 +179,57 @@ Reject:
 - Dynamic expansion failureでAttempt無し
 - activation/Input resolution等Pre-Attempt failure
 
-Attempt/Input無し:
+Attempt/Input無し=`retry_input_unavailable`, retryable=false。
 
-```text
-retry_input_unavailable
-retryable=false
-```
+## 8. Manual Retry on non-terminal Run
 
-## 8. Manual Retry reopen
+Runが既にnon-terminalならConcurrency holder状態は変更しない。
 
-Completed/failure Run:
+1 transactionで:
 
 1. eligibility/idempotency
-2. `run_attempt += 1`
-3. Run reopen
-4. target Jobへ§5 pending snapshot、`retry_not_before=NULL`
-5. blocked/skipped descendants activation再評価対象へ戻す
-6. whole-skipped Dynamic expansion rowは`05`規則でreset可能
-7. successful descendants `reuse_check_pending=1`
-8. successful Dynamic group/expanded rows `05` reuse check対象
-9. Event/Execution Log
+2. target Jobへ§5 pending snapshot、`retry_not_before=NULL`
+3. blocked/skipped descendantsをactivation再評価対象へ戻す
+4. successful descendants `reuse_check_pending=1`
+5. successful Dynamic group/expanded rowsを`05` reuse check対象
+6. Event/Execution Log/idempotency result
 
-Past Attempt/Output/Artifact/Event削除無し。
+Run `run_attempt` はincrementしない。これは同じRun attemptの途中で行うJob再試行である。
 
-Manual Retryはautomatic max-attempts budgetをリセットしない。New Attempt番号=existing max+1。その失敗後automatic Retry可否はactual attempt_noとmax-attempts比較。
+## 9. Completed failure Run reopen
 
-## 9. Target Retry固定値
+Completed `conclusion=failure` RunをManual Retryする場合は**同じWorkflow Runを新しいrun_attemptとしてreopen**する。
+
+Concurrencyを持たないRunはそのままreopen可能。
+
+Concurrencyを持つRunは`08`のWorkflow-scoped concurrency規則でslotを再取得する。同一transaction内でactive holderを再計算する。
+
+- capacityあり -> `status=running`, `wait_reason=NULL`
+- capacity無し + `on-limit=queue` -> `status=queued`, `wait_reason=concurrency`
+- capacity無し + `on-limit=reject` -> `concurrency_limit_reached` conflict。**何も変更せず**retry request失敗
+
+Reopenをcommitする場合、同じtransactionで:
+
+1. `run_attempt += 1`
+2. `conclusion=NULL`
+3. `completed_at=NULL`
+4. `failure_json=NULL`
+5. Workflow Output storage fieldsを全てNULLにして旧Workflow Outputをcurrent公開対象から外す
+6. `cancel_requested=0`, `pause_requested=0`
+7. target Jobへ§5 pending snapshot、`retry_not_before=NULL`
+8. blocked/skipped descendants activation再評価対象
+9. whole-skipped Dynamic expansionは`05`規則でreset可能
+10. successful descendants `reuse_check_pending=1`
+11. successful Dynamic expansionをreuse check対象
+12. Event/Execution Log/idempotency result
+
+`started_at`は最初のRun開始時刻として保持する。Past Attempt/Job Output/Artifact/Event/Logは削除しない。
+
+Concurrency queue中でもtarget pending snapshotは保持し、slot取得までnew Attemptを作らない。
+
+Manual Retryはautomatic `max-attempts` budgetをリセットしない。New Attempt番号=existing max+1。
+
+## 10. Target Retry固定値
 
 Target Retryで再評価しない:
 
@@ -217,7 +243,7 @@ Target Retryで再評価しない:
 
 Secret **value**だけAttemptごとcurrent SecretsProviderから再materialize。
 
-## 10. Descendant reactivation / reuse
+## 11. Descendant reactivation / reuse
 
 ### blocked/skipped Job
 
@@ -237,25 +263,45 @@ Secret **value**だけAttemptごとcurrent SecretsProviderから再materialize�
 - Definition/executor/Validator identity match
 - Payload/Artifact availability
 - stored Output validation re-pass
-- eligible
+- reuse eligible
 
 Mismatch -> `successful_job_result_not_reusable`, new Workflow Run必要。
 
 ### Dynamic expansion
 
-Committed `expanded` setは`05` expansion digest exact match必須。Mismatch=`dynamic_expansion_not_reusable`。Same Runでgenerated setを差し替えない。
+Committed `expanded` setは`05` expansion digest exact match必須。Mismatch=`dynamic_expansion_not_reusable`。
 
-## 11. Internal timeout
+## 12. Internal timeout
 
-1. timeout cancel
-2. grace default10秒
-3. terminate
-4. `job_timeout/retryable=true`
-5. Retry policy
+`timeout-minutes` deadline到達時点でAttemptはtimeout outcomeへ固定する。
+
+1. Runnerがdeadline到達を検知
+2. timeout-expired flagを立てる
+3. `cancel_requested(reason=timeout)`をAction Runnerへ送る
+4. grace default10秒は**cleanup猶予**として待つ
+5. Actionがgrace中にresultを返しても成功として採用しない
+6. 未終了ならterminate
+7. Attempt=`failure/job_timeout/retryable=true`
+8. Retry policy
+
+Deadline前にresult terminal commit済みならtimeoutは適用しない。
 
 External/Human/Reusableに`timeout-minutes`無し。
 
-## 12. Runner Lost / Runtime restart
+## 13. Cancel / result race
+
+Root Cancel transactionが`cancel_requested=1`をcommitした時点を境界とする。
+
+- Action result terminal commitがCancelより先 -> そのJob resultは成立。Cancelは残りのRunへ適用
+- Cancel commitが先 -> その後のrunning internal resultはcurrent successとして採用せずAttempt/Jobをcancelledへ収束
+- Cancel後new activation禁止
+- Runtime Handleのcleanup処理はAttempt terminal/fencingまで動作し得る
+
+External/Human late submitは既存規則どおりreject。
+
+Workflow最終conclusionはCancel requestが成立したRunでは`cancelled`。
+
+## 14. Runner Lost / Runtime restart
 
 Runner lost/old Runtime orphan running Attempt -> `runner_lost/retryable=true` terminal failure -> Retry policy。
 
@@ -274,7 +320,7 @@ Runtime起動:
 
 Completed RunはRecoveryのみでreopenしない。
 
-## 13. Pause
+## 15. Pause
 
 - running internal継続
 - new internal/external claim/Dynamic expansion禁止
@@ -282,8 +328,9 @@ Completed RunはRecoveryのみでreopenしない。
 - Lease expiry継続
 - due retry pending snapshotを保持、new AttemptはResume後
 - ready Job Input snapshotを再評価しない
+- paused RunはConcurrency holderを維持する
 
-## 14. Cancel
+## 16. Cancel
 
 - cancel_requested
 - queued/retry-wait/waiting executor cancel
@@ -291,10 +338,9 @@ Completed RunはRecoveryのみでreopenしない。
 - running internal cooperative cancel
 - Child cancel
 - new activation禁止
+- Concurrency holder解放後waiting Runをwake
 
-Workflow conclusion=cancelled。
-
-## 15. External / Human
+## 17. External / Human
 
 Lease requeue=same AttemptでRetryではない。
 
@@ -302,24 +348,31 @@ Lease fail=Attempt failure -> Retry policy。
 
 Human reject=retryable false defaultだがYAML retry.ifで明示Automatic Retry可能。Retry時はnew Review。
 
-## 16. Recovery idempotency
+## 18. Recovery idempotency
 
 Repeated RecoveryでAttempt/Task/Lease/Review/Dynamic/Child/retry schedule/reuse resultを重複生成しない。
 
-## 17. 受入条件
+Reopened Runが`wait_reason=concurrency`なら通常のConcurrency waitingとして復元し、pending Job Inputは再評価しない。
 
-1. retry absent/default/backoff
+## 19. 受入条件
+
+1. retry absent/default/backoff + `now >= retry_not_before`
 2. core retryable map/parent override
 3. pending snapshot exact copy all executors
 4. no new Attempt at retry scheduling/request
 5. due executor-specific Attempt creation
 6. External validation failure follows scheduler retry flow
 7. Manual Retry Input/version eligibility
-8. Manual run_attempt/attempt numbering
-9. Target no with/item/version re-eval
-10. Secret value re-materializes but binding fixed
-11. descendant blocked/skipped reactivation
-12. successful Job current-context reuse
-13. Dynamic expansion strict reuse
-14. timeout/runner_lost
-15. pause/cancel/recovery idempotency
+8. non-terminal Run retry does not increment run_attempt
+9. completed Run retry increments run_attempt
+10. completed Run concurrency reacquire queue/reject/available
+11. reject leaves Run unchanged
+12. reopen clears conclusion/completed/failure/current Workflow Output
+13. target no with/item/version re-eval
+14. Secret value re-materializes but binding fixed
+15. descendant blocked/skipped reactivation
+16. successful Job current-context reuse
+17. Dynamic expansion strict reuse
+18. timeout result-after-deadline discarded
+19. cancel/result commit ordering
+20. runner_lost/pause/cancel/recovery idempotency
