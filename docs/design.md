@@ -1,6 +1,6 @@
 # JobRunner 基本設計
 
-- Status: Draft v0.3
+- Status: Draft v0.4
 - 対象: MVP
 - WebUI: 画面設計のみ後続
 - 用語: GitHub Actions に対応概念がある場合は可能な限り合わせる
@@ -142,6 +142,8 @@ Runner ↔ Action RunnerはJSON Lines v1。stdout/stderrはprotocolと分離し�
 
 Action ProcessはCore DBを直接触らない。
 
+Parent正常shutdownはWorkflow cancelではない。未完了running Attemptは次回Runtime起動時に旧Runtimeのorphanとして通常 `runner_lost` Recoveryへ流す。
+
 ## 9. Timeout
 
 Hidden default timeoutなし。
@@ -198,9 +200,12 @@ Nested Dynamicでは `foreach.parent` も暗黙required dependencyとしてhelpe
 
 Effective success:
 
-- success
-- skipped
-- failure + `continue-on-error=true`
+- `success`
+- `failure` + `continue-on-error=true`
+
+**通常Jobの`skipped`はeffective successではない。** そのJobに依存する後段Jobは明示条件が無ければ既定でskipする。
+
+Dynamic template groupは個別generated Jobのskipをgroup集約した結果として `success` になり得る。
 
 `failure()/cancelled()/always()`も同じdependency setで評価する。
 
@@ -307,7 +312,15 @@ Execution Log本文はfile、Event Logはappend-only DB。
 
 Attempt temp directoryは終了時削除。Security sandboxではない。
 
-## 19. Persistence
+## 19. SecretGuard
+
+Current internal Attemptでmaterializeした既知Secret値は永続化前に検査する。
+
+- Output / State / Artifact metadata / Event / error details: exact substring検出時は `secret_value_persistence_blocked` でfail-closed
+- stdout/stderr/log: `[REDACTED]` へ置換
+- Base64/hash/分割等の変形Secretは完全検出を保証しない
+
+## 20. Persistence
 
 標準SQLite専用DB、WAL/FK/busy timeout。
 
@@ -322,7 +335,7 @@ Attempt temp directoryは終了時削除。Security sandboxではない。
 - state current + history atomic
 - Workflow concurrency start/release atomic
 
-## 20. Idempotency
+## 21. Idempotency
 
 state-changing operationはoptional `request_id`。
 
@@ -339,7 +352,7 @@ Default TTL 24h。
 
 TTL内same hashはreplay、different hashはconflict。TTL後はexpired DB rowが残っていてもtransaction内で置換してsame keyを新requestとして再利用可能。
 
-## 21. Authorization / Secrets
+## 22. Authorization / Security
 
 認証は親責任。Coreは全public read/writeでAuthorizationProviderを通す。Default AllowAll。
 
@@ -347,7 +360,7 @@ SecretsはDB/Event/Execution Logへ平文保存しない。Action Runnerへ必�
 
 Core標準で任意shell/source実行や本格sandboxを提供しない。
 
-## 22. Service / MCP
+## 23. Service / MCP
 
 Web/MCP/Pythonは同じService layer。
 
@@ -356,8 +369,6 @@ MCP public name:
 ```text
 <namespace>_wf_*
 ```
-
-例: `novel_wf_start`, `fx_wf_start`。
 
 主要操作:
 
@@ -372,7 +383,7 @@ wf_runner_info
 
 Child direct controlは禁止。
 
-## 23. Retention / Scheduler / CLI / WebUI
+## 24. Retention / Scheduler / CLI / WebUI
 
 Retention既定無期限。
 
@@ -380,6 +391,6 @@ Scheduler/Cron/CLIはMVPなし。
 
 WebUI画面設計は後続。ただしService/HTTP Adapter境界は最初から持つ。
 
-## 24. 詳細設計
+## 25. 詳細設計
 
 `docs/detailed-design/01`〜`13` を実装時Source of Truthとする。基本設計と詳細設計が衝突する場合は、より具体的な最新詳細設計を優先し、基本設計も同時に同期修正する。
