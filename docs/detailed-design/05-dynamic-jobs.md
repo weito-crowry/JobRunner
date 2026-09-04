@@ -1,6 +1,6 @@
 # 05. Dynamic Jobs 詳細設計
 
-- Status: Draft v1.3
+- Status: Draft v1.4
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `02`, `03`, `08`, `10`
@@ -274,16 +274,37 @@ Criterion=stringまたはfinite number、criterion内同型。null/bool/object/a
 
 Sort criteria left-to-right、tie=source_order ASC。`order_rank=0..N-1` snapshot。
 
-Runner ordering=Workflow priority -> Job priority -> order_rank -> source_order -> ready_at -> id。
+Internal/External schedulerでのexact comparatorは`03`。`order_rank=NULL`のStatic Jobはscheduler上0として扱う。
+
+Job/Task opaque IDは同一DB state内の最終stable tie-breakでありcross-run deterministic orderを意味しない。
 
 ## 16. Template group status / conclusion
 
 Template groupは仮想viewとして導出する。
 
-Status:
+Status enum:
 
-- expansion未確定/non-terminal generatedあり -> running
-- 全expansion確定 + generated全terminal -> completed
+```text
+queued|running|completed
+```
+
+### `queued`
+
+- group conclusion未確定
+- expansion instanceがまだ1件も作成されていない
+- required dependency/parentが未terminalで、現時点でexpansionを評価できない
+
+### `running`
+
+- 1件以上のexpansion instanceが存在し未terminal、または
+- generated concrete Jobにnon-terminalが存在する、または
+- dependency terminal後でexpansion評価/commit待ち
+
+### `completed`
+
+- 必要なexpansion instanceが全てterminal
+- generated concrete Jobも全てterminal
+- group conclusion確定
 
 Conclusion priority:
 
@@ -392,24 +413,25 @@ dynamic_expansion_not_reusable
 ## 24. 受入条件
 
 1. Dynamic template has no job_runs/Attempt/Retry target
-2. Root/Nested/3+ depth
-3. parent cycle/zero-parent
-4. parent別same raw key/full key
-5. index fallback key exact + one warning Event/expansion
-6. explicit key no fallback Event
-7. generated max from Run snapshot, template groups excluded
-8. System setting change after Run start does not change limit
-9. 1000/1001 rollback
-10. internal-only Runner Pool preflight
-11. Action/Validator preflight
-12. atomic expansion/recovery
-13. order schema/stable tie
-14. if=false skipped vs foreach=[] success
-15. group precedence
-16. expansion_digest golden
-17. Manual Retry exact expansion reuse
-18. changed source/key/order/item -> new Run
-19. whole skipped group re-evaluate only
-20. mixed group no partial re-expansion
-21. full-key aggregation
-22. Generated Retry snapshot fixed
+2. group status queued/running/completed
+3. Root/Nested/3+ depth
+4. parent cycle/zero-parent
+5. parent別same raw key/full key
+6. index fallback key exact + one warning Event/expansion
+7. explicit key no fallback Event
+8. generated max from Run snapshot, template groups excluded
+9. System setting change after Run start does not change limit
+10. 1000/1001 rollback
+11. internal-only Runner Pool preflight
+12. Action/Validator preflight
+13. atomic expansion/recovery
+14. order schema/stable tie
+15. if=false skipped vs foreach=[] success
+16. group precedence
+17. expansion_digest golden
+18. Manual Retry exact expansion reuse
+19. changed source/key/order/item -> new Run
+20. whole skipped group re-evaluate only
+21. mixed group no partial re-expansion
+22. full-key aggregation
+23. Generated Retry snapshot fixed
