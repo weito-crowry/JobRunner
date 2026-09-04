@@ -1,26 +1,29 @@
 # 06. Reusable Workflows 詳細設計
 
-- Status: Draft v0.4
+- Status: Draft v0.5
 - 対象: MVP
 - 上位仕様: `docs/design.md`
-- 関連: `01`, `02`, `03`, `05`, `08`, `10`
+- 関連: `01`, `02`, `03`, `05`, `08`, `09`, `10`
 
 ## 1. 目的
 
-Reusable Workflow の参照、親子Workflow Run、Input/Output、Definition binding、Action/Validator version、Retry/Cancel/Recoveryを定義する。
+Reusable Workflow の参照、親子Workflow Run、Input/Output/ArtifactRef data flow、Definition binding、Action/Validator version、Retry/Cancel/Recoveryを定義する。
 
 ## 2. 基本原則
 
 1. 親から見るReusable Workflowは1 Job。
 2. 子は独立Workflow Run。
 3. 親子mutable stateは共有しない。
-4. Input/Output/Artifactのみ明示mapping。
-5. Child Definitionもsnapshotする。
-6. cycleは禁止。固定depth limitは置かない。
-7. Parent Job Retryでは最初に確定したChild bindingを再利用する。
-8. BindingはChildのAction versionだけでなくValidator versionも固定する。
+4. 親子data flowはInput/Outputへ明示mappingする。
+5. Artifact実体を暗黙共有せず、必要ならArtifactRefをInput/Output値として明示的に渡す。
+6. Child Definitionもsnapshotする。
+7. cycleは禁止。固定depth limitは置かない。
+8. Parent Job Retryでは最初に確定したChild bindingを再利用する。
+9. BindingはChild Action/Validator versionを固定する。
 
 ## 3. YAML
+
+通常Input:
 
 ```yaml
 jobs:
@@ -28,6 +31,17 @@ jobs:
     uses: ./common/analyze.yml
     with:
       document_id: ${{ inputs.document_id }}
+```
+
+ArtifactRefを明示渡し:
+
+```yaml
+jobs:
+  analyze:
+    needs: [export]
+    uses: ./common/analyze.yml
+    with:
+      source_artifact: ${{ needs.export.artifacts.dataset }}
 ```
 
 `uses` Jobでは `action/validator/executor/runs-on/success_if/external/timeout-minutes` 禁止。
@@ -125,21 +139,49 @@ reusable_binding_id
 
 Rootはparent null, root=self, depth=0。
 
-## 8. Input / State / Actor
+## 8. Input / ArtifactRef / State / Actor
 
 `with`をChild Input Schemaで検証。Secret参照は禁止。
 
+ArtifactRefは`02/09`のcanonical JSON objectとして通常Inputと同じ`with`で渡す。別のArtifact専用port/暗黙mountはMVPに作らない。
+
+Cross-run Managed ArtifactをChild Actionがmaterializeする場合:
+
+- ArtifactRefがChild persistent Job Inputへ明示的に流れていること
+- `09`のsource Artifact authorization/data availabilityを満たすこと
+
+を要求する。
+
 Child state独立。親state直接read/write禁止。
 
-ActorContext/AccessScopeは親から継承し権限拡大禁止。
+ActorContext/AccessScopeは親から継承し権限拡大禁止。この継承Actor/Scopeでcross-run Artifact readもauthorizeする。
 
-## 9. Workflow Output
+## 9. Workflow Output / Child -> Parent data flow
 
 Childトップレベル`outputs`をsuccess確定直前に評価し、JSON objectとしてParent Job Outputへ公開。
 
+Artifactを親へ返したい場合、Child top-level Output fieldへArtifactRefを明示する。
+
+例:
+
+```yaml
+outputs:
+  report_artifact: ${{ jobs.report.artifacts.report }}
+```
+
+Parent側:
+
+```text
+needs.analyze.outputs.report_artifact
+```
+
+としてArtifactRefを参照できる。
+
+**Child ArtifactをParent Jobの `needs.analyze.artifacts` へ自動mirrorしない。** 親子間Artifact data flowもOutput mappingで明示する。
+
 失敗 `workflow_output_invalid`。
 
-PayloadStore inline/spill規則は通常Workflowと同じ。
+PayloadStore inline/spill規則は通常Workflowと同じ。ArtifactRef実体をPayloadへコピーするのではなくref JSONだけをOutputに保持する。
 
 ## 10. Conclusion propagation
 
@@ -171,6 +213,8 @@ validator_version_mismatch
 
 いずれもretryable=false。新Child Definition/Validatorへ自動upgradeしない。
 
+ArtifactRefを含むParent persistent Inputもexact copyするため、Retryで参照Artifactを別generationへ勝手に差し替えない。
+
 ## 12. Result Reuse identity
 
 Reusable Parent Jobのexecutor identityは:
@@ -181,7 +225,9 @@ child_action_versions_json
 child_validator_versions_json
 ```
 
-を含む。Child Validator version変更を古い成功結果のsame-run reuseから隠さない。
+を含む。
+
+Parent persistent Inputに明示されたArtifactRefはInput digestへ含まれる。
 
 ## 13. Cancel / Pause
 
@@ -243,6 +289,8 @@ child_workflow_failed
 workflow_output_invalid
 action_version_mismatch
 validator_version_mismatch
+artifact_access_forbidden
+artifact_data_unavailable
 child_run_direct_control_forbidden
 ```
 
@@ -254,9 +302,13 @@ child_run_direct_control_forbidden
 4. registered ID
 5. binding Action+Validator versions snapshot
 6. Retry same binding / missing version fail-closed
-7. Reuse identity includes Child validator versions
-8. Child state isolation
-9. cycle
-10. direct Child control reject
-11. Dynamic+Reusable
-12. restart duplicate防止
+7. Child state isolation
+8. parent->child ArtifactRef via `with`
+9. child->parent ArtifactRef via Workflow Output
+10. no automatic Child artifact mirror
+11. cross-run Artifact materialize authorization
+12. ArtifactRef fixed on Retry
+13. cycle
+14. direct Child control reject
+15. Dynamic+Reusable
+16. restart duplicate防止
