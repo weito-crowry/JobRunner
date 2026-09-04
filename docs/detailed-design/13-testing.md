@@ -1,19 +1,19 @@
 # 13. Testing 詳細設計
 
-- Status: Draft v0.3
+- Status: Draft v0.4
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`〜`12`
 
 ## 1. 基本原則
 
-1. 状態遷移はintegration testを必須にする。
-2. SQLite concurrency/transactionは実DBで検証。
-3. Runner/Action Runnerは実Process E2Eを持つ。
+1. 状態遷移はintegration test必須。
+2. SQLite concurrency/transactionは実DB。
+3. Runner/Action Runnerは実Process E2E。
 4. External/Human/Retry/Recoveryはnegative case必須。
 5. Definition/Expressionはtable-driven。
 6. 時刻依存はClock abstraction。
-7. 競合testはbarrier/hookを使いrandom sleepへ依存しない。
+7. 競合testはbarrier/hookを使う。
 
 ## 2. Test layers
 
@@ -23,7 +23,7 @@ Integration
 Process Integration
 Adapter Contract
 End-to-End
-Recovery/Failure Injection
+Recovery / Failure Injection
 ```
 
 ## 3. Definition / Expression
@@ -33,7 +33,7 @@ Recovery/Failure Injection
 - duplicate YAML key / merge key / custom tag
 - unknown key
 - bad Job ID / missing needs / DAG cycle
-- **Dynamic foreach.parentを含むcycle**
+- Dynamic `foreach.parent`を含むcycle
 - executor field conflict
 - envでSecret参照
 - external/human/reusableでSecret参照
@@ -43,11 +43,12 @@ Recovery/Failure Injection
 
 Condition helper:
 
-- success/failure/cancelled/always
-- continue-on-error effective success
-- skipped dependency
+- `success/failure/cancelled/always`
+- continue-on-error failureはeffective success
+- **通常Job skippedはeffective successではなく後段default skip**
+- Dynamic group内skippedはgroup集約規則を通す
 - explicit if false
-- **Nested Dynamic parent + declared needsのcondition dependency set**
+- Nested Dynamic parent + declared needs
 
 ## 4. Input / Output / Secret
 
@@ -58,15 +59,28 @@ Condition helper:
 - Secret非永続化
 - Output schema
 - NaN/Infinity
-- 4MiB default limit / override
+- 4MiB default limit/override
+
+### SecretGuard regression
+
+current Attemptへ注入したSecret値について:
+
+- Outputのstring全体一致 -> reject
+- Output文字列の部分一致 -> reject
+- nested object/list内 -> reject
+- `state.set` -> reject
+- Artifact URI/metadata -> reject
+- Event/error details -> reject
+- stdout/stderr/log -> `[REDACTED]`
+- Base64等に変形された値は保証対象外
 
 ## 5. Scheduling
 
 - Workflow priority
 - Job priority
-- Dynamic order_rank/source_order
+- Dynamic order/source
 - pool routing
-- one internal running per Workflow Run
+- one internal running / Workflow Run
 - multiple Workflow Runs parallel
 - pause/resume
 - priority update non-preemptive
@@ -76,30 +90,30 @@ Internal claim競合はexactly one。
 ## 6. Runner / IPC
 
 - start/ready/log/progress/step/result/error
-- malformed JSON / protocol mismatch
+- malformed JSON/protocol mismatch
 - stdout/stderr capture
-- action exception/crash/hang
+- Action exception/crash/hang
 - heartbeat継続
 - main-loop stall detection
 - old runner fencing
 - restart suppression
+- Parent shutdownとWorkflow cancelの区別
+- Parent restartでold running Attempt -> runner_lost Recovery
 
 ## 7. Timeout
 
 - internal no-timeout long action success
 - internal timeout -> cancel -> child terminate -> `job_timeout`
 - timeout後Retry
-- **external/human/reusable timeout definition reject**
+- external/human/reusable timeout definition reject
 
 ## 8. Dynamic Jobs
-
-必須:
 
 - 0/1/N
 - stable key/index fallback
 - parent別同raw key非衝突
-- special char percent encoding
-- **full logical job_keyに固定長上限無し**
+- percent encoding
+- full logical job_keyに固定長上限無し
 - 1000 allowed / 1001 rollback
 - nested 2/3段以上
 - arbitrary-depth representative
@@ -107,7 +121,7 @@ Internal claim競合はexactly one。
 - parent+needs helper
 - order_by type/order
 - atomic expansion crash/restart
-- group status `running/completed`
+- group status running/completed
 - group conclusion success/failure/blocked/cancelled
 - full-key Output/Artifact lookup
 
@@ -118,10 +132,10 @@ Internal claim競合はexactly one。
 - root traversal/symlink escape
 - non-filesystem caller relative reject
 - binding固定
-- source変更後Retryでsame binding
+- source変更後Retry same binding
 - parent-child output/state isolation
 - direct/indirect cycle
-- direct child control reject
+- direct Child control reject
 - Dynamic + Reusable
 - restart duplicate防止
 
@@ -129,7 +143,7 @@ Internal claim競合はexactly one。
 
 - activation one Attempt/Task
 - concurrent claim exactly one
-- **candidate ordering = Workflow priority -> Job priority -> dynamic order -> source -> ready -> id**
+- candidate ordering = Workflow priority -> Job priority -> dynamic order -> source -> ready -> id
 - claim_next同一selection
 - lease expiry requeue same Attempt
 - lease expiry fail -> Retry
@@ -156,7 +170,6 @@ Internal claim競合はexactly one。
 - success/cancelled Run retry reject
 - blocked descendants再評価
 - terminal RunはRecoveryだけでreopenしない
-- running internal runner_lost
 - retry backoff restart
 - Dynamic/Child duplicate無し
 
@@ -165,29 +178,28 @@ Internal claim競合はexactly one。
 - fresh/incremental migration
 - WAL/FK/busy timeout
 - internal running partial unique
-- Dynamic expansion partial unique
+- Dynamic expansion unique
+- no logical job_key length CHECK
 - Reusable uniqueness
 - External active lease unique
 - Human one review/Attempt
 - state current+history atomic
 - concurrency race
-- no fixed DB length check for logical job_key
 
 ## 14. Idempotency
 
-対象operationごとに:
-
 - same Actor/AccessScope + same key/hash -> replay
 - same scope + same key/different hash -> conflict
-- **different Actorはsame keyでも独立**
-- **different AccessScopeはsame keyでも独立**
+- different Actorはsame keyでも独立
+- different AccessScopeはsame keyでも独立
 - concurrent same key -> single side effect
-- TTL expiry後、expired rowがDBに残ったままsame keyを新requestとして再利用
+- TTL expiry後、expired row残存状態でsame keyを新requestとして再利用
+- `task_claim` replayは新Lease/別Taskを追加しない
 
 ## 15. Authorization / Security
 
 - AllowAll/Deny
-- list/read/write全public operationがauthorize通過
+- list/read/write全public operation authorize
 - filtered AccessScope
 - log path traversal reject
 - Artifact URI auto-fetch無し
@@ -195,9 +207,9 @@ Internal claim競合はexactly one。
 
 ## 16. Platform / CI
 
-少なくともWindows 11 / Linux。
+Windows 11 / Linux。
 
-CI推奨:
+推奨:
 
 ```text
 lint/typecheck
@@ -209,20 +221,18 @@ recovery
 platform-matrix
 ```
 
-1000 Dynamic Jobs等の重いstressはPR/nightly分離可。
-
 ## 17. MVP completion gate
 
-1. `01`〜`12`の受入条件に対応test
+1. `01`〜`12`受入条件対応test
 2. migration pass
 3. Windows/Linux process integration
 4. concurrent claim
 5. restart recovery
 6. External/Human E2E
-7. Dynamic 1000 + nested + atomic rollback
+7. Dynamic 1000 + nested + rollback
 8. Reusable nested/cycle/binding
-9. Secret non-persistence
+9. SecretGuard/non-persistence
 10. idempotency scope/TTL
 11. adapter contract
 
-WebUI E2EはWebUI詳細設計後に追加する。
+WebUI E2EはWebUI詳細設計後。
