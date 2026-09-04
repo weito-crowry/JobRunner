@@ -1,9 +1,9 @@
 # 04. Runner / IPC 詳細設計
 
-- Status: Draft v0.6
+- Status: Draft v0.7
 - 対象: MVP
 - 上位仕様: `docs/design.md`
-- 関連: `01`, `02`, `03`, `08`, `09`, `10`, `12`
+- 関連: `02`, `03`, `08`, `09`, `10`, `12`
 
 ## 1. 目的
 
@@ -99,8 +99,6 @@ sync/async対応。
 
 ### 6.1 Structured `ActionFailure`
 
-親ActionはJobRunner提供exceptionで明示failureを返せる。
-
 ```python
 raise ActionFailure(
     code="rate_limited",
@@ -120,17 +118,7 @@ details: JSON-compatible optional
 category = action
 ```
 
-Common Action Runnerはこれをstructured `error` messageへ変換する。
-
-通常の未処理exception:
-
-```text
-category=execution
-code=action_exception
-retryable=false
-```
-
-TracebackはExecution Logへ記録できるが、public errorへ無制限に露出しない。
+通常未処理exception=`action_exception`, retryable=false。
 
 ## 7. IPC v1 transport
 
@@ -142,14 +130,7 @@ UTF-8
 protocol=jobrunner.action-ipc.v1
 ```
 
-全message:
-
-```text
-protocol
-type
-payload
-request_id optional
-```
+全message=`protocol/type/payload/request_id optional`。
 
 Malformed/unknown protocol/type -> `ipc_protocol_error`。
 
@@ -212,7 +193,7 @@ Managed Artifact:
 
 ```text
 artifact_put_file(name, relative_work_path,...)
-artifact_materialize(artifact_id)
+artifact_materialize(artifact_ref)
 ```
 
 External Artifact:
@@ -221,9 +202,25 @@ External Artifact:
 artifact_register_external(name, uri,...)
 ```
 
-State/Artifact変更はRunnerService transaction。Path規則は`09/12`。
+State/Artifact変更はRunnerService transaction。Path規則・ArtifactRef shape・cross-run authorizationは`09`。
 
-`state_get`やInput外Artifact materializeはResult Reuse eligibilityへ記録する。
+### 10.1 `artifact_materialize`
+
+Runnerは受け取ったArtifactRefを`artifact_id`でDB再解決し、caller supplied metadataを信頼しない。
+
+許可:
+
+- same Workflow Run owned Managed Artifact、または
+- different Workflow Runだがcanonical ArtifactRefがcurrent persistent Job Input内に明示存在し、AuthorizationProviderがsource Artifact readを許可
+
+拒否:
+
+- raw/forged cross-run artifact_idのみ
+- deleted/retained-away Managed data
+- External Reference Artifact
+- current work_dir外destination
+
+Runtime中にpersistent Input外Artifactをmaterializeした場合はResult Reuse eligibility=falseとして記録する。
 
 ## 11. Large Action Result protocol
 
@@ -293,6 +290,8 @@ result_file_invalid
 output_validation_failed
 secret_value_persistence_blocked
 payload_storage_failed
+artifact_access_forbidden
+artifact_data_unavailable
 ```
 
 ## 15. Internal Job timeout
@@ -336,13 +335,14 @@ CPU/RAM/GPU quota、本格sandbox、arbitrary shellはCore MVP無し。
 4. atomic claim
 5. Windows spawn/bootstrap
 6. ActionFailure structured propagation
-7. unhandled exception retryable=false
-8. stdout/protocol分離
-9. Runtime Handle correlation/cancel
-10. managed Artifact/state proxy
-11. large JSON result file
-12. Custom Validator internal path
-13. result path/digest reject
-14. timeout/cancel
-15. Parent restart runner_lost
-16. old Runner fencing/restart suppression
+7. stdout/protocol分離
+8. Runtime Handle correlation/cancel
+9. same-run Artifact materialize
+10. explicit cross-run Input Artifact materialize + authorization
+11. raw cross-run ID / External materialize reject
+12. large JSON result file
+13. Custom Validator internal path
+14. result path/digest reject
+15. timeout/cancel
+16. Parent restart runner_lost
+17. old Runner fencing/restart suppression
