@@ -1,6 +1,6 @@
 # 08. Persistence 詳細設計
 
-- Status: Draft v0.9
+- Status: Draft v1.0
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - Canonical JSON: `01-workflow-definition.md` の `jobrunner.canonical-json.v1`
@@ -271,11 +271,22 @@ Managed put=temp copy/Secret scan/digest/atomic finalize/metadata Event。DB fai
 
 ## 18. Event persistence / retention audit
 
-通常Eventは`workflow_run_id`等をnullable参照として持つが、Run row削除後もRetention実施事実を残すため、**system-level retention audit Eventはworkflow_run_id=NULL** としpayloadへdeleted resource type/opaque ID/countを記録する。
+通常Eventは`workflow_run_id`等をnullable参照として持つ。
 
-Run削除前にsystem-level `retention_deleted` Eventをcommitし、対象RunにFK依存させない。
+Run row削除後もRetention実施事実を残すため、**system-level retention audit Event**は:
 
-SecretGuard対象。
+- `workflow_run_id=NULL`
+- `job_run_id/attempt_id=NULL`
+- payloadへdeleted resource type / opaque ID / workflow_id copy / count / policy key / cutoffを記録
+- 対象Run等へのFKを持たない
+- Run/Artifact/Event等の実削除前または同logical operationでcommit
+- SecretGuard対象
+
+Event typeは `retention_deleted` / `retention_orphan_cleaned` を使用する。
+
+**このsystem-level retention audit Eventは通常の `event-days` Retention対象から除外し、MVPでは無期限保持する。** 通常Workflow Eventのみ`event-days`で削除可能。
+
+Repeated sweepで同じresource削除を二重auditしないようRepositoryはlogical deletion marker/current existenceを条件にする。
 
 ## 19. External / Human uniqueness
 
@@ -310,13 +321,17 @@ Policy source=`workflow_runs.retention_policy_json`。
 
 - Run age base: `completed_at`; non-terminal Runはrun-history retention削除対象外
 - Execution Log age base: Attempt `completed_at`; running Attempt logは削除しない
-- Event age base: Event `created_at`
-- Artifact metadata/data age base: Artifact `created_at`
+- Event age base: Event `created_at`; system-level retention audit Eventは除外
+- Artifact metadata/data age base: Artifact `created_at`; owner Run non-terminal中は削除しない
 - Managed Artifact dataをmetadataより先にdelete可。`data_deleted_at`記録
 - External Artifact dataはCore delete無し
 - Output PayloadはRun/Attempt履歴所有物としてrun-history deletion時にdelete
 
 Run history deletionはowned FK rowsが残らないよう依存順に処理する。Component policyが長くてもrun-history expiryが上限。
+
+Artifact metadata削除時にManaged dataが残る状態を作らない。必要ならdata deleteを先行する。
+
+Orphan temp/blob/store objectはconsistency cleanupとして削除可能で、system-level `retention_orphan_cleaned` audit Eventを残す。
 
 ## 24. 受入条件
 
@@ -325,12 +340,12 @@ Run history deletionはowned FK rowsが残らないよう依存順に処理す�
 3. retention_policy snapshot
 4. non-terminal Run retention safety
 5. component retention age bases
-6. system-level retention audit survives Run delete
+6. system-level retention audit survives Run delete and event-days sweep
 7. Action/Validator snapshot/reuse
 8. signed64/string/source identity
 9. concurrency/FK semantics
 10. deadline indexes
-11. Artifact orphan cleanup
+11. Artifact orphan cleanup audit
 12. Retry Input/version
 13. uniqueness constraints
 14. idempotency original HTTP status metadata
