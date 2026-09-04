@@ -1,6 +1,6 @@
 # 04. Runner / IPC 詳細設計
 
-- Status: Draft v1.8
+- Status: Draft v1.9
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `02`, `03`, `08`, `09`, `10`, `12`
@@ -133,7 +133,9 @@ runner_count integer>=1
 restart_policy.mode on_failure|never
 restart_policy.max_restarts integer>=0
 restart_policy.window_seconds finite>0
-restart backoff initial>=0,max>=initial,multiplier>=1 finite
+restart_policy.backoff.initial_seconds finite>=0
+restart_policy.backoff.max_seconds finite>=initial
+restart_policy.backoff.multiplier finite>=1
 heartbeat_interval_seconds finite>0
 runner_lost_after_seconds finite>0
 main_loop_stale_after_seconds finite>0
@@ -165,6 +167,10 @@ pool_name
 pid
 ```
 
+- `runner_id`=Pool内の論理slot。Parent Runtime存続中は同じslotをrestart後も再利用
+- `runner_instance_id`=各OS Process instanceごとに新規発行
+- `runtime_instance_id`=Parent Runtime起動ごとに新規発行
+
 Status=`starting|idle|claiming|running|stopping|stopped|lost|restart_suppressed`。
 
 Parent lifecycle pipe EOFでnew claim停止。旧Runtime/instance updateはfencing reject。
@@ -173,12 +179,31 @@ Parent lifecycle pipe EOFでnew claim停止。旧Runtime/instance updateはfenci
 
 Main loopはbounded cycleごとmonotonic tick更新。Heartbeat Threadはtick fresh時だけheartbeat更新。Heavy Actionは別Processなのでheartbeatを止めない。
 
+Supervisor scanは`heartbeat_interval_seconds`以下の間隔で行う。
+
+Canonical liveness:
+
+```text
+last_heartbeat_at non-NULL:
+  now - last_heartbeat_at > runner_lost_after_seconds -> lost candidate
+
+last_heartbeat_at NULL:
+  now - started_at > runner_lost_after_seconds -> startup_lost candidate
+```
+
+つまりRunnerが起動途中で固まり**一度もheartbeatを出さない場合もlost判定できる**。`started_at`はOS Process spawn成功後、instance row作成時のcanonical timestamp。
+
+`main_loop_tick_at`はheartbeat Threadが更新可否を判断する内部freshness情報。Main loop tickが`main_loop_stale_after_seconds`より古い場合、Heartbeat Threadは新しいheartbeatを書かず、最終的に上記lost判定へ到達させる。
+
 Supervisor:
 
-- OS exit即時検知
-- heartbeat interval以下でscan
-- `now-last_heartbeat > lost_after` + current instance一致でlost候補
-- Attempt ownership再確認後`runner_lost` exactly once
+1. OS process exitはscan待ちせず可能な限り即時検知
+2. liveness threshold到達時はcurrent `runtime_instance_id/runner_instance_id`を再確認
+3. current Attempt ownershipを再確認
+4. まだalive processが残るlost判定ではterminate/reapを試行
+5. Attempt ownershipがあれば`runner_lost`をexactly once terminalizeし`10` Retryへ
+6. Runner instanceを`lost`または`stopped`へ確定
+7. §22 restart policyを適用
 
 ## 7. Atomic claim
 
@@ -539,11 +564,110 @@ Deadline到達時点でtimeout outcomeが成立する。
 
 Graceは成功猶予ではない。**Deadline前にAttempt terminal success commit済みならtimeout処理しない。** Resultをdeadline前に受け取っただけでは不十分で、terminal commitがdeadline後ならtimeoutを優先する。
 
-## 22. Parent shutdown / restart
+## 22. Parent shutdown / Runner restart policy
 
-Parent正常shutdown=New claim停止/bounded reap/cancel_requested無し。未完了Attemptは次起動runner_lost Recovery。
+### 22.1 Parent正常shutdown
 
-Restart policy=`never|on_failure`, default on_failure。Window max5/300s、backoff1..30x2 default。Crash loop -> restart_suppressed。
+Parent正常shutdownでは:
+
+1. Scheduling/new claim停止
+2. Runnerへ`stopping`通知/lifecycle pipe close
+3. bounded reap
+4. `cancel_requested`をWorkflowへ自動設定しない
+5. 正常に終了したRunnerは`stopped`
+6. shutdown開始後の意図したRunner終了にはautomatic restartを掛けない
+
+未完了internal Attemptは次Parent起動時に`runner_lost` Recoveryへ収束する。Parent restartでは新しい`runtime_instance_id`となり、前Runtimeのrestart budgetを継承しない。
+
+### 22.2 Failure classification
+
+Runner logical slotについて以下を**failure**としてrestart policy対象にする:
+
+- OS process unexpected exit
+- non-zero exit
+- `starting/idle/claiming/running`中のliveness lost
+- first heartbeat前のstartup lost
+- Supervisorがmain-loop stale経由でlost確定した場合
+
+以下はfailure restart対象外:
+
+- Parent正常shutdownに伴う停止
+- Supervisorが明示的に`stopping`へ移したplanned stop
+- Parent Runtime自体の終了後に観測された旧instance
+
+Exit code 0でもplanned stopでなければunexpected exitとしてfailure扱いする。
+
+### 22.3 Restart mode
+
+`restart_policy.mode=never`:
+
+- failure確定後automatic restartしない
+- logical slotを`restart_suppressed`として可視化
+- `runner_restarts`へ`suppressed=1, reason=policy_never`記録
+
+`restart_policy.mode=on_failure`:
+
+- §22.2 failure時のみautomatic restart候補
+- planned stop/normal shutdownではrestartしない
+
+### 22.4 Rolling restart window
+
+Budgetは同じ:
+
+```text
+runtime_instance_id + pool_name + runner_id
+```
+
+のlogical slot単位。
+
+Failure時刻を`now`とし、`runner_restarts.created_at > now - window_seconds` の**過去のautomatic restart launch/suppression判定記録**をwindow内履歴として扱う。
+
+`max_restarts`はそのwindow内で許すautomatic restart **launch回数**。
+
+- `max_restarts=0` -> 最初のfailureからrestartせずsuppressed
+- window内の既存`suppressed=0` restart launch数 `< max_restarts` -> 次restart可
+- 既存launch数 `>= max_restarts` -> restartせず`suppressed=1, reason=restart_limit_exceeded`
+- 古いrestart recordがrolling window外へ出れば自然にbudgetが回復する
+- stable uptimeによる別のmanual reset counterは持たない
+
+Parent Runtime再起動はruntime_instance_idが変わるため新budgetとなる。
+
+### 22.5 Restart ordinal / backoff
+
+Restartを許可する場合、window内の既存successful launch record数を`k`として:
+
+```text
+restart_ordinal = k + 1
+raw_delay = initial_seconds * multiplier ** (restart_ordinal - 1)
+delay = min(max_seconds, raw_delay)
+scheduled_for = now + delay
+```
+
+Retry backoffと同様、overflow-safe saturating calculationを使いNaN/Infinity/OverflowErrorを出さない。
+
+`runner_restarts` rowを先に作り、`scheduled_for`を保存する。Delay経過前にParent shutdownした場合は新Runnerを起動せず、そのrecordはhistorical scheduleとして残してよい。新Parent Runtimeでは再利用しない。
+
+Scheduled time到達後:
+
+1. Parent Runtimeがまだcurrent
+2. logical slotがrestart_suppressedでない
+3. Pool config上slotが必要
+
+を確認してnew `runner_instance_id`をspawnする。Spawn開始成功時`started_runner_instance_id`を記録する。
+
+Spawn自体が即失敗/新instanceがstartup_lostした場合も新しいfailureとして同じrolling windowへ入り、次のbudget/backoff判定を行う。
+
+### 22.6 Restart suppressed visibility
+
+Suppressed時:
+
+- logical slotのcurrent visible state=`restart_suppressed`
+- reason=`policy_never|restart_limit_exceeded`
+- Event/Execution diagnosticを残す
+- Runtimeはそのslotを自動復活させない
+- 他slot/Poolは通常継続する
+
+MVPにpublic「restart budget reset」APIは持たない。復旧はParent configuration修正後のParent Runtime再起動、または親内部運用で行う。
 
 ## 23. 非目標
 
@@ -557,27 +681,36 @@ CPU/RAM/GPU quota、本格sandbox、arbitrary shell、Pool global pause、Pool A
 4. invalid Action arity registration reject
 5. Validator sync-only/awaitable reject/ValidationResult defaults
 6. ActionFailure contract validation
-7. Pool config/liveness/restart
-8. claim ready_at + pending snapshot
-9. timeout origin starts immediately after claim before child spawn
-10. timeout covers bootstrap/handshake/action/result validation until terminal commit
-11. pre-ready timeout/cancel cleanup
-12. unique Secret resolution exactly once/name/Attempt
-13. same Secret multiple bindings exact same value
-14. non-empty Secret binding reuse ineligible
-15. ready->start/IPC errors
-16. cancel while Action/request waits
-17. Runtime Handle correlation
-18. state_get found/missing both reuse ineligible
-19. state_set immediate nonrollback + current Step producer association
-20. Artifact operations
-21. progress telemetry redaction
-22. at most one open Step / nested start reject
-23. Step key/name/start-finish metadata exact columns
-24. open Step incomplete close
-25. result file/exit matrix
-26. deadline-before-terminal-commit result discard
-27. cancel commit result discard
-28. stdout/stderr streaming byte redaction across chunks
-29. no raw pre-redaction sink
-30. fencing/temp/restart
+7. Pool config strict validation
+8. startup before first heartbeat lost detection from started_at
+9. heartbeat/main-loop stale liveness
+10. planned shutdown vs unexpected exit classification
+11. restart mode never/on_failure exact behavior
+12. max_restarts=0 and rolling window budget
+13. stable elapsed window naturally restores restart budget
+14. restart ordinal/backoff saturating calculation
+15. scheduled restart cancelled by Parent shutdown/no cross-runtime reuse
+16. restart_suppressed visibility/reason
+17. claim ready_at + pending snapshot
+18. timeout origin starts immediately after claim before child spawn
+19. timeout covers bootstrap/handshake/action/result validation until terminal commit
+20. pre-ready timeout/cancel cleanup
+21. unique Secret resolution exactly once/name/Attempt
+22. same Secret multiple bindings exact same value
+23. non-empty Secret binding reuse ineligible
+24. ready->start/IPC errors
+25. cancel while Action/request waits
+26. Runtime Handle correlation
+27. state_get found/missing both reuse ineligible
+28. state_set immediate nonrollback + current Step producer association
+29. Artifact operations
+30. progress telemetry redaction
+31. at most one open Step / nested start reject
+32. Step key/name/start-finish metadata exact columns
+33. open Step incomplete close
+34. result file/exit matrix
+35. deadline-before-terminal-commit result discard
+36. cancel commit result discard
+37. stdout/stderr streaming byte redaction across chunks
+38. no raw pre-redaction sink
+39. fencing/temp/restart
