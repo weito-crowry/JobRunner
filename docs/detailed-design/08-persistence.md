@@ -1,13 +1,13 @@
 # 08. Persistence 詳細設計
 
-- Status: Draft v1.0
+- Status: Draft v1.1
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - Canonical JSON: `01-workflow-definition.md` の `jobrunner.canonical-json.v1`
 
 ## 1. 目的
 
-SQLite schema、PayloadStore / ArtifactStore metadata、Action/Validator snapshot、Result Reuse、deadline、Retention、Migration、Recovery、Idempotencyを定義する。
+SQLite schema、PayloadStore / ArtifactStore metadata、Action/Validator snapshot、Dynamic expansion、Result Reuse、deadline、Retention、Migration、Recovery、Idempotencyを定義する。
 
 ## 2. Storage構成
 
@@ -17,7 +17,7 @@ SQLite
 ├─ Payload metadata
 ├─ Artifact metadata
 ├─ Action/Validator identity
-└─ Reuse/idempotency/retention metadata
+└─ Dynamic/Reuse/idempotency/retention metadata
 
 PayloadStore
 └─ large JSON Output blob
@@ -137,7 +137,7 @@ artifact_metadata_days: integer>=1|null
 managed_artifact_data_days: integer>=1|null
 ```
 
-Run start時effective policyをcanonical JSONでsnapshot。後からSystem/Workflow source設定が変わっても既存Run policyを暗黙変更しない。
+Run start時effective policyをcanonical JSONでsnapshot。
 
 Checks:
 
@@ -216,7 +216,7 @@ ineligibility_reason optional
 
 canonical-json-v1 SHA-256。
 
-state_get/undeclared Artifact materialize -> ineligible。
+state_get/persistent Input外Artifact materialize -> ineligible。
 
 Output commit + reuse metadata + Job success same logical terminal operation。
 
@@ -245,19 +245,92 @@ WHERE status='active';
 
 Conditional transaction、due二重処理は副作用化しない。
 
-## 15. Dynamic / Reusable uniqueness
+## 15. `dynamic_expansions`
 
-Dynamic root/nested expansion partial unique。Full job_key fixed length CHECK無し。
+Canonical columns:
 
-Reusable binding one/parent_job_run_id。BindingにChild Action+Validator versions。
+```text
+id TEXT PK
+workflow_run_id TEXT NOT NULL FK
+template_id TEXT NOT NULL
+parent_generated_job_run_id TEXT NULL FK
+outcome TEXT NOT NULL
+source_snapshot_json TEXT NULL
+source_digest TEXT NULL
+generated_count INTEGER NOT NULL DEFAULT 0
+failure_json TEXT NULL
+created_at TEXT NOT NULL
+completed_at TEXT NULL
+```
 
-Child Run one/parent_attempt_id。
+`outcome`:
 
-## 16. State
+```text
+pending|expanded|skipped|failed|cancelled
+```
+
+Checks:
+
+```text
+generated_count >= 0
+pending -> completed_at NULL
+expanded|skipped|failed|cancelled -> completed_at NOT NULL
+expanded -> source_snapshot_json/source_digest NOT NULL
+skipped|cancelled -> generated_count=0
+failed -> failure_json NOT NULL
+```
+
+Rootでは`parent_generated_job_run_id IS NULL`、NestedではNOT NULL。
+
+SQLiteは`NULL`を含む通常UNIQUEだけではRoot重複を防げないため、以下を必須とする。
+
+```sql
+CREATE UNIQUE INDEX uq_dynamic_expansion_root
+ON dynamic_expansions(workflow_run_id, template_id)
+WHERE parent_generated_job_run_id IS NULL;
+
+CREATE UNIQUE INDEX uq_dynamic_expansion_nested
+ON dynamic_expansions(workflow_run_id, template_id, parent_generated_job_run_id)
+WHERE parent_generated_job_run_id IS NOT NULL;
+```
+
+Expansion commit transactionは:
+
+- expansion outcome/source snapshot
+- 全generated `job_runs`
+- generated count
+
+をall-or-nothingで確定する。
+
+`if=false` は`skipped`、`foreach=[]`は`expanded/generated_count=0`。この差をRecoveryで維持する。
+
+Nested parent generated Job 0件の直接propagationはgenerated expansion rowを捏造せず、template group resolution metadata/stateから`05`のparent conclusionをidempotentに導出する。
+
+## 16. `reusable_bindings`
+
+最低限:
+
+```text
+id TEXT PK
+parent_workflow_run_id TEXT NOT NULL FK
+parent_job_run_id TEXT NOT NULL FK
+workflow_ref_original TEXT NOT NULL
+child_workflow_id TEXT NOT NULL
+child_workflow_version INTEGER NOT NULL
+child_definition_yaml/json/hash
+child_action_versions_json TEXT NOT NULL
+child_validator_versions_json TEXT NOT NULL
+created_at TEXT NOT NULL
+UNIQUE(parent_job_run_id)
+```
+
+Child Runは`parent_attempt_id`に対して最大1件となるpartial/unique constraintを持つ。
+
+## 17. State
 
 Current + append-only history same transaction。SecretGuard対象。
 
-## 17. Artifact metadata / Store
+## 18. Artifact metadata / Store
 
 ```text
 id/workflow_run_id/job_run_id/attempt_id/name
@@ -269,32 +342,43 @@ created_at/data_deleted_at/metadata_deleted_at
 
 Managed put=temp copy/Secret scan/digest/atomic finalize/metadata Event。DB failure orphan cleanup。
 
-## 18. Event persistence / retention audit
+## 19. Event persistence / retention audit
 
 通常Eventは`workflow_run_id`等をnullable参照として持つ。
 
-Run row削除後もRetention実施事実を残すため、**system-level retention audit Event**は:
+System-level retention audit Event:
 
-- `workflow_run_id=NULL`
-- `job_run_id/attempt_id=NULL`
-- payloadへdeleted resource type / opaque ID / workflow_id copy / count / policy key / cutoffを記録
-- 対象Run等へのFKを持たない
-- Run/Artifact/Event等の実削除前または同logical operationでcommit
+- `workflow_run_id/job_run_id/attempt_id=NULL`
+- payloadへdeleted resource type / opaque ID / workflow_id copy / count / policy key / cutoff
+- 対象Run等へのFK無し
 - SecretGuard対象
 
-Event typeは `retention_deleted` / `retention_orphan_cleaned` を使用する。
+Type=`retention_deleted|retention_orphan_cleaned`。
 
-**このsystem-level retention audit Eventは通常の `event-days` Retention対象から除外し、MVPでは無期限保持する。** 通常Workflow Eventのみ`event-days`で削除可能。
+通常`event-days`対象から除外しMVP無期限保持。Repeated sweepで二重auditしない。
 
-Repeated sweepで同じresource削除を二重auditしないようRepositoryはlogical deletion marker/current existenceを条件にする。
+## 20. External / Human uniqueness
 
-## 19. External / Human uniqueness
+Required DB guarantees:
 
-- one Task/Attempt
-- one active Lease/Task
-- one Review/Attempt
+```text
+UNIQUE(external_tasks.attempt_id)
+UNIQUE(human_reviews.attempt_id)
+```
 
-## 20. Idempotency
+External LeaseはTaskあたりactive最大1をpartial uniqueで保証する。
+
+```sql
+CREATE UNIQUE INDEX uq_external_active_lease
+ON external_leases(task_id)
+WHERE status='active';
+```
+
+Task status=`available|leased|completed|cancelled`。
+Lease status=`active|expired|released|invalidated`。
+Review status=`pending|completed|cancelled`。
+
+## 21. Idempotency
 
 ```text
 scope/operation/request_key PK
@@ -307,15 +391,15 @@ TTL内replay/conflict、expired replace可。Result/adapter metadata SecretGuard
 
 Side effect + idempotency result same transaction。
 
-## 21. Concurrency
+## 22. Concurrency
 
 Start/slot release `BEGIN IMMEDIATE` holder recount。Group BINARY case-sensitive。
 
-## 22. Migration
+## 23. Migration
 
 `migrations/NNN_name.sql` + `schema_migrations`。Ordered once、fail-closed、unknown future version reject。
 
-## 23. Retention deletion rules
+## 24. Retention deletion rules
 
 Policy source=`workflow_runs.retention_policy_json`。
 
@@ -333,20 +417,24 @@ Artifact metadata削除時にManaged dataが残る状態を作らない。必要
 
 Orphan temp/blob/store objectはconsistency cleanupとして削除可能で、system-level `retention_orphan_cleaned` audit Eventを残す。
 
-## 24. 受入条件
+## 25. 受入条件
 
 1. canonical-json-v1 persistence/digest
 2. inline/blob crash consistency
-3. retention_policy snapshot
-4. non-terminal Run retention safety
-5. component retention age bases
-6. system-level retention audit survives Run delete and event-days sweep
-7. Action/Validator snapshot/reuse
-8. signed64/string/source identity
-9. concurrency/FK semantics
-10. deadline indexes
-11. Artifact orphan cleanup audit
-12. Retry Input/version
-13. uniqueness constraints
-14. idempotency original HTTP status metadata
-15. future migration reject
+3. dynamic root/nested partial unique
+4. dynamic skip vs empty outcome persistence
+5. dynamic atomic expansion/recovery
+6. reusable binding unique/version snapshot
+7. external Task/active Lease/Review uniqueness
+8. retention_policy snapshot
+9. non-terminal Run retention safety
+10. component retention age bases
+11. system-level retention audit survives Run delete/event sweep
+12. Action/Validator snapshot/reuse
+13. signed64/string/source identity
+14. concurrency/FK semantics
+15. deadline indexes
+16. Artifact orphan cleanup audit
+17. Retry Input/version
+18. idempotency original HTTP status metadata
+19. future migration reject
