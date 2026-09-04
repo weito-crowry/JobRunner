@@ -1,6 +1,6 @@
 # 11. Service API / MCP / HTTP 詳細設計
 
-- Status: Draft v1.3
+- Status: Draft v1.4
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `03`, `07`, `08`, `09`, `10`, `12`
@@ -100,6 +100,8 @@ jobs nullable
 source_yaml nullable
 ```
 
+`wf_definition_list/info`はbrowse cacheを利用可能だが、`wf_start`の実行開始source readは`01`どおり必ずcurrent source bytesを再取得する。
+
 ## 5. Workflow Run
 
 ### 5.1 `wf_start`
@@ -120,8 +122,11 @@ Response=`workflow_run_id,workflow_id,status,conclusion,priority,wait_reason,cre
 
 Run start時`01/08` snapshot固定。Concurrency scope=`(workflow_id,group)`。
 
+- slot admission success/no concurrency -> Run作成、`status=running, wait_reason=null`
 - queue -> Run作成、`status=queued, wait_reason=concurrency`
 - reject -> Run ID無し `concurrency_limit_reached`
+
+MVPのRun `queued`はConcurrency待ち専用。
 
 ### 5.2 `wf_run_list`
 
@@ -222,6 +227,20 @@ steps nullable
 artifacts nullable
 ```
 
+Step summary (`include_steps=true`):
+
+```text
+step_id
+sequence
+name
+status/conclusion
+start_metadata nullable
+finish_metadata nullable
+started_at/completed_at
+```
+
+MVPでは同一Attemptに同時open Step最大1。
+
 Attempt navigation IDはそのAttemptに属するexact rowを返す。Concurrency rejectでReusable Child未作成なら`child_workflow_run_id=null`。
 
 `log_metadata`=`available,size_bytes,updated_at?,deleted_at?`。
@@ -232,11 +251,20 @@ Input/Output/State/Log/Event本文無し。
 
 ### 5.4 `wf_pause`
 
-Non-terminal root Run。Already paused=same-state success。
+Root non-terminal Runのみ。
+
+- `status=running` -> `status=paused, wait_reason=null`。Concurrency設定時はslot保持
+- `status=queued, wait_reason=concurrency` -> `status=paused, wait_reason=concurrency`。slot無し、wake候補外
+- already paused -> same-state success
+
+Child direct pause=`child_run_direct_control_forbidden`。
 
 ### 5.5 `wf_resume`
 
-Paused root Run。New requestでnon-pausedならinvalid_state。Concurrency waiterならslot取得までqueued待機。
+Paused root Runのみ。New requestでnon-pausedなら`invalid_state`。Replayはstored result。
+
+- paused + `wait_reason=null` -> `status=running`。admitted holderは同じslotで再開
+- paused + `wait_reason=concurrency` -> `status=queued, wait_reason=concurrency`。slot取得まで待機
 
 ### 5.6 `wf_cancel`
 
@@ -244,9 +272,13 @@ Request=`workflow_run_id,reason?,request_id?`。Non-terminal root only。Race=`1
 
 ### 5.7 `wf_priority_update`
 
+Request=`workflow_run_id,priority,request_id?`。
+
 Root non-terminal only。root + all non-terminal descendant Child Runへ同値伝播。Preempt無し。
 
 Response=`workflow_run_id,priority,updated_descendant_count,status,conclusion,updated_at`。
+
+HTTP `PATCH /workflow-runs/{id}` bodyはexact `{ "priority": <signed64 integer> }`。Unknown body field reject。
 
 ### 5.8 `wf_retry`
 
@@ -269,8 +301,11 @@ Non-terminal retryはrun_attempt不変。Completed failure reopenは`10`。
 
 Concurrency reacquire:
 
+- admitted -> Run running
 - queue -> success response、Run queued/concurrency
 - reject -> `concurrency_limit_reached` 409、state変更無し
+
+Retry pendingのtarget Jobは`status=queued, conclusion=null, completed_at=null`。
 
 ## 6. Input inspection
 
@@ -319,23 +354,9 @@ Public mutation APIはMVPに持たない。State writeはinternal Action Runtime
 
 ### 8.1 `wf_state_list`
 
-Request:
+Request=`workflow_run_id,limit,cursor`。Order=`name ASC`。
 
-```text
-workflow_run_id
-limit/cursor
-```
-
-Order=`name ASC`。
-
-Item:
-
-```text
-name
-revision
-size_bytes
-updated_at
-```
+Item=`name,revision,size_bytes,updated_at`。
 
 `size_bytes`=current `value_json` canonical UTF-8 bytes。
 
@@ -343,31 +364,13 @@ updated_at
 
 Request=`workflow_run_id,name non-empty`。
 
-Response:
-
-```text
-workflow_run_id
-name
-revision
-value any JSON
-size_bytes
-updated_at
-```
-
-Missing=`not_found`。
+Response=`workflow_run_id,name,revision,value,size_bytes,updated_at`。Missing=`not_found`。
 
 ### 8.3 `wf_state_history`
 
-Request:
+Request=`workflow_run_id,name?,include_values=false,limit,cursor`。
 
-```text
-workflow_run_id
-name optional
-include_values boolean default false
-limit/cursor
-```
-
-Order=`created_at DESC,history_id DESC`。name指定時も同orderで、revisionは補助field。
+Order=`created_at DESC,history_id DESC`。
 
 Item:
 
@@ -384,33 +387,64 @@ old_value optional
 new_value optional
 ```
 
-`include_values=false`ではold/newをresponseに含めない。`true`では保存済みJSON値を返す。
+`include_values=false`ではold/newを含めない。`true`では保存済みJSON値を返す。
 
-Large State/history valueはRun info/Listへ埋めず、read/historyでのみ返す。Adapter/MCP response上限超過=`response_too_large`、silent truncate無し。
+Large State/history valueはRun info/Listへ埋めず、read/historyのみ。Adapter/MCP response上限超過=`response_too_large`、silent truncate無し。
 
-State historyはAttempt failure後も残り得る。これは`09` immediate/nonrollback semanticsどおり。
+State historyはAttempt failure後も残り得る。
 
 ## 9. External Task
 
-### `wf_task_info`
+### 9.1 `wf_task_info`
 
-Response=`task_id/workflow_run_id/job_run_id/attempt_id/status/input/current_lease?/claim_history_summary/output_metadata?/failure?/timestamps`。
+Request=`task_id`。
 
-### `wf_task_claim`
+Response:
+
+```text
+task_id/workflow_run_id/job_run_id/attempt_id
+status
+input
+current_lease nullable
+claim_history_summary
+output_metadata nullable
+failure nullable
+created_at/completed_at
+```
+
+`current_lease`:
+
+```text
+status
+expires_at nullable
+claimed_by_self boolean
+lease_id nullable
+```
+
+- active Leaseの`claimant_key`がcurrent Actor/client principal由来keyと一致する場合のみ`claimed_by_self=true`かつ`lease_id`を返す
+- 他者claimなら`lease_id=null`。claimant identity/lease tokenを一般readへ露出しない
+- inactive/無しなら必要最小metadataだけ
+- `claim_history_summary`へlease_idやclaimant secret/capability情報を含めない
+
+Task submitはLease IDだけでなくcurrent Actor由来claimant ownershipも再確認するため、他Actorがtokenだけでsubmitできない。
+
+### 9.2 `wf_task_claim`
 
 Request=`task_id? / workflow_run_id? / job_template_key? / request_id?`。Task ID指定時他filter禁止。No candidate=`{"task":null}`。
 
 Task object=`task_id/lease_id/lease_expires_at/workflow_run_id/job_run_id/attempt_id/job_key/input`。
 
-Ordering=`07`、Task `available_at`使用。
+Ordering=`07`、Task `available_at`使用。Stable `job_key`はopaque IDsより先にtie-break。
 
-### `wf_task_submit`
+### 9.3 `wf_task_submit`
 
 Request=`task_id,lease_id,result,artifacts=[],claim_next=false,request_id?`。
 
 Response=`submitted=true,workflow_run_id,job_run_id,attempt_id,job_status,job_conclusion,failure?,next_task?`。
 
 `claim_next=true`はsubmit + optional next Lease + idempotencyをsame transaction。`now >= lease_expires_at`はresult不採用。
+
+Transaction内でtask/lease current ownership、Lease ID、claimant_key、Actor/Scopeを再確認する。
 
 Lease heartbeat/renew/extend/transfer無し。
 
@@ -430,7 +464,20 @@ artifact_id -> public ArtifactRef + producer/deletion metadata。Store path無�
 
 ### `wf_log_read`
 
-Request=`attempt_id,offset_bytes?,limit_bytes?,tail_lines?`。Tail/offset同時禁止。Deleted=`log_data_unavailable`。
+Request:
+
+```text
+attempt_id
+offset_bytes >=0 optional
+limit_bytes 1..1048576 default65536
+tail_lines 1..10000 optional
+```
+
+Tail/offset同時禁止。Deleted=`log_data_unavailable`。
+
+Execution Log fileはUTF-8 text。`offset_bytes`は0または過去responseの`next_offset_bytes`利用を正規利用とする。任意offsetがUTF-8 code point境界でない場合は`invalid_log_offset` 400とし、暗黙に前後へ丸めない。
+
+Response=`content,next_offset_bytes?,truncated,size_bytes,updated_at?`。
 
 ### `wf_event_list`
 
@@ -540,6 +587,8 @@ GET  /runners
 
 Opaque Core IDsのみpath parameter。Workflow ref/state name等はquery/bodyで安全にURL encode。
 
+`PATCH /workflow-runs/{id}`はpriority update専用でbody exact `{priority}`。
+
 State-changing HTTP optional `Idempotency-Key` header。Body request_id無し。
 
 ## 15. HTTP status
@@ -585,6 +634,7 @@ runner_unavailable
 payload_missing/payload_digest_mismatch
 artifact_access_forbidden/artifact_data_unavailable
 log_data_unavailable
+invalid_log_offset
 secret_binding_invalid
 successful_job_result_not_reusable
 dynamic_expansion_not_reusable
@@ -605,7 +655,7 @@ No reserved row。TTL内same hash replay/different conflict。`now >= expires_at
 
 ## 18. Authorization / pagination
 
-全public operation authorize。State list/read/history=`workflow_state.read`。List/Eventはfiltered scope。Limit1..200 default50。
+全public operation authorize。State list/read/history=`workflow_state.read`。Task info/claim/submitはExternalTask resource authorizationに加えてclaimant ownershipをsubmit時確認。List/Eventはfiltered scope。Limit1..200 default50。
 
 ## 19. Python API
 
@@ -619,24 +669,27 @@ State change Eventへactor/source/request_id。Request body/Secret/巨大payload
 
 1. strict/no-coercion Core Service models
 2. HTTP explicit integer/boolean/timestamp parsing
-3. Definition/Run separation
-4. root start priority/concurrency queue/reject
-5. priority update propagation
-6. Run info concrete Jobs/Dynamic groups exact shapes
-7. Job/Attempt task-review-child navigation IDs
-8. Input info/read Secret reference only
-9. Output read/reopen unavailable
-10. State list metadata-only/current read/history values optional
-11. State history persists failed Attempt writes
-12. no public State mutation
-13. State Authorization
-14. wf_retry run_attempt/concurrency response
-15. task available_at ordering/expired Lease
-16. submit+claim_next transaction/replay
-17. Human mutation restrictions
-18. Artifact/Log/Event contracts
-19. namespaced MCP includes State tools
-20. HTTP exact State routes
-21. status/no422
-22. idempotency commit recheck/expiry
-23. all read/write Authorization
+3. Definition/Run separation + start fresh source path
+4. admitted start=running / concurrency queue=queued
+5. pause/resume admitted holder vs concurrency waiter semantics
+6. root priority/HTTP PATCH exact body
+7. Run info concrete Jobs/Dynamic groups/Step exact shapes
+8. Job/Attempt task-review-child navigation IDs
+9. Input info/read Secret reference only
+10. Output read/reopen unavailable
+11. State list metadata-only/current read/history values optional
+12. State history persists failed Attempt writes
+13. no public State mutation
+14. wf_retry Job terminal reset/run_attempt/concurrency response
+15. task available_at ordering + job_key tie-break
+16. task_info does not expose another claimant's lease_id
+17. self claimant can recover active lease_id
+18. submit verifies lease + claimant ownership
+19. submit+claim_next transaction/replay
+20. Human mutation restrictions
+21. Artifact/Log byte-offset/Event contracts
+22. namespaced MCP includes State tools
+23. HTTP exact State routes
+24. status/no422
+25. idempotency commit recheck/expiry
+26. all read/write Authorization
