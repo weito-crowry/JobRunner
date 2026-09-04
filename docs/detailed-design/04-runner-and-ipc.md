@@ -1,6 +1,6 @@
 # 04. Runner / IPC 詳細設計
 
-- Status: Draft v1.7
+- Status: Draft v1.8
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `02`, `03`, `08`, `09`, `10`, `12`
@@ -200,6 +200,8 @@ same Workflow Run running internal無し
 
 1 Runner同時1 Job。
 
+`timeout-minutes`がある場合、**claim transaction成功直後にRunner monotonic clockでAttempt timeout originを固定**する。Action Runner spawn前に開始し、terminal Attempt commitまで同じdeadlineを使う。DB wall-clock timestampとしてtimeout deadlineを永続化する必要はない。Runner lost後は同Attemptを継続せず`10` Recoveryへ移るためである。
+
 ## 8. Action failure contract
 
 ```python
@@ -265,6 +267,10 @@ Envelope:
 ready前message/start重複/terminal重複=`ipc_protocol_error`。
 
 `ready`: `pid integer>0`, `protocol_version=1`。
+
+`timeout-minutes`はこのhandshake/bootstrap時間も含む。Deadlineが`ready`前に到達した場合はcooperative `cancel_requested`を送れるIPC状態ではないため、RunnerはChildをterminateして`job_timeout`へ収束してよい。これはpublic force-cancel APIではなく、既に成立したJob timeoutのcleanupである。
+
+Workflow cancelが`ready`前にcommitした場合もnew Action開始を行わずChildを終了しAttemptをcancelledへ収束する。
 
 ## 11. `start` / Secret materialization
 
@@ -450,13 +456,15 @@ Runner result validation前にcurrent ownership + timeout/cancel fenceを再確�
 9. SecretGuard
 10. PayloadStore
 
+`timeout-minutes`のdeadlineはresult受信時で止めない。Validation/PayloadStore処理中も継続し、**Attempt terminal commit直前にmonotonic deadlineを再確認**する。Deadline成立済みならsuccessをcommitせず`job_timeout`へ収束する。
+
 Result commit transactionでもcancel/current ownershipを再確認し、validation中にCancelがcommitしたraceでsuccessを確定しない。
 
 ## 17. `exiting` / exit matrix
 
 Optional `exiting.reason=result|error`。Source of Truthではない。
 
-- result + exit0 + validation success + fence clear -> success候補
+- result + exit0 + validation success + fence clear + timeout deadline前terminal commit -> success候補
 - result + nonzero -> action_process_exit, result非採用
 - error + any exit -> error failure採用、exit0 diagnostic
 - no terminal + nonzero -> action_process_exit
@@ -497,18 +505,39 @@ Payload commit後削除。Managed Artifactはput時durable copy済み。Cleanup 
 
 `timeout-minutes` internalのみ、未指定無期限。
 
-DeadlineはAction実行開始時点からRunner monotonic clockで計測。deadline到達時にtimeout flag成立。
+Canonical timeout interval:
+
+```text
+start = internal Attempt claim transaction成功直後のRunner monotonic time
+end   = Attempt terminal DB commit
+```
+
+したがって以下を全て含む:
+
+- Action Runner process spawn
+- `role=action_runner` bootstrap
+- ready/start handshake
+- Secret materialization/start準備
+- Action本体
+- result/error transport
+- result file検証
+- Schema/Validator/success_if/SecretGuard
+- PayloadStore prepare/final terminalization
+
+Deadline到達時点でtimeout outcomeが成立する。
 
 1. deadline到達
 2. timeout flag
-3. cancel(timeout)
-4. grace default10秒
-5. grace中result/errorはcleanup signalとして受けられるがsuccess resultは採用しない
-6. 未終了ならterminate
-7. Attempt=`job_timeout`
-8. Retry policy
+3. Childがready/start済みなら`cancel(timeout)`でcooperative cleanup要求
+4. ready前/IPC不可ならChild terminate可
+5. grace default10秒はcleanup猶予
+6. grace中result/errorはcleanup signalとして受けられるがsuccess resultは採用しない
+7. 未終了ならterminate
+8. open Stepはincompleteへclose
+9. Attempt=`job_timeout`
+10. Retry policy
 
-Graceは成功猶予ではない。Deadline前にsuccess commit済みならtimeout処理しない。
+Graceは成功猶予ではない。**Deadline前にAttempt terminal success commit済みならtimeout処理しない。** Resultをdeadline前に受け取っただけでは不十分で、terminal commitがdeadline後ならtimeoutを優先する。
 
 ## 22. Parent shutdown / restart
 
@@ -530,22 +559,25 @@ CPU/RAM/GPU quota、本格sandbox、arbitrary shell、Pool global pause、Pool A
 6. ActionFailure contract validation
 7. Pool config/liveness/restart
 8. claim ready_at + pending snapshot
-9. unique Secret resolution exactly once/name/Attempt
-10. same Secret multiple bindings exact same value
-11. non-empty Secret binding reuse ineligible
-12. ready->start/IPC errors
-13. cancel while Action/request waits
-14. Runtime Handle correlation
-15. state_get found/missing both reuse ineligible
-16. state_set immediate nonrollback + current Step producer association
-17. Artifact operations
-18. progress telemetry redaction
-19. at most one open Step / nested start reject
-20. Step key/name/start-finish metadata exact columns
-21. open Step incomplete close
-22. result file/exit matrix
-23. timeout deadline result discard
-24. cancel commit result discard
-25. stdout/stderr streaming byte redaction across chunks
-26. no raw pre-redaction sink
-27. fencing/temp/restart
+9. timeout origin starts immediately after claim before child spawn
+10. timeout covers bootstrap/handshake/action/result validation until terminal commit
+11. pre-ready timeout/cancel cleanup
+12. unique Secret resolution exactly once/name/Attempt
+13. same Secret multiple bindings exact same value
+14. non-empty Secret binding reuse ineligible
+15. ready->start/IPC errors
+16. cancel while Action/request waits
+17. Runtime Handle correlation
+18. state_get found/missing both reuse ineligible
+19. state_set immediate nonrollback + current Step producer association
+20. Artifact operations
+21. progress telemetry redaction
+22. at most one open Step / nested start reject
+23. Step key/name/start-finish metadata exact columns
+24. open Step incomplete close
+25. result file/exit matrix
+26. deadline-before-terminal-commit result discard
+27. cancel commit result discard
+28. stdout/stderr streaming byte redaction across chunks
+29. no raw pre-redaction sink
+30. fencing/temp/restart
