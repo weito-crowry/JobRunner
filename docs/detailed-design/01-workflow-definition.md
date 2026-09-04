@@ -1,6 +1,6 @@
 # 01. Workflow Definition 詳細設計
 
-- Status: Draft v1.4
+- Status: Draft v1.5
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 
@@ -106,6 +106,13 @@ Draft **2020-12のみ**。
 - Definition load時`Draft202012Validator.check_schema()`相当
 - RuntimeもDraft202012 semantics
 - `format`はMVPではannotation扱いで強制しない
+- MVPのSchemaは**自己完結型**とし、CoreはHTTP/file/parent filesystem等からSchemaを取得しない
+- `$defs`等による同一Schema document内の再利用は許可
+- `$ref` / `$dynamicRef` は `#` で始まるlocal fragmentだけ許可
+- absolute URI、relative URI、file path等のnon-fragment `$ref` / `$dynamicRef` はDefinition load時にreject
+- Resolver/network policyへ処理を委ねて外部Schemaを黙って取得する実装は禁止
+
+外部参照禁止違反は `json_schema_external_ref_forbidden` としてDefinition validation errorにする。
 
 ## 6. トップレベル
 
@@ -561,7 +568,7 @@ Child Run snapshot rules=`06`。
 Load:
 
 - YAML1.2、安全性、strict Pydantic/validators
-- JSON Schema draft
+- JSON Schema Draft + self-contained local-reference policy
 - Input/default strict types
 - needs/foreach cycle
 - numeric/expression
@@ -594,20 +601,21 @@ FailureならRun row無し。
 5. Input/default strict validation
 6. canonical JSON golden
 7. Draft2020-12 only
-8. executor default/internal + uses->reusable
-9. Root System baseline snapshot/restart stability
-10. Child Parent baseline inheritance
-11. default_runner_pool/runs-on resolution
-12. root priority resolution/Child propagation
-13. concurrency scope=(workflow_id,group)
-14. mixed max-runs delegates to `08`
-15. Job outputs.schema Human/Reusable boundary
-16. Registry one-current-version/uses_runtime/version mismatch
-17. runtime setting/External lease/progress/log/Retention strict validation
-18. Secret full-scalar
-19. browse cache refresh
-20. wf_start always reads source bytes even unchanged metadata
-21. Reusable first binding always reads child source bytes
-22. invalid execution-time source never falls back to old cache
-23. arbitrary Output/spill
-24. deterministic Definition hash
+8. JSON Schema local fragment `$ref/$dynamicRef` allow + external/relative ref reject + no retrieval
+9. executor default/internal + uses->reusable
+10. Root System baseline snapshot/restart stability
+11. Child Parent baseline inheritance
+12. default_runner_pool/runs-on resolution
+13. root priority resolution/Child propagation
+14. concurrency scope=(workflow_id,group)
+15. mixed max-runs delegates to `08`
+16. Job outputs.schema Human/Reusable boundary
+17. Registry one-current-version/uses_runtime/version mismatch
+18. runtime setting/External lease/progress/log/Retention strict validation
+19. Secret full-scalar
+20. browse cache refresh
+21. wf_start always reads source bytes even unchanged metadata
+22. Reusable first binding always reads child source bytes
+23. invalid execution-time source never falls back to old cache
+24. arbitrary Output/spill
+25. deterministic Definition hash
