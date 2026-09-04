@@ -1,6 +1,6 @@
 # 04. Runner / IPC 詳細設計
 
-- Status: Draft v1.6
+- Status: Draft v1.7
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `02`, `03`, `08`, `09`, `10`, `12`
@@ -334,7 +334,8 @@ RunnerServiceがAuthorization + SecretGuard + current/history transactionをrequ
 
 - Attempt successまで保留しない
 - later failure/cancel/timeout/runner_lostでもrollbackしない
-- historyへproducer Job/Attempt/Stepを記録
+- historyへproducer Job/Attemptを記録
+- **その時点でopen StepがあればそのStep IDもproducer `step_id`として記録し、open Stepが無ければNULL**
 - 成功利用でAttempt `reuse_eligible=false`
 
 業務transactionが必要なら専用Action/親DB transaction等で設計する。
@@ -351,9 +352,11 @@ Request=`name,uri,media_type?,size_bytes?,digest?,metadata?`。Response=External
 
 Request=`artifact_ref`。Response=`relative_work_path`。DB re-resolve + `09/12` authorization。External reject。Persistent Input外materialize -> reuse ineligible。
 
-## 14. Observation messages
+## 14. Observation messages / Step model
 
 Persistent telemetry strings/metadataは`12`のredactionを通してから保存する。Known Secretを含む表示fieldは`[REDACTED]`化し、telemetryだけを理由にAttempt failureにはしない。
+
+**MVPでは1 Attemptにつき同時にopen可能なStepは最大1つ。** Stepはネスト/並列化しない。これによりState history等の「現在のStep」対応を一意にする。
 
 ### 14.1 `log`
 
@@ -388,29 +391,30 @@ metadata JSON object optional
 Rules:
 
 - `step_key`はAttempt内unique correlation key
-- 同じkeyの2回目startは`ipc_protocol_error`
+- 既にopen Stepが存在する状態でnew `step_started` -> `ipc_protocol_error`
+- 同じkeyの2回目startも`ipc_protocol_error`
 - DB `job_steps.name = provided name or step_key`
 - display nameはredact後保存
 - `step_key`自体はcorrelation用で、DBに専用columnは持たない
 - metadataはJSON objectのみ。redact後に`start_metadata_json`へ保存
 
-Runnerがsequence/DB Step ID採番し、open key -> Step ID mapをAttempt memoryに持つ。
+Runnerがsequence/DB Step ID採番し、current open Stepとしてmemory保持する。
 
 ### 14.4 `step_finished`
 
 Payload:
 
 ```text
-step_key existing open
+step_key = current open Step key
 conclusion=success|failure|cancelled
 metadata JSON object optional
 ```
 
-Unknown/closed key=protocol error。Finish metadataはredact後に`finish_metadata_json`へ保存する。Finish時にstart metadataを上書きしない。
+Open Step無し/別key/既にclosed key=`ipc_protocol_error`。Finish metadataはredact後に`finish_metadata_json`へ保存する。Finish時にstart metadataを上書きしない。
 
-Start/finish metadata未指定なら対応DB column=`NULL`。
+Start/finish metadata未指定なら対応DB column=`NULL`。Finish commit後current open Stepをclearする。
 
-Open StepがAction process異常終了/timeout/cancelで正常finishされなかった場合、Runnerが`conclusion=incomplete`へ閉じ、`finish_metadata_json=NULL`を保持する。
+Open StepがAction process異常終了/timeout/cancelで正常finishされなかった場合、Runnerが`conclusion=incomplete`へ閉じ、`finish_metadata_json=NULL`を保持してopen Stepをclearする。
 
 ## 15. Terminal `error`
 
@@ -533,14 +537,15 @@ CPU/RAM/GPU quota、本格sandbox、arbitrary shell、Pool global pause、Pool A
 13. cancel while Action/request waits
 14. Runtime Handle correlation
 15. state_get found/missing both reuse ineligible
-16. state_set immediate nonrollback + reuse ineligible
+16. state_set immediate nonrollback + current Step producer association
 17. Artifact operations
 18. progress telemetry redaction
-19. Step key/name/start-finish metadata exact columns
-20. open Step incomplete close
-21. result file/exit matrix
-22. timeout deadline result discard
-23. cancel commit result discard
-24. stdout/stderr streaming byte redaction across chunks
-25. no raw pre-redaction sink
-26. fencing/temp/restart
+19. at most one open Step / nested start reject
+20. Step key/name/start-finish metadata exact columns
+21. open Step incomplete close
+22. result file/exit matrix
+23. timeout deadline result discard
+24. cancel commit result discard
+25. stdout/stderr streaming byte redaction across chunks
+26. no raw pre-redaction sink
+27. fencing/temp/restart
