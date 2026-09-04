@@ -1,6 +1,6 @@
 # 13. Testing 詳細設計
 
-- Status: Draft v0.4
+- Status: Draft v0.5
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`〜`12`
@@ -13,203 +13,214 @@
 4. External/Human/Retry/Recoveryはnegative case必須。
 5. Definition/Expressionはtable-driven。
 6. 時刻依存はClock abstraction。
-7. 競合testはbarrier/hookを使う。
+7. 競合testはbarrier/hook。
 
-## 2. Test layers
+## 2. Foundation dependencies
+
+Python3.10で:
 
 ```text
-Unit
-Integration
-Process Integration
-Adapter Contract
-End-to-End
-Recovery / Failure Injection
+ruamel.yaml >=0.19,<0.20
+pydantic >=2.13,<3
+jsonschema >=4.26,<5
+cel-python >=0.5,<0.6
+jmespath >=1.1,<2
 ```
+
+のimport / representative parse-validationをCI確認。
 
 ## 3. Definition / Expression
 
-必須negative:
-
-- duplicate YAML key / merge key / custom tag
-- unknown key
-- bad Job ID / missing needs / DAG cycle
-- Dynamic `foreach.parent`を含むcycle
+- duplicate/merge/custom tag reject
+- env literal-only / expression/Secret reject
+- bad needs / Dynamic parent cycle
 - executor field conflict
-- envでSecret参照
-- external/human/reusableでSecret参照
-- external/human/reusable `timeout-minutes`
+- external/human/reusable timeout reject
 - invalid CEL/JMESPath
-- missing/null/type mismatch
+- null/missing/type strictness
+- normal skipped dependency -> downstream default skip
+- continue-on-error effective success
+- Dynamic group aggregate + Nested parent helper
 
-Condition helper:
+## 4. JSON Output / PayloadStore
 
-- `success/failure/cancelled/always`
-- continue-on-error failureはeffective success
-- **通常Job skippedはeffective successではなく後段default skip**
-- Dynamic group内skippedはgroup集約規則を通す
-- explicit if false
-- Nested Dynamic parent + declared needs
+Action/External result:
 
-## 4. Input / Output / Secret
+```text
+null
+boolean
+number
+string
+array
+object
+```
 
-- Workflow required/default/extra/type
-- `$base` shallow override
-- Retry Input固定
-- Secret reference固定 + Attemptごとrematerialize
-- Secret非永続化
-- Output schema
-- NaN/Infinity
-- 4MiB default limit/override
+すべてpositive test。
 
-### SecretGuard regression
+Optional JSON Schemaを各shapeで検証。
 
-current Attemptへ注入したSecret値について:
+Transparent storage:
 
-- Outputのstring全体一致 -> reject
-- Output文字列の部分一致 -> reject
-- nested object/list内 -> reject
-- `state.set` -> reject
-- Artifact URI/metadata -> reject
-- Event/error details -> reject
-- stdout/stderr/log -> `[REDACTED]`
-- Base64等に変形された値は保証対象外
+- threshold-1 -> inline
+- threshold -> inline
+- threshold+1 -> blob
+- multi-MiB JSON -> success
+- downstream `needs.*.outputs` がinline/blob同じvalue
+- Workflow Output spill
+- blob temp write -> atomic rename -> DB commit
+- DB commit failure orphan blob cleanup
+- referenced blob missing -> `payload_missing`
+- digest mismatch -> `payload_digest_mismatch`
+- Attempt historyのold Output維持
 
-## 5. Scheduling
+## 5. SecretGuard
 
-- Workflow priority
-- Job priority
-- Dynamic order/source
+Current Attempt known Secretについて:
+
+- Output exact/substring/nested -> reject
+- large Output spill前reject
+- state.set -> reject
+- Artifact metadata URI -> reject
+- Event/error -> reject
+- log -> redact
+- managed Artifact text/binary byte match -> reject
+- chunk境界match -> reject
+- transformed Secretは保証外
+
+## 6. Scheduling
+
+- Workflow/Job/Dynamic priority order
 - pool routing
 - one internal running / Workflow Run
-- multiple Workflow Runs parallel
+- multiple Runs parallel
 - pause/resume
-- priority update non-preemptive
+- non-preemptive priority update
+- internal claim exactly-one race
 
-Internal claim競合はexactly one。
+## 7. Runner / IPC
 
-## 6. Runner / IPC
+- start/ready/log/progress/step/error/exiting
+- Runtime Handle request_id correlation
+- state_get/set response
+- artifact put/materialize response
+- request待ち中cancel
+- Action return result file protocol
+- giant JSON resultでもIPC frame小さい
+- result path traversal reject
+- size/digest mismatch
+- child crash/hang
+- heartbeat/main-loop stall
+- Parent shutdown vs Workflow cancel
+- old Runner fencing/restart suppression
 
-- start/ready/log/progress/step/result/error
-- malformed JSON/protocol mismatch
-- stdout/stderr capture
-- Action exception/crash/hang
-- heartbeat継続
-- main-loop stall detection
-- old runner fencing
-- restart suppression
-- Parent shutdownとWorkflow cancelの区別
-- Parent restartでold running Attempt -> runner_lost Recovery
+## 8. Timeout
 
-## 7. Timeout
+- internal no-timeout long Action
+- internal timeout -> cancel/terminate -> retry
+- external/human/reusable timeout reject
 
-- internal no-timeout long action success
-- internal timeout -> cancel -> child terminate -> `job_timeout`
-- timeout後Retry
-- external/human/reusable timeout definition reject
-
-## 8. Dynamic Jobs
+## 9. Dynamic Jobs
 
 - 0/1/N
-- stable key/index fallback
-- parent別同raw key非衝突
+- stable/index key
+- parent別same raw key
 - percent encoding
-- full logical job_keyに固定長上限無し
-- 1000 allowed / 1001 rollback
-- nested 2/3段以上
-- arbitrary-depth representative
-- parent edge cycle
+- fixed job_key length limit無し
+- 1000/1001 rollback
+- nested 2/3+ depth
+- parent cycle
 - parent+needs helper
-- order_by type/order
-- atomic expansion crash/restart
-- group status running/completed
-- group conclusion success/failure/blocked/cancelled
-- full-key Output/Artifact lookup
+- order type/order
+- expansion crash/restart
+- group status/conclusion
+- arbitrary JSON Output aggregation
 
-## 9. Reusable Workflow
+## 10. Reusable Workflow
 
 - registered ID
-- relative pathはcaller source directory基準
-- root traversal/symlink escape
-- non-filesystem caller relative reject
-- binding固定
-- source変更後Retry same binding
+- caller-directory relative resolution
+- traversal/symlink escape
+- non-filesystem relative reject
+- binding固定 / retry same binding
 - parent-child output/state isolation
-- direct/indirect cycle
+- cycle
 - direct Child control reject
-- Dynamic + Reusable
+- Dynamic+Reusable
 - restart duplicate防止
 
-## 10. External LLM
+## 11. Managed ArtifactStore
 
-- activation one Attempt/Task
-- concurrent claim exactly one
-- candidate ordering = Workflow priority -> Job priority -> dynamic order -> source -> ready -> id
-- claim_next同一selection
-- lease expiry requeue same Attempt
-- lease expiry fail -> Retry
+- put_file copies to durable store
+- put source work_dir traversal reject
+- immutable same-name generations
+- managed Artifact materialize current work_dir
+- materialize destination safety
+- retry current generation resolution
+- managed retention deletes data
+- store failure -> no metadata/current pointer
+
+External Artifact:
+
+- register URI metadata
+- no fetch
+- Core retention does not delete external data
+- External LLM task_submit Artifactはexternal reference only
+
+## 12. External LLM
+
+- arbitrary JSON result
+- large result spill
+- activation one Task/Attempt
+- candidate ordering / concurrent claim
+- claim_next same selection
+- lease requeue/fail
 - stale/cancel submit reject
-- Pause中existing submit可/expiry clock継続
-- restart valid/expired lease
+- Pause/recovery
 
-## 11. Human
+## 13. Human
 
-- pending review
-- approve/reject
+- pending/approve/reject
+- Job Output null
 - concurrent first-wins
-- cancel/late submit
-- pause中submit
-- Retry new review
+- cancel/pause/retry
 - timeout無し
 
-## 12. Retry / Recovery
+## 14. Retry / Recovery
 
-- auto retry disabled default
-- max-attempts/condition/backoff
-- manual retry completed/failure Run reopen
-- run_attempt増加
-- success/cancelled Run retry reject
-- blocked descendants再評価
-- terminal RunはRecoveryだけでreopenしない
-- retry backoff restart
+- auto retry default off
+- max/condition/backoff
+- manual retry completed/failure reopen
+- run_attempt++
+- success/cancelled retry reject
+- blocked/skipped descendants reevaluate
+- terminal Run not reopened by recovery
+- Parent restart old running -> runner_lost
 - Dynamic/Child duplicate無し
 
-## 13. Persistence
+## 15. Persistence / Idempotency
 
-- fresh/incremental migration
-- WAL/FK/busy timeout
-- internal running partial unique
-- Dynamic expansion unique
-- no logical job_key length CHECK
-- Reusable uniqueness
-- External active lease unique
-- Human one review/Attempt
-- state current+history atomic
+- migration/WAL/FK/busy timeout
+- output inline/blob column constraints
+- internal running unique
+- Dynamic/Reusable/External/Human unique
+- state current/history atomic
 - concurrency race
+- idempotency actor/scope isolation
+- TTL replay/conflict
+- TTL expired row replacement
+- task_claim idempotent replay no extra Lease
 
-## 14. Idempotency
+## 16. Authorization
 
-- same Actor/AccessScope + same key/hash -> replay
-- same scope + same key/different hash -> conflict
-- different Actorはsame keyでも独立
-- different AccessScopeはsame keyでも独立
-- concurrent same key -> single side effect
-- TTL expiry後、expired row残存状態でsame keyを新requestとして再利用
-- `task_claim` replayは新Lease/別Taskを追加しない
+- AllowAll/Deny/filtered scope
+- all public read/write authorize
+- log path safety
+- Artifact URI no auto-fetch
+- arbitrary shell無し
 
-## 15. Authorization / Security
+## 17. Platform / CI
 
-- AllowAll/Deny
-- list/read/write全public operation authorize
-- filtered AccessScope
-- log path traversal reject
-- Artifact URI auto-fetch無し
-- arbitrary shell非搭載
-
-## 16. Platform / CI
-
-Windows 11 / Linux。
-
-推奨:
+Windows11 / Linux。
 
 ```text
 lint/typecheck
@@ -221,18 +232,20 @@ recovery
 platform-matrix
 ```
 
-## 17. MVP completion gate
+## 18. MVP completion gate
 
-1. `01`〜`12`受入条件対応test
-2. migration pass
-3. Windows/Linux process integration
-4. concurrent claim
-5. restart recovery
-6. External/Human E2E
-7. Dynamic 1000 + nested + rollback
-8. Reusable nested/cycle/binding
-9. SecretGuard/non-persistence
-10. idempotency scope/TTL
-11. adapter contract
+1. `01`〜`12`受入条件対応
+2. dependency imports Python3.10+
+3. migration
+4. process integration Windows/Linux
+5. claim/concurrency races
+6. PayloadStore inline/spill/crash
+7. Managed ArtifactStore
+8. External/Human E2E
+9. Dynamic1000/nested/rollback
+10. Reusable binding/cycle
+11. SecretGuard
+12. idempotency scope/TTL
+13. adapter contract
 
-WebUI E2EはWebUI詳細設計後。
+WebUI E2Eは後続。
