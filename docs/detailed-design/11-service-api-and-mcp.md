@@ -1,6 +1,6 @@
 # 11. Service API / MCP / HTTP 詳細設計
 
-- Status: Draft v1.4
+- Status: Draft v1.5
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `03`, `07`, `08`, `09`, `10`, `12`
@@ -17,6 +17,7 @@
 8. Canonical request/response modelを本書で固定。
 9. Generic Job state override API無し。
 10. Core Service modelはstrict/no-coercion。
+11. External Lease claimant identityはrequest bodyではなくcurrent ActorContext/AccessScopeからCoreが算出する。
 
 ## 2. 共通model / Adapter parsing
 
@@ -24,10 +25,13 @@ Pydantic typed model + JSON-compatible serialization。`01` strict type semantic
 
 - Core ID=opaque string
 - ActorContext/AccessScopeはAdapter/parentから別argument注入
+- canonical `actor_principal_key`=`12 §2.1`
 - Python/MCP `request_id` optional
 - HTTPは`Idempotency-Key` header -> request_id
 - Unknown request field reject
 - Timestamp=`08` canonical UTC `YYYY-MM-DDTHH:MM:SS.ffffffZ`
+
+External `wf_task_claim/wf_task_submit` はActorContextにnon-empty `actor_id`必須。欠落=`claimant_identity_required`。`claimant_key`をpublic request fieldとして受け取らない。
 
 ### 2.1 Core model
 
@@ -118,12 +122,23 @@ request_id optional
 
 Priority=request value if present, otherwise Workflow Definition priority。
 
-Response=`workflow_run_id,workflow_id,status,conclusion,priority,wait_reason,created_at`。
+Response:
+
+```text
+workflow_run_id
+workflow_id
+status
+conclusion nullable
+priority
+wait_reason nullable
+concurrency_queued_at nullable
+created_at
+```
 
 Run start時`01/08` snapshot固定。Concurrency scope=`(workflow_id,group)`。
 
-- slot admission success/no concurrency -> Run作成、`status=running, wait_reason=null`
-- queue -> Run作成、`status=queued, wait_reason=concurrency`
+- slot admission success/no concurrency -> Run作成、`status=running, wait_reason=null, concurrency_queued_at=null`
+- queue -> Run作成、`status=queued, wait_reason=concurrency, concurrency_queued_at=<queue time>`
 - reject -> Run ID無し `concurrency_limit_reached`
 
 MVPのRun `queued`はConcurrency待ち専用。
@@ -139,6 +154,7 @@ Item:
 ```text
 workflow_run_id/workflow_id/workflow_version
 status/conclusion/priority/run_attempt/wait_reason
+concurrency_queued_at nullable
 progress nullable
 parent_workflow_run_id nullable
 root_workflow_run_id
@@ -166,6 +182,7 @@ Base Response:
 ```text
 workflow_run_id/workflow_id/workflow_version
 status/conclusion/priority/run_attempt/wait_reason
+concurrency_queued_at nullable
 pause_requested/cancel_requested
 parent_workflow_run_id/root_workflow_run_id
 source_identity nullable
@@ -253,8 +270,8 @@ Input/Output/State/Log/Event本文無し。
 
 Root non-terminal Runのみ。
 
-- `status=running` -> `status=paused, wait_reason=null`。Concurrency設定時はslot保持
-- `status=queued, wait_reason=concurrency` -> `status=paused, wait_reason=concurrency`。slot無し、wake候補外
+- `status=running` -> `status=paused, wait_reason=null, concurrency_queued_at=null`。Concurrency設定時はslot保持
+- `status=queued, wait_reason=concurrency` -> `status=paused, wait_reason=concurrency`。元`concurrency_queued_at`保持、slot無し、wake候補外
 - already paused -> same-state success
 
 Child direct pause=`child_run_direct_control_forbidden`。
@@ -263,8 +280,8 @@ Child direct pause=`child_run_direct_control_forbidden`。
 
 Paused root Runのみ。New requestでnon-pausedなら`invalid_state`。Replayはstored result。
 
-- paused + `wait_reason=null` -> `status=running`。admitted holderは同じslotで再開
-- paused + `wait_reason=concurrency` -> `status=queued, wait_reason=concurrency`。slot取得まで待機
+- paused + `wait_reason=null` -> `status=running, concurrency_queued_at=null`。admitted holderは同じslotで再開
+- paused + `wait_reason=concurrency` -> `status=queued, wait_reason=concurrency`。元`concurrency_queued_at`を保持してslot取得まで待機
 
 ### 5.6 `wf_cancel`
 
@@ -292,6 +309,7 @@ run_attempt
 run_status
 run_conclusion nullable
 wait_reason nullable
+concurrency_queued_at nullable
 job_status
 retry_not_before nullable
 updated_at
@@ -301,8 +319,8 @@ Non-terminal retryはrun_attempt不変。Completed failure reopenは`10`。
 
 Concurrency reacquire:
 
-- admitted -> Run running
-- queue -> success response、Run queued/concurrency
+- admitted -> Run running / queue timestamp null
+- queue -> success response、Run queued/concurrency + fresh `concurrency_queued_at`
 - reject -> `concurrency_limit_reached` 409、state変更無し
 
 Retry pendingのtarget Jobは`status=queued, conclusion=null, completed_at=null`。
@@ -421,30 +439,37 @@ claimed_by_self boolean
 lease_id nullable
 ```
 
-- active Leaseの`claimant_key`がcurrent Actor/client principal由来keyと一致する場合のみ`claimed_by_self=true`かつ`lease_id`を返す
-- 他者claimなら`lease_id=null`。claimant identity/lease tokenを一般readへ露出しない
-- inactive/無しなら必要最小metadataだけ
-- `claim_history_summary`へlease_idやclaimant secret/capability情報を含めない
+Current caller principal=`12 actor_principal_key`。
 
-Task submitはLease IDだけでなくcurrent Actor由来claimant ownershipも再確認するため、他Actorがtokenだけでsubmitできない。
+- active Lease `claimant_key == current actor_principal_key` の場合のみ`claimed_by_self=true`かつ`lease_id`を返す
+- `actor_id`が無いcallerは`claimed_by_self=false`としてLease IDを復元しない
+- 他principal claimなら`lease_id=null`。claimant identity/lease tokenを一般readへ露出しない
+- inactive/無しなら必要最小metadataだけ
+- `claim_history_summary`へlease_idやclaimant/capability情報を含めない
+
+Task submitはLease IDだけでなくcurrent Actor principal ownershipも再確認するため、他Actorがtokenだけでsubmitできない。
 
 ### 9.2 `wf_task_claim`
 
 Request=`task_id? / workflow_run_id? / job_template_key? / request_id?`。Task ID指定時他filter禁止。No candidate=`{"task":null}`。
 
+Current ActorContext `actor_id` non-empty必須。欠落=`claimant_identity_required`。
+
 Task object=`task_id/lease_id/lease_expires_at/workflow_run_id/job_run_id/attempt_id/job_key/input`。
 
-Ordering=`07`、Task `available_at`使用。Stable `job_key`はopaque IDsより先にtie-break。
+Claim成功時Lease `claimant_key=current actor_principal_key`。Ordering=`07`、Task `available_at`使用。Stable `job_key`はopaque IDsより先にtie-break。
 
 ### 9.3 `wf_task_submit`
 
 Request=`task_id,lease_id,result,artifacts=[],claim_next=false,request_id?`。
 
+Current ActorContext `actor_id` non-empty必須。`claimant_key`はrequest bodyに含めない。
+
 Response=`submitted=true,workflow_run_id,job_run_id,attempt_id,job_status,job_conclusion,failure?,next_task?`。
 
 `claim_next=true`はsubmit + optional next Lease + idempotencyをsame transaction。`now >= lease_expires_at`はresult不採用。
 
-Transaction内でtask/lease current ownership、Lease ID、claimant_key、Actor/Scopeを再確認する。
+Transaction内でtask/lease current ownership、Lease ID、`claimant_key == current actor_principal_key`、Actor/Scope Authorizationを再確認する。`claim_next`で取得する新Leaseもsame actor_principal_keyを使う。
 
 Lease heartbeat/renew/extend/transfer無し。
 
@@ -539,7 +564,7 @@ State mutationはtrusted internal Action Runtime Handleのみ。
 <ns>_wf_runner_info
 ```
 
-Actor/AccessScopeはtool inputへ露出しない。
+Actor/AccessScopeはtool inputへ露出しない。External claim/submitのclaimant identityもAdapter/parent injectionから算出しtool inputへ露出しない。
 
 ## 14. HTTP Adapter v1
 
@@ -629,6 +654,7 @@ action_contract_error
 validator_contract_error
 idempotency_conflict
 concurrency_limit_reached
+claimant_identity_required
 lease_conflict/lease_expired
 runner_unavailable
 payload_missing/payload_digest_mismatch
@@ -649,13 +675,23 @@ internal_error
 
 Identity=`scope + operation + request_id`。Request hash=`08` canonical Service request excluding request_id/transport fields。
 
+Canonical actor isolationは`12 §2.1 actor_principal_key`。`08`どおりprincipal keyにAccessScopeを含むためIdempotency scopeへAccessScopeを別途二重追加しない。
+
 Flow=Schema -> Actor/Scope -> Auth -> optional fast lookup -> prepare -> `BEGIN IMMEDIATE` -> key/hash再確認 -> domain state再確認 -> side effect+full result row commit -> response。
 
 No reserved row。TTL内same hash replay/different conflict。`now >= expires_at`でreplace可。
 
 ## 18. Authorization / pagination
 
-全public operation authorize。State list/read/history=`workflow_state.read`。Task info/claim/submitはExternalTask resource authorizationに加えてclaimant ownershipをsubmit時確認。List/Eventはfiltered scope。Limit1..200 default50。
+全public operation authorize。State list/read/history=`workflow_state.read`。
+
+Task info/claim/submitはExternalTask resource Authorizationに加え:
+
+- claim/submitはnon-empty actor_id必須
+- submitはcurrent actor_principal_keyとLease claimant_key exact一致必須
+- task infoのactive lease_idは同principalのcallerだけ取得可能
+
+List/Eventはfiltered scope。Limit1..200 default50。
 
 ## 19. Python API
 
@@ -670,26 +706,29 @@ State change Eventへactor/source/request_id。Request body/Secret/巨大payload
 1. strict/no-coercion Core Service models
 2. HTTP explicit integer/boolean/timestamp parsing
 3. Definition/Run separation + start fresh source path
-4. admitted start=running / concurrency queue=queued
-5. pause/resume admitted holder vs concurrency waiter semantics
-6. root priority/HTTP PATCH exact body
-7. Run info concrete Jobs/Dynamic groups/Step exact shapes
-8. Job/Attempt task-review-child navigation IDs
-9. Input info/read Secret reference only
-10. Output read/reopen unavailable
-11. State list metadata-only/current read/history values optional
-12. State history persists failed Attempt writes
-13. no public State mutation
-14. wf_retry Job terminal reset/run_attempt/concurrency response
-15. task available_at ordering + job_key tie-break
-16. task_info does not expose another claimant's lease_id
-17. self claimant can recover active lease_id
-18. submit verifies lease + claimant ownership
-19. submit+claim_next transaction/replay
-20. Human mutation restrictions
-21. Artifact/Log byte-offset/Event contracts
-22. namespaced MCP includes State tools
-23. HTTP exact State routes
-24. status/no422
-25. idempotency commit recheck/expiry
-26. all read/write Authorization
+4. admitted start=running / concurrency queue=queued + queue timestamp
+5. Run list/info/start/retry expose concurrency_queued_at consistently
+6. pause/resume admitted holder vs concurrency waiter preserves queue timestamp
+7. root priority/HTTP PATCH exact body
+8. Run info concrete Jobs/Dynamic groups/Step exact shapes
+9. Job/Attempt task-review-child navigation IDs
+10. Input info/read Secret reference only
+11. Output read/reopen unavailable
+12. State list metadata-only/current read/history values optional
+13. State history persists failed Attempt writes
+14. no public State mutation
+15. wf_retry Job terminal reset/run_attempt/concurrency response
+16. task claim/submit actor_id required
+17. canonical actor_principal_key used for claimant/idempotency
+18. task available_at ordering + job_key tie-break
+19. task_info does not expose another claimant's lease_id
+20. self claimant can recover active lease_id
+21. submit verifies lease + claimant ownership
+22. submit+claim_next same claimant transaction/replay
+23. Human mutation restrictions
+24. Artifact/Log byte-offset/Event contracts
+25. namespaced MCP includes State tools
+26. HTTP exact State routes
+27. status/no422
+28. idempotency commit recheck/expiry
+29. all read/write Authorization
