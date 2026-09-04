@@ -1,6 +1,6 @@
 # JobRunner 基本設計
 
-- Status: Draft v0.6
+- Status: Draft v0.7
 - 対象: MVP
 - WebUI: 画面設計のみ後続
 - 用語: GitHub Actions に対応概念がある場合は可能な限り合わせる
@@ -311,7 +311,9 @@ Retryはnew Attempt。Retry targetのpersistent Input/Definition/Action version/
 
 Automatic retryは明示時のみ。
 
-Manual retryはfailed Job指定。Completed/failure Runなら同じRunをreopenし`run_attempt++`。Success/cancelled Runはretry不可。
+Manual retryはfailed Job指定。ただし **過去Attemptとpersistent Input Snapshotが存在するJobだけ**を対象にする。Activation/Input resolution段階でAttempt開始前にfailedとなりInput Snapshotが存在しないJobは `retry_input_unavailable` としてsame Run retryを拒否し、新Workflow Runを要求する。
+
+Completed/failure Runをmanual retryする場合は同じRunをreopenし`run_attempt++`。Success/cancelled Runはretry不可。
 
 Recoveryだけでcompleted Runをreopenしない。
 
