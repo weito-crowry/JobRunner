@@ -1,25 +1,25 @@
 # 05. Dynamic Jobs 詳細設計
 
-- Status: Draft v0.6
+- Status: Draft v1.0
 - 対象: MVP
 - 上位仕様: `docs/design.md`
-- 関連: `01`, `02`, `03`, `08`
+- 関連: `01`, `02`, `03`, `08`, `10`
 
 ## 1. 目的
 
-`foreach` によるDynamic Job生成、任意深さの入れ子、stable key、full logical `job_key`、atomic expansion、ordering、dependency group、Action/Validator binding、Recoveryを定義する。
+`foreach` によるDynamic Job生成、任意深さの入れ子、stable key、full logical `job_key`、atomic expansion、ordering、dependency group、Recovery、Manual Retry後のexpansion reuseを定義する。
 
 ## 2. 基本原則
 
 1. Actionから任意Jobを直接追加しない。YAML templateをEngineが展開する。
-2. generated Jobは通常Jobと同じJob Run/Attempt/Retry/Log/Artifact/Validator規則を持つ。
+2. generated Jobは通常Jobと同じJob Run/Attempt/Retry/Log/Artifact/Validator規則。
 3. 入れ子深さに固定上限無し。
 4. Workflow Run generated Job数上限default1000。
 5. 1 expansion all-or-nothing。
-6. identityはparent path込みfull `job_key`。
+6. identity=parent path込みfull `job_key`。
 7. 同一Run internal Job同時最大1。
-8. `foreach=[]` の正常0件と `if=false` のskipを区別する。
-9. Nested parentが0件の場合はparent group conclusionを失わず伝播する。
+8. `foreach=[]`正常0件と`if=false` skipを区別。
+9. 一度`expanded`としてcommitしたgenerated Job集合は同一Run内で変更しない。
 
 ## 3. Root Dynamic Job
 
@@ -52,31 +52,28 @@ jobs:
     action: evaluate_condition
 ```
 
-- parent: same Workflow Dynamic template ID literal
-- parentはDAG edge/cycle検証対象
+- parent=same Workflow Dynamic template ID literal
+- parentはDAG edge/cycle対象
 - parentをneedsへ重複記載禁止
-- needsにはparent以外のglobal dependency可
+- needsにはparent以外global dependency可
 - condition dependency set=`{parent} ∪ needs`
 - 1 parent generated Jobにつき0/1 expansion instance
-- dependencies terminal後if評価
-- cancel後alwaysでもnew expansion無し
+- cancel後new expansion無し
 
 Root scalar/Nested object form以外reject。
 
 ## 5. Expansion outcome
 
-各Root/Nested expansion instanceはJob statusとは別に:
+各Root/Nested expansion instance:
 
 ```text
 pending|expanded|skipped|failed|cancelled
 ```
 
-を持つ。
-
-- `if=false` -> `skipped`
-- `foreach`評価成功かつarray（empty含む）をcommit -> `expanded`
-- expression/preflight/storage error -> `failed`
-- Workflow cancelで未展開 -> `cancelled`
+- `if=false` -> skipped
+- foreach評価成功 + array commit -> expanded
+- expression/preflight/storage error -> failed
+- Workflow cancelで未展開 -> cancelled
 
 `skipped` と empty `expanded` を同一扱いしない。
 
@@ -84,38 +81,30 @@ pending|expanded|skipped|failed|cancelled
 
 JSON array必須。null/object/scalar -> `dynamic_foreach_type_error`。
 
-空array:
+Empty array:
 
-- expansion=`expanded`
+- expansion=expanded
 - generated count=0
-- 正常な「仕事なし」
-- Rootならtemplate groupはsuccess
+- 正常な仕事なし
+- Root group success
 
-source arrayはexpansion時snapshot。
+Source arrayはexpansion時snapshot。
 
 ## 7. Nested zero-parent propagation
 
-Nested templateのparent groupがterminalになった時点でgenerated parent Jobが0件なら、per-parent expansion instanceは作れないため `iteration.parent` を使った`if/foreach`を評価しない。
+Nested parent group terminal時にgenerated parent Job=0ならper-parent expressionを評価できないため、parent group conclusionを直接伝播する。
 
-代わりにparent group conclusionを基準にNested template groupを直接terminal化する。
-
-| parent group | nested group (generated parent=0) |
+| parent group | nested group |
 | --- | --- |
-| `success` | `success` |
-| `skipped` | `skipped` |
-| `failure` | `blocked` |
-| `blocked` | `blocked` |
-| `cancelled` | `cancelled` |
+| success | success |
+| skipped | skipped |
+| failure | blocked |
+| blocked | blocked |
+| cancelled | cancelled |
 
-したがって:
+Global needsも合わせ、優先方向は `cancelled > blocked/failure > skipped > success`。
 
-- parent `foreach=[]` -> parent success -> nested success
-- parent Root `if=false` -> parent skipped -> nested skipped
-- parent expansion failure before any generated Job -> nested blocked
-
-このzero-parent propagationは`if: always()`等で「存在しないparent item」を人工的に作る機能ではない。Parent itemが0件ならNested Actionは0件のまま。
-
-Declared global `needs` にfailure/cancelがある場合は通常dependency規則を合わせて、より強い `cancelled > blocked/failure > skipped > success` の方向へterminal化する。
+`always()`でも存在しないparent itemを生成しない。
 
 ## 8. `item` / `iteration`
 
@@ -133,32 +122,34 @@ status/conclusion/continue_on_error
 outputs/artifacts
 ```
 
-ancestors outermost -> parent。Retryで再評価無し。
+Ancestors outermost -> parent。Retryでitem/iterationを再評価しない。
 
 ## 9. raw key / full job key
 
-key result string|integer。integerはbase10 string。empty string禁止。
+Key result=string|integer。Integerはbase10 string。Empty string禁止。
 
-Duplicate raw keyはsame expansion instance内failure。key無しはsource index fallback。
-
-Full path例:
+Duplicate raw keyはsame expansion instance内failure。Key omitted=source index fallback。
 
 ```text
 evaluate[candidate_a]
 evaluate[candidate_a]/condition[x]
 ```
 
-raw keyはUTF-8 percent-encode。safe=`A-Z a-z 0-9 . _ -`、他はuppercase `%HH`。
+Raw key UTF-8 percent-encode。Safe=`A-Z a-z 0-9 . _ -`、他uppercase `%HH`。
 
-Full logical `job_key` fixed byte limit無し。DB TEXT、filesystem pathはopaque ID。
+Full `job_key` fixed byte limit無し。DB TEXT、filesystem pathはopaque ID。
 
 ## 10. 生成数上限
 
-System default1000。Workflow `settings.max-dynamic-jobs` override。
+Effective max:
 
-Countは当該Workflow Run generated Job。ChildはChild Runで別count。
+```text
+Workflow settings.max-dynamic-jobs > System max_dynamic_jobs > 1000
+```
 
-超過時expansion全体0件登録でfailure。truncate禁止。
+Count=当該Workflow Run generated Job総数。Child Runは別count。
+
+超過時当該expansion全rollback。Silent truncate禁止。
 
 ## 11. Expansion identity
 
@@ -168,55 +159,85 @@ template_id
 parent_generated_job_run_id nullable
 ```
 
-Root parent null、Nestedはparent generated Jobごと。
+Root parent=null、Nestedはparent generated Job。
 
 ## 12. Atomic expansion preflight
 
-全candidateをmemory上で構築し、DB insert前に全件検証:
+全candidateをmemory上で構築しDB insert前に全件検証:
 
 - foreach result
 - raw key type/duplicate
 - full job_key collision
 - parent/DAG
-- Input/if/order expression
+- Input/if/order expression validity
 - executor field constraints
 - Runner Pool
-- Action ID/version existence
-- Validator ID/version existence（指定時）
-- Reusable reference/binding prerequisites
-- Retry policy/internal timeout
+- Action current ID/version == Run snapshot
+- Validator current ID/version == Run snapshot
+- Reusable prerequisites
+- Retry/internal timeout
 - generated count limit
-
-Action/Validator versionはWorkflow Run snapshotと一致。Expansion中Registry不一致なら `dynamic_expansion_validation_failed` で全rollback。
-
-1 SQLite transactionでgenerated Job、Action/Validator version、item/iteration/order snapshot、expansion metadataを保存。
 
 1件でも失敗ならgenerated Jobを残さない。
 
-## 13. `if`
+Commit transaction:
 
-Root: declared needs terminal後1回。
-Nested: parent generated Job + declared needs terminal後parentごと。
+- expansion row/outcome
+- source snapshot/digest
+- expansion digest
+- all generated `job_runs`
+- item/iteration/source_order/order_rank
 
-- true -> foreach評価へ
-- false -> そのexpansion instance=`skipped`、foreachは評価しない、generated Job 0
-- expression error -> expansion=`failed`
+をall-or-nothingで保存。
 
-Nested parent generated Jobが0件の場合は§7を使い、per-parent `if`は評価しない。
+## 13. Expansion digest
 
-Workflow cancel後は新規if/foreach activationを開始しない。
+`expanded` outcomeごとに、Manual Retry後の同一性確認用 `expansion_digest` を保存する。
 
-## 14. `order_by` canonical schema
+Canonical source:
 
-未指定時はsource array order。
+```json
+{
+  "template_id": "evaluate",
+  "parent_generated_job_run_id": null,
+  "source": [],
+  "candidates": [
+    {
+      "raw_key": "a",
+      "full_job_key": "evaluate[a]",
+      "item": {},
+      "source_order": 0,
+      "order_rank": 0
+    }
+  ]
+}
+```
 
-明示source order:
+をcanonical-json-v1 -> SHA-256。
+
+`source`にはforeach評価結果arrayそのもの、`candidates`には全candidateをsource order順で入れる。
+
+Empty arrayもdigestを持つ。
+
+## 14. `if`
+
+Root=declared needs terminal後1回。Nested=parent generated Job + declared needs terminal後parentごと。
+
+- true -> foreach
+- false -> expansion skipped/generated0
+- error -> expansion failed
+
+Zero-parentは§7。
+
+## 15. `order_by`
+
+Omitted=`source_order`。
 
 ```yaml
 order_by: source_order
 ```
 
-Expression sort:
+または:
 
 ```yaml
 order_by:
@@ -226,63 +247,42 @@ order_by:
     direction: asc
 ```
 
-許可形:
+Allowed:
 
 ```text
-null/omitted
-literal "source_order"
-non-empty array of {expr, direction}
+omitted|null
+literal source_order
+non-empty array of {expr,direction}
 ```
 
-`direction=asc|desc`、default `asc`。Unknown key reject。
+Direction=`asc|desc`, default asc。Unknown key reject。
 
-各criterionは全candidateで同一型のstringまたはfinite number。null/bool/object/array/NaN/Infinity/criterion内混在型は`dynamic_order_type_error`。
+Criterionはstringまたはfinite number、criterion内同型。null/bool/object/array/NaN/Infinity/混在禁止。
 
-Sortはcriterionを左からlexicographic適用し、全criterion同値ならsource_order ASCでstable tie-break。最終整数`order_rank`をexpansion内0..N-1でsnapshot。
+Sort criteria left-to-right、tie=source_order ASC。`order_rank=0..N-1` snapshot。
 
-Runner選択:
+Runner orderingはWorkflow priority -> Job priority -> order_rank -> source_order -> ready_at -> id。
 
-1. Workflow priority DESC
-2. Job priority DESC
-3. Dynamic order_rank ASC
-4. source_order ASC
-5. ready_at ASC
-6. job_run_id
-
-Different expansion/template間でもorder_rankは同じ整数軸として比較する。Job priorityをまたいでorder_byが優先することはない。
-
-## 15. Template group status / conclusion
-
-`needs: [evaluate]` 等で参照するTemplate groupは、そのtemplateに属する全expansion instance + generated Jobを集約する。
+## 16. Template group status / conclusion
 
 Status:
 
-- activation/expansion未確定、またはgenerated Job non-terminalあり -> `running`
-- 全expansion outcome確定 + generated Job全terminal -> `completed`
+- expansion未確定/non-terminal generatedあり -> running
+- 全expansion確定 + generated全terminal -> completed
 
-Conclusion優先順位:
+Conclusion priority:
 
-1. cancel由来あり -> `cancelled`
-2. expansion failure / non-allowed generated failureあり -> `failure`
-3. required generated blockedあり -> `blocked`
-4. 全expansion instanceが`skipped`でgenerated Job 0 -> `skipped`
-5. それ以外で全generated Jobがeffective success/skipped、または正常empty expansion -> `success`
+1. cancel -> cancelled
+2. expansion/non-allowed Job failure -> failure
+3. required blocked -> blocked
+4. all expansion skipped + generated0 -> skipped
+5. その他effective success/skippedまたは正常empty -> success
 
-Nested parent Job 0件の場合は§7の直接propagationを優先する。
+Nested zero-parentは§7優先。
 
-例:
+Generated Job 0件ならoutputs/artifacts/jobs mapはempty object。
 
-- Root `if=false` -> group `completed/skipped`
-- Root `foreach=[]` -> group `completed/success`
-- Nested parent success+0 jobs -> nested `completed/success`
-- Nested parent skipped+0 jobs -> nested `completed/skipped`
-- Nested parent failure+0 jobs -> nested `completed/blocked`
-- Nested parent10件の全てで`if=false` -> group `completed/skipped`
-- 一部parentでskip、一部でsuccess -> group `completed/success`（failure/blocked/cancel無し）
-
-このgroup conclusionを`02`のcondition helperが通常dependencyと同様に使う。
-
-## 16. Output / Artifact aggregation
+## 17. Output / Artifact aggregation
 
 ```text
 needs.<template>.jobs[full_job_key]
@@ -290,11 +290,9 @@ needs.<template>.outputs[full_job_key]
 needs.<template>.artifacts[full_job_key]
 ```
 
-raw keyだけでindexしない。
+Raw keyだけでindexしない。
 
-Generated Job 0件なら各mapはempty object。
-
-## 17. Retry / Recovery
+## 18. Generated Job Retry
 
 Generated Job Retryはsame Job Run new Attempt。
 
@@ -303,34 +301,79 @@ Generated Job Retryはsame Job Run new Attempt。
 - full/raw key
 - item/iteration
 - persistent Input
+- Secret bindings
 - order rank
 - Action/Validator version
 
-foreach/order再評価無し。
+foreach/key/orderは再評価しない。
 
-Recovery:
+## 19. Manual Retry後のExpansion Reuse
+
+Upstream JobをManual Retryした場合、descendantに**既にcommit済み`expanded` expansion**があるなら、そのgenerated集合を勝手に差し替えない。
+
+副作用無しでcurrent dependency contextから再計算:
+
+1. expansion instance identity集合
+2. current `if`
+3. foreach source array
+4. raw/full key
+5. item snapshot
+6. source order/order rank
+7. Action/Validator/Runner Pool preflight
+8. canonical `expansion_digest`
+
+Required:
+
+- existing `expanded` instanceの集合が同一
+- 全instanceでcurrent `if=true`
+- current expansion digest == stored digest
+
+Exact matchならexisting expansion/generated Jobを保持し、その後各successful generated Jobは`03` Result Reuse check。
+
+Mismatch/error:
+
+```text
+category=runtime
+code=dynamic_expansion_not_reusable
+retryable=false
+```
+
+としてsame Runをfailureにしnew Workflow Runを要求する。
+
+### 19.1 skipped expansion
+
+Template group全体が`completed/skipped`でgenerated Job=0の場合は未実行扱いなので、Manual Retry descendant reactivation時にそのtemplateの`skipped` expansion rowをreset/removeしてcurrent dependenciesから再評価してよい。過去skip事実はEvent Logへ残す。
+
+### 19.2 expanded empty
+
+`foreach=[]` は`expanded/success`なので実行済み成功group。Manual Retry後もcurrent digest exact match必須。新たに非emptyへ変わった場合はsame RunでJob生成せず `dynamic_expansion_not_reusable`。
+
+### 19.3 mixed group
+
+一部expansion skipped + 一部expandedでgroup successの場合は**group全体をsuccessfulとして扱う**。Skipped instanceも含めcurrent outcome/digest構造が同一でなければreuse不可。Group successを理由に一部skipだけ再展開しない。
+
+## 20. Recovery
 
 - committed expansion再生成無し
 - uncommittedはcurrent dependenciesから再評価
-- committed outcome (`expanded|skipped|failed|cancelled`)を重複確定しない
-- zero-parent direct propagationもidempotent
-- success generated Job保持
+- committed outcome重複確定無し
+- expansion digest復元
+- zero-parent propagation idempotent
 - running Runner recovery
 - queued維持
+- `reuse_check_pending`時は§19再開
 
-## 18. Reusable / External / Human
+## 21. Reusable / External / Human
 
 Dynamic templateにReusable/External/Human可。Field/Validator constraintsは`01`。
 
-External generated Jobもoptional Validator可。Human/Reusable generated JobはValidator禁止。
+## 22. Pause / Cancel
 
-## 19. Pause / Cancel
-
-Pause中new expansion無し。commit済み保持。
+Pause中new expansion無し。Commit済み保持。
 
 Cancel後new expansion無し。未実行generatedは通常cancel。
 
-## 20. Failure code
+## 23. Failure code
 
 ```text
 dynamic_foreach_type_error
@@ -343,27 +386,26 @@ dynamic_parent_invalid
 dynamic_cycle_detected
 dynamic_expansion_validation_failed
 dynamic_expansion_storage_failed
+dynamic_expansion_not_reusable
 ```
 
-## 21. 受入条件
+## 24. 受入条件
 
 1. Root/Nested/3+ depth
-2. parent cycle
-3. parent+needs helper
-4. parent別same raw key
-5. no fixed job_key limit
-6. 1000/1001 rollback
-7. Action+Validator version preflight before insert
-8. atomic recovery
-9. `order_by` source_order/list schema/asc/desc/stable tie
-10. Root `if=false` group skipped
-11. Root `foreach=[]` group success
-12. nested parent success+0 -> success
-13. nested parent skipped+0 -> skipped
-14. nested parent failure/blocked+0 -> blocked
-15. nested parent cancelled+0 -> cancelled
-16. no parent item synthesis by always()
-17. mixed skipped/success group success
-18. group failure/blocked/cancel precedence
-19. full-key output/artifact
-20. Retry Action+Validator/item/order snapshot固定
+2. parent cycle/zero-parent propagation
+3. parent別same raw key
+4. no fixed job_key limit
+5. System/Workflow 1000 hierarchy + 1001 rollback
+6. Action/Validator version preflight
+7. atomic expansion/recovery
+8. order schema/asc/desc/stable tie
+9. Root if=false skipped vs foreach=[] success
+10. group precedence/mixed skip-success
+11. expansion_digest golden
+12. Manual Retry exact expansion reuse
+13. changed source/key/order/item -> not reusable/new Run
+14. expanded empty changed to nonempty -> not reusable
+15. whole skipped group may re-evaluate
+16. mixed successful group cannot partially re-expand
+17. full-key output/artifact
+18. Generated Retry snapshot固定
