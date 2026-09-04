@@ -1,6 +1,6 @@
 # JobRunner 基本設計
 
-- Status: Draft v0.7
+- Status: Draft v0.8
 - 対象: MVP
 - WebUI: 画面設計のみ後続
 - 用語: GitHub Actions に対応概念がある場合は可能な限り合わせる
@@ -26,7 +26,7 @@ JobRunner は既存アプリケーションへ組み込んで使う軽量な Per
 - Reusable Workflow
 - Event / Execution Log
 - SQLite persistence
-- MCP / Web / Python 共通Service
+- MCP / HTTP / Python 共通Service
 
 非目標: Airflow/Temporal/n8n級の独立大規模基盤、Kubernetes/distributed scheduler、任意shell標準機能、GUI workflow editor、CLI/Cron、通知、完全GitHub Actions互換、本格sandbox、認証基盤。
 
@@ -35,14 +35,14 @@ JobRunner は既存アプリケーションへ組み込んで使う軽量な Per
 Python >=3.10。
 
 ```text
-ruamel.yaml >=0.19,<0.20
+ruamel.yaml >=0.19.1,<0.20
 pydantic >=2.13,<3
 jsonschema >=4.26,<5
 cel-python >=0.5,<0.6
 jmespath >=1.1,<2
 ```
 
-SQLite/process/JSON/UUID等はPython標準libraryを優先する。
+ライセンスは `ruamel.yaml/pydantic/jsonschema/jmespath = MIT`, `cel-python = Apache-2.0`。SQLite/process/JSON/UUID等はPython標準libraryを優先する。
 
 ## 3. 用語
 
@@ -70,7 +70,7 @@ Parent System
 ├─ PayloadStore
 ├─ ArtifactStore
 ├─ MCP Adapter optional
-├─ Web Adapter optional
+├─ HTTP/Web Adapter optional
 └─ Runner Pools
    └─ Runner Process
       ├─ Heartbeat Thread
@@ -79,13 +79,17 @@ Parent System
 
 親起動時にRuntime/Runner Poolを自動初期化。JobRunner専用サービスの手動起動は不要。
 
-1 Repository / 1 Python Package。MCP/Webはoptional dependency。
+1 Repository / 1 Python Package。MCP/HTTP Web Adapterはoptional dependency。
 
 ## 5. Workflow Definition
 
 Canonical formatはYAML。safe loader、duplicate key/merge key/custom tag/unknown keyをreject。
 
+Workflow Inputは`type/required/nullable/default/schema`で定義し、`null`許可は`nullable: true`へ統一する。
+
 `env`はJSON-compatible literal-only。Expression/Secret参照は禁止。
+
+Concurrency groupは最終的にnon-empty stringで、case-sensitive完全一致。暗黙trim/lowercase無し。
 
 Run開始時に実使用定義をsnapshot:
 
@@ -105,7 +109,7 @@ GitHub Actions風`${{ ... }}`。
 - CEL: condition/value計算
 - JMESPath: JSON filter/projection
 
-Secretsはinternal Action Jobの`with`だけ。`env`、External/Human/Reusable、condition等では禁止。
+Secretsはinternal Action Jobの`with`だけ。Secret valueはMVPではnon-empty string。`env`、External/Human/Reusable、condition等では禁止。
 
 Current Attemptでmaterializeしたknown SecretはSecretGuardで:
 
@@ -119,7 +123,7 @@ Current Attemptでmaterializeしたknown SecretはSecretGuardで:
 
 親bootstrapでProcess起動時に再構築。CallableをDB/pickle転送しない。
 
-Actionは`action_id + version`。sync/async対応。
+Action identityはnon-empty `action_id + action_version` string。親がversion更新責任を持つ。sync/async対応。
 
 Runtime Handle:
 
@@ -148,7 +152,7 @@ Runnerは常駐しJobをpull。
 5. ready time
 6. deterministic ID
 
-External task claimも同じordering軸。
+Priorityはsigned 64-bit integer。External task claimも同じordering軸。
 
 ## 9. Runner / Action Process / IPC
 
@@ -365,7 +369,7 @@ Attempt temp directoryは終了時削除、sandboxではない。
 
 ## 21. Persistence / Idempotency
 
-Standard SQLite、WAL/FK/busy timeout。
+Standard SQLite、WAL/FK/busy timeout。FKは暗黙cascadeせずNO ACTION、Retentionが依存順に明示削除。
 
 重要constraint/transaction:
 
@@ -376,28 +380,25 @@ Standard SQLite、WAL/FK/busy timeout。
 - one active Lease / Task
 - one Human Review / Attempt
 - state current+history atomic
-- concurrency holder atomic
+- concurrency holder atomic / case-sensitive group
 - Payload inline/blob metadata integrity
 - reuse metadata/pending state
 
 Idempotency scopeはsystem namespace + resource + AccessScope + Actor/client principal。Default TTL24h。TTL後expired rowが残っていてもtransaction内で置換しsame keyをnew requestとして利用可能。
 
-## 22. Authorization / Service / MCP
+## 22. Authorization / Service / MCP / HTTP
 
 認証は親責任。Coreは全public read/writeでAuthorizationProviderを通す。Default AllowAll。
 
-Web/MCP/Pythonは同じService layer。
+MCP/HTTP/Pythonは同じService layer。
 
-MCP public name:
-
-```text
-<namespace>_wf_*
-```
-
-主要:
+DefinitionとRunを分離したcanonical logical API:
 
 ```text
-wf_start/list/info/pause/resume/cancel/retry/priority_update
+wf_definition_list/info
+wf_start
+wf_run_list/info
+wf_pause/resume/cancel/retry/priority_update
 wf_output_info/read
 wf_task_info/claim/submit
 wf_review_list/info/submit
@@ -406,7 +407,11 @@ wf_log_read
 wf_runner_info
 ```
 
-`wf_info`はOutput本文/Execution Log本文を含めない。Output本文は`wf_output_read`で取得し、optional JMESPath `select`で巨大JSONの一部だけを読める。MCP response上限超過時はsilent truncateせずerror。
+MCP public nameは `<namespace>_wf_*`。曖昧な`wf_list/wf_info` aliasはMVPでは作らない。
+
+HTTP標準prefixは `/api/jobrunner/v1`。Exact route/methodは`11-service-api-and-mcp.md`をSource of Truthとする。State-changing HTTP idempotencyは`Idempotency-Key` headerをService `request_id`へmappingする。
+
+`wf_run_info`はOutput本文/Execution Log本文を含めない。Output本文は`wf_output_read`で取得し、optional JMESPath `select`で巨大JSONの一部だけを読める。MCP response上限超過時はsilent truncateせずerror。
 
 ## 23. Retention / Scheduler / CLI / WebUI
 
@@ -414,7 +419,7 @@ Retention default無期限。
 
 Scheduler/Cron/CLIはMVP無し。
 
-WebUI画面設計は後続。ただしService/HTTP Adapter境界は最初から持つ。
+WebUI**画面構成**は後続。ただしService/HTTP Adapter contractは本設計で固定する。
 
 ## 24. Source of Truth
 
