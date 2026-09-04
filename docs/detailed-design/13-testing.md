@@ -1,6 +1,6 @@
 # 13. Testing 詳細設計
 
-- Status: Draft v0.5
+- Status: Draft v0.6
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`〜`12`
@@ -17,7 +17,7 @@
 
 ## 2. Foundation dependencies
 
-Python3.10で:
+Python 3.10で以下のimportと代表処理をCI確認する。
 
 ```text
 ruamel.yaml >=0.19,<0.20
@@ -27,20 +27,19 @@ cel-python >=0.5,<0.6
 jmespath >=1.1,<2
 ```
 
-のimport / representative parse-validationをCI確認。
-
 ## 3. Definition / Expression
 
 - duplicate/merge/custom tag reject
-- env literal-only / expression/Secret reject
+- unknown key
+- `env` literal-only、expression/Secret reject
 - bad needs / Dynamic parent cycle
 - executor field conflict
 - external/human/reusable timeout reject
 - invalid CEL/JMESPath
 - null/missing/type strictness
 - normal skipped dependency -> downstream default skip
-- continue-on-error effective success
-- Dynamic group aggregate + Nested parent helper
+- continue-on-error failure -> effective success
+- Dynamic group aggregate / Nested parent helper
 
 ## 4. JSON Output / PayloadStore
 
@@ -65,7 +64,7 @@ Transparent storage:
 - threshold -> inline
 - threshold+1 -> blob
 - multi-MiB JSON -> success
-- downstream `needs.*.outputs` がinline/blob同じvalue
+- downstream `needs.*.outputs` がinline/blobで同一value
 - Workflow Output spill
 - blob temp write -> atomic rename -> DB commit
 - DB commit failure orphan blob cleanup
@@ -75,36 +74,39 @@ Transparent storage:
 
 ## 5. SecretGuard
 
-Current Attempt known Secretについて:
+Current Attempt known Secret:
 
 - Output exact/substring/nested -> reject
 - large Output spill前reject
 - state.set -> reject
-- Artifact metadata URI -> reject
+- Artifact metadata/URI -> reject
 - Event/error -> reject
 - log -> redact
 - managed Artifact text/binary byte match -> reject
 - chunk境界match -> reject
 - transformed Secretは保証外
 
-## 6. Scheduling
+## 6. Scheduling / Claim
 
-- Workflow/Job/Dynamic priority order
+- Workflow priority
+- Job priority
+- Dynamic order/source
 - pool routing
 - one internal running / Workflow Run
-- multiple Runs parallel
+- multiple Workflow Runs parallel
 - pause/resume
 - non-preemptive priority update
 - internal claim exactly-one race
+- External claimは同じordering軸
 
 ## 7. Runner / IPC
 
 - start/ready/log/progress/step/error/exiting
 - Runtime Handle request_id correlation
 - state_get/set response
-- artifact put/materialize response
-- request待ち中cancel
-- Action return result file protocol
+- Artifact put/materialize response
+- Runtime request待ち中cancel
+- Action result file protocol
 - giant JSON resultでもIPC frame小さい
 - result path traversal reject
 - size/digest mismatch
@@ -126,45 +128,48 @@ Current Attempt known Secretについて:
 - parent別same raw key
 - percent encoding
 - fixed job_key length limit無し
-- 1000/1001 rollback
+- 1000 allowed / 1001 rollback
 - nested 2/3+ depth
-- parent cycle
+- arbitrary-depth representative
+- parent edge cycle
 - parent+needs helper
 - order type/order
 - expansion crash/restart
 - group status/conclusion
 - arbitrary JSON Output aggregation
+- full-key Artifact lookup
 
 ## 10. Reusable Workflow
 
 - registered ID
-- caller-directory relative resolution
+- relative pathはcaller source directory基準
 - traversal/symlink escape
-- non-filesystem relative reject
-- binding固定 / retry same binding
-- parent-child output/state isolation
+- non-filesystem caller relative reject
+- binding固定 / Retry same binding
+- Parent/Child Output/state isolation
 - cycle
 - direct Child control reject
-- Dynamic+Reusable
+- Dynamic + Reusable
 - restart duplicate防止
+- Child Workflow Output large spill
 
 ## 11. Managed ArtifactStore
 
-- put_file copies to durable store
-- put source work_dir traversal reject
+- put_file durable copy
+- source work_dir traversal reject
 - immutable same-name generations
-- managed Artifact materialize current work_dir
+- managed materialize current work_dir
 - materialize destination safety
-- retry current generation resolution
+- Retry current generation
 - managed retention deletes data
-- store failure -> no metadata/current pointer
+- store failure -> no metadata/current exposure
 
 External Artifact:
 
-- register URI metadata
+- URI metadata register
 - no fetch
 - Core retention does not delete external data
-- External LLM task_submit Artifactはexternal reference only
+- External LLM `task_submit.artifacts`はexternal reference only
 
 ## 12. External LLM
 
@@ -185,32 +190,84 @@ External Artifact:
 - cancel/pause/retry
 - timeout無し
 
-## 14. Retry / Recovery
+## 14. Automatic / Manual Retry
 
 - auto retry default off
-- max/condition/backoff
-- manual retry completed/failure reopen
-- run_attempt++
-- success/cancelled retry reject
-- blocked/skipped descendants reevaluate
-- terminal Run not reopened by recovery
-- Parent restart old running -> runner_lost
-- Dynamic/Child duplicate無し
+- max-attempts / condition / backoff
+- Retry target Input fixed
+- manual retry completed/failure Run reopen
+- `run_attempt++`
+- success/cancelled Run retry reject
+- blocked/skipped descendants re-evaluate
+- failed non-target descendant not auto-retried
+- terminal Run not reopened by Recovery
 
-## 15. Persistence / Idempotency
+## 15. Same-Run Result Reuse
+
+### Scope
+
+- same Workflow Runだけreuse可能
+- 別Workflow Runの同一Job/同一Inputでもautomatic reuseしない
+
+### Reuse key positive
+
+同一Runで以下が同一ならmatchすること:
+
+- final persistent Job Input digest
+- direct upstream Artifact identity (`artifact_id` + digest if present)
+- entire Workflow Definition hash
+- executor identity
+  - internal `action_id + version`
+  - external protocol identity
+  - human protocol identity
+  - reusable binding Child Definition/action versions
+
+### Negative / ineligible
+
+- Input changed -> mismatch
+- upstream Artifact generation changed -> mismatch
+- Definition hash changed -> mismatch
+- Action version changed/unavailable -> mismatch/fail-closed
+- spilled Output blob missing/digest bad -> cannot reuse
+- ActionがRuntime Handle `state.get`使用 -> `reuse_eligible=false`
+- Actionがfrozen Input/direct upstream以外のArtifactをdynamic materialize -> false
+
+### Manual Retry descendant
+
+- successful descendant + key match -> existing success維持 + `job_result_reused`
+- mismatch/ineligible/Payload missing -> `successful_job_result_not_reusable`
+- mismatch時にsame Job Runへnew InputのAttemptを自動作成しない
+- new Workflow Runが必要
+
+### Retention
+
+Reuse候補のPayload/managed Artifactがretentionで欠落した場合、silent reuseせずfail-closed。
+
+## 16. Recovery
+
+- Parent restart old running -> `runner_lost`
+- queued/waiting/backoff restore
+- Dynamic expansion duplicate無し
+- Child duplicate無し
+- `reuse_check_pending` restore
+- completed RunはRecoveryだけでreopenしない
+
+## 17. Persistence / Idempotency
 
 - migration/WAL/FK/busy timeout
 - output inline/blob column constraints
+- `reuse_context_json/reuse_key/reuse_eligible`
+- `reuse_check_pending`
 - internal running unique
 - Dynamic/Reusable/External/Human unique
 - state current/history atomic
 - concurrency race
-- idempotency actor/scope isolation
+- idempotency Actor/AccessScope isolation
 - TTL replay/conflict
 - TTL expired row replacement
 - task_claim idempotent replay no extra Lease
 
-## 16. Authorization
+## 18. Authorization / Security
 
 - AllowAll/Deny/filtered scope
 - all public read/write authorize
@@ -218,9 +275,9 @@ External Artifact:
 - Artifact URI no auto-fetch
 - arbitrary shell無し
 
-## 17. Platform / CI
+## 19. Platform / CI
 
-Windows11 / Linux。
+Windows 11 / Linux。
 
 ```text
 lint/typecheck
@@ -232,10 +289,10 @@ recovery
 platform-matrix
 ```
 
-## 18. MVP completion gate
+## 20. MVP completion gate
 
 1. `01`〜`12`受入条件対応
-2. dependency imports Python3.10+
+2. dependency import Python3.10+
 3. migration
 4. process integration Windows/Linux
 5. claim/concurrency races
@@ -245,7 +302,8 @@ platform-matrix
 9. Dynamic1000/nested/rollback
 10. Reusable binding/cycle
 11. SecretGuard
-12. idempotency scope/TTL
-13. adapter contract
+12. same-run Result Reuse positive/negative
+13. idempotency scope/TTL
+14. adapter contract
 
 WebUI E2Eは後続。
