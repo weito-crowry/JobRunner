@@ -1,6 +1,6 @@
 # 09. Artifact / Log / Workflow State 詳細設計
 
-- Status: Draft v0.7
+- Status: Draft v0.8
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `02`, `04`, `08`, `11`, `12`
@@ -98,16 +98,18 @@ Artifact owner `workflow_run_id == current workflow_run_id` なら、current Run
 
 ### 7.2 different Workflow Run
 
-Artifact ownerが別Runの場合、以下を**全て**要求する。
+Artifact ownerが別Runの場合、以下を全て要求する。
 
-1. canonical ArtifactRefがcurrent Jobのpersistent Input JSON tree内に存在する
+1. canonical ArtifactRefがcurrent Jobのpersistent Input JSON tree内に存在
 2. Artifact row/dataが存在し`data_deleted_at IS NULL`
 3. current ActorContext/AccessScopeに対してAuthorizationProviderがsource Artifact readを許可
 4. refのartifact_idとDB metadataが一致
 
-これにより、単に他Runのartifact_idを知っているだけではmaterializeできない。
+単に他Runのartifact_idを知っているだけではmaterialize不可。
 
 Parentが過去Run Artifactを明示Workflow Inputとして渡すこと、Reusable parentがChild `with`へArtifactRefを渡すことは許可される。
+
+**ArtifactRefを別Runへ渡してもsource ArtifactのRetention hold/pinは作らない。** Source Run/Artifactのsnapshot retention policyが優先され、data/metadataが期限削除された場合は`artifact_data_unavailable|not_found`等でfail-closedする。参照先Runが生存していることを理由にsource retentionを延長しない。
 
 ### 7.3 External Reference
 
@@ -115,9 +117,9 @@ Coreはmaterializeしない。ArtifactRefの`uri`をAction/親側が解釈する
 
 ### 7.4 Reuse eligibility
 
-- persistent Inputに含まれるArtifactRefはInput digestへ固定される
+- persistent Inputに含まれるArtifactRefはInput digestへ固定
 - same-run direct upstream Artifactは`03`のdirect_upstream_artifactsへも固定
-- persistent Input外のArtifactをRuntime中にmaterializeした場合は`reuse_eligible=false`
+- persistent Input外ArtifactをRuntime中にmaterializeした場合は`reuse_eligible=false`
 
 ## 8. Current Artifact / generations
 
@@ -253,6 +255,7 @@ managed-artifact-data-days
 
 - due基準=Artifact `created_at`
 - owner Workflow Run non-terminal中は期限だけで削除しない
+- **別RunからArtifactRefで参照されていてもRetention holdを作らない**
 - ArtifactStore delete成功後`data_deleted_at`
 - current reference/materializeは`data_deleted_at IS NULL`のみusable
 
@@ -260,6 +263,7 @@ managed-artifact-data-days
 
 - due基準=Artifact `created_at`
 - owner Run non-terminal中は削除しない
+- cross-run ArtifactRef存在を理由に期限延長しない
 - Managed dataが残る場合metadata先行削除禁止
 - External metadata削除でも外部実体は触らない
 
@@ -279,7 +283,9 @@ Crashでowner metadataを持たないtemp/payload/artifact store objectはMainte
 
 ## 18. RetentionとResult Reuse
 
-Successful descendant reuse対象Payload/Managed ArtifactがRetentionで既に消えている場合、silent reuse禁止。
+Successful descendant reuse対象Payload/Managed ArtifactがRetentionで消えている場合、silent reuse禁止。
+
+Cross-run ArtifactRefもsource retentionで失効し得る。Materialize時にavailabilityを毎回再確認する。
 
 `03/10`のreuse validationでavailability不一致を検出し `successful_job_result_not_reusable` へ。
 
@@ -301,14 +307,16 @@ Successful descendant reuse対象Payload/Managed ArtifactがRetentionで既に�
 5. explicit cross-run ArtifactRef materialize + authorization
 6. raw cross-run artifact_id only reject
 7. External Artifact core materialize reject
-8. Output Payloadとの分離
-9. Execution Log read/no Run info body
-10. State history/SecretGuard
-11. temp cleanup
-12. retention inheritance/cutoff
-13. non-terminal retention guard
-14. managed data_deleted_at/current reference behavior
-15. run-history FK cleanup
-16. retention audit survives normal event retention
-17. orphan cleanup audit
-18. retention loss causes reuse fail-closed
+8. cross-run ArtifactRef does not pin source retention
+9. retained source cross-run materialize fail-closed
+10. Output Payloadとの分離
+11. Execution Log read/no Run info body
+12. State history/SecretGuard
+13. temp cleanup
+14. retention inheritance/cutoff
+15. non-terminal retention guard
+16. managed data_deleted_at/current reference behavior
+17. run-history FK cleanup
+18. retention audit survives normal event retention
+19. orphan cleanup audit
+20. retention loss causes reuse fail-closed
