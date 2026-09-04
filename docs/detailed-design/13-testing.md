@@ -1,6 +1,6 @@
 # 13. Testing 詳細設計
 
-- Status: Draft v0.8
+- Status: Draft v0.9
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`〜`12`
@@ -20,22 +20,37 @@
 Python 3.10で:
 
 ```text
-ruamel.yaml >=0.19,<0.20
+ruamel.yaml >=0.19.1,<0.20
 pydantic >=2.13,<3
 jsonschema >=4.26,<5
 cel-python >=0.5,<0.6
 jmespath >=1.1,<2
 ```
 
-のimport/代表処理をCI確認。
+のinstall/import/代表処理をCI確認する。
+
+追加確認:
+
+- CEL custom function bindingで`jmespath(...)` helperを登録・実行できる
+- Windows Python3.10でcel-python/google-re2依存をinstallできる
+- dependency license inventoryが設計記載と一致する
 
 ## 3. Definition / Expression
 
 - duplicate/merge/custom tag reject
 - unknown key
+- Input `nullable=false/true`
+- required+nullable
+- `default:null` nullable true/false
+- extra Input reject
 - env literal-only / expression/Secret reject
 - bad needs / Dynamic parent cycle
 - executor field conflict
+- Action version empty/non-string reject
+- concurrency group non-string/null/empty reject
+- concurrency group case-sensitive identity
+- priority signed64 min/max/overflow
+- NaN/Infinity numeric field reject
 - external/human/reusable timeout reject
 - invalid CEL/JMESPath
 - null/missing/type strictness
@@ -76,9 +91,18 @@ Transparent storage:
 - digest mismatch -> `payload_digest_mismatch`
 - Attempt history old Output維持
 
-## 5. Output Service / Adapter
+## 5. Service / MCP / HTTP Adapter
 
-- `wf_info`はOutput metadataのみ、本文無し
+Canonical names:
+
+- `wf_definition_list/info`
+- `wf_run_list/info`
+- ambiguous `wf_list/wf_info` alias無し
+- namespaced MCP names
+
+Output:
+
+- `wf_run_info`はOutput metadataのみ、本文無し
 - `wf_output_info`はinline/blobで同じmetadata contract
 - `wf_output_read`はinline/blobで同じJSON value
 - Job current Output / specific Attempt Output / Workflow Outputのsource resolution
@@ -88,7 +112,24 @@ Transparent storage:
 - selectで小さいresponseなら成功
 - Output read authorization / AccessScope
 
+HTTP v1:
+
+- 全canonical route/methodが`11`と一致
+- path ID percent-encoding
+- list/query mapping
+- `Idempotency-Key` -> Service request_id
+- bodyにduplicate request_idを持たせない
+- canonical HTTP error mapping 200/201/400/401/403/404/409/413/500
+- retry_input_unavailable -> 400 or 409ではなく`11`のcanonical domain mappingに従う（MVPでは400 validation/domain contract error）
+
 ## 6. SecretGuard
+
+SecretsProvider:
+
+- non-empty str success
+- empty str -> `secret_value_invalid`
+- bytes/number/object -> `secret_value_invalid`
+- missing -> `secret_not_found`
 
 Current Attempt known Secret:
 
@@ -114,6 +155,7 @@ Current Attempt known Secret:
 - non-preemptive priority update
 - internal claim exactly-one race
 - External claim同ordering
+- concurrency group `Foo` と `foo` は別group
 
 ## 8. Runner / IPC
 
@@ -178,7 +220,7 @@ Current Attempt known Secret:
 - materialize destination safety
 - Retry current generation
 - managed retention deletes data
-- store failure -> no metadata/current exposure
+- store finalize後DB failure -> orphan cleanup/no metadata exposure
 
 External Artifact:
 
@@ -214,6 +256,7 @@ External Artifact:
 - failed Job with prior Attempt/Input Snapshot -> manual retry allowed
 - activation前failure with no Attempt/Input Snapshot -> `retry_input_unavailable`
 - `retry_input_unavailable` はsame Run retryせずnew Workflow Run要求
+- Service/API error mapping
 - manual retry completed/failure Run reopen
 - run_attempt++
 - success/cancelled Run retry reject
@@ -260,15 +303,17 @@ RetentionによるPayload/managed Artifact欠落もsilent reuse禁止。
 - reuse_check_pending restore
 - completed Run Recovery-only reopen無し
 
-## 18. Persistence / Idempotency
+## 18. Persistence / Idempotency / Retention
 
 - migration/WAL/FK/busy timeout
+- unknown future schema version reject
 - output inline/blob column constraints
 - reuse context/key/eligible/pending
 - internal running unique
 - Dynamic/Reusable/External/Human unique
 - state current/history atomic
-- concurrency race
+- concurrency race/case-sensitive group
+- FK NO ACTION / child-first explicit retention deletion
 - idempotency Actor/AccessScope isolation
 - TTL replay/conflict
 - expired row replacement
@@ -278,6 +323,7 @@ RetentionによるPayload/managed Artifact欠落もsilent reuse禁止。
 
 - AllowAll/Deny/filtered scope
 - all public read/write authorize
+- Definition list/info authorization
 - log path safety
 - Artifact URI no auto-fetch
 - arbitrary shell無し
@@ -299,20 +345,19 @@ platform-matrix
 ## 21. MVP completion gate
 
 1. `01`〜`12`受入条件対応
-2. dependency import Python3.10+
-3. migration
+2. dependency install/import Python3.10+ / Windows/Linux
+3. migration/FK retention semantics
 4. process integration Windows/Linux
 5. claim/concurrency races
 6. PayloadStore inline/spill/crash
-7. Output Service / adapter contract
+7. Service/MCP/HTTP adapter contract
 8. Managed ArtifactStore
 9. External/Human E2E
 10. Dynamic1000/nested/rollback
 11. Reusable binding/cycle
-12. SecretGuard
+12. SecretGuard + Secret value contract
 13. same-run Result Reuse
 14. Retry Input availability boundary
 15. idempotency scope/TTL
-16. adapter contract
 
 WebUI E2Eは後続。
