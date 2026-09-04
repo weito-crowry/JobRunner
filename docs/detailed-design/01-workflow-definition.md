@@ -1,12 +1,12 @@
 # 01. Workflow Definition 詳細設計
 
-- Status: Draft v1.3
+- Status: Draft v1.4
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 
 ## 1. 目的
 
-JobRunner の Workflow YAML、型、JSON Schema、canonical serialization、Action/Validator定義、設定継承、priority、concurrency、reload、Job fieldの正規契約を定義する。
+JobRunner の Workflow YAML、厳密型、JSON Schema、canonical serialization、Action/Validator定義、設定継承、priority、concurrency、reload、Job fieldの正規契約を定義する。
 
 ## 2. MVP Python / OSS依存
 
@@ -28,7 +28,7 @@ PyPI `cel-python` は cloud-custodian/cel-python。
 
 Process/SQLite/JSON/UUID/hashlibはPython標準libraryを優先。
 
-## 3. YAML基本原則
+## 3. YAML / typed model基本原則
 
 1. Canonical authoring format=YAML 1.2。
 2. `ruamel.yaml` safe loaderをYAML 1.2 modeで使用。
@@ -37,11 +37,36 @@ Process/SQLite/JSON/UUID/hashlibはPython標準libraryを優先。
 5. merge key `<<` reject。
 6. unknown key reject。
 7. load後typed immutable `WorkflowDefinition`。
-8. 数値NaN/Infinity reject。
-9. SQLite INTEGER対象はsigned64範囲。
-10. Run開始時再検証し実使用Definition snapshot固定。
+8. Core typed modelは**strict / no coercion**。
+9. 数値NaN/Infinity reject。
+10. SQLite INTEGER対象はsigned64範囲。
+11. Run開始時はsource bytesを再読込・再検証し実使用Definition snapshot固定。
 
 YAML 1.1の暗黙boolean等へfallbackしない。
+
+### 3.1 JSON-compatible strict type semantics
+
+CoreでJSON値を型判定する正規規則:
+
+```text
+null     -> None only
+boolean  -> bool only
+integer  -> Python int, but bool excluded
+number   -> int or float, but bool excluded and finite only
+string   -> str only
+object   -> mapping/object with string keys only
+array    -> list/JSON array only
+```
+
+- `"1"` をintegerへ変換しない
+- `1` をstringへ変換しない
+- `true` をinteger/numberとして扱わない
+- `1`はintegerかつnumberとして許可され得るが、`1.0`はintegerではない
+- tuple/set/Decimal/datetime/bytes等をJSON型へ暗黙変換しない
+- Default値も同じstrict規則でDefinition load時に検証
+- Pydantic modelはstrict設定または同等の明示validatorでこの規則を保証する
+
+HTTP query/pathの文字列を数値やbooleanへ変換する責務はAdapterにあり、Core Service modelへ渡る時点では正規型にする。Exact Adapter規則=`11`。
 
 ## 4. Canonical JSON v1
 
@@ -105,7 +130,7 @@ Required=`name/version/jobs`。
 
 Workflow ID=親登録名またはWorkflowResolver canonical reference。
 
-`version`=1..signed64 max integer。
+`version`=1..signed64 max integer。bool/string等のcoercion無し。
 
 Definition hash:
 
@@ -139,12 +164,14 @@ inputs:
 - required=trueはkey存在
 - optional+default無し=missing
 - extra reject
+- base typeは§3.1 strict semantics
+- Defaultも同じ型/nullable/schemaをDefinition load時に満たすこと
 
 Validation:
 
 1. presence/extra
 2. nullable
-3. non-null base type
+3. non-null strict base type
 4. non-null optional Draft2020-12 schema
 
 Input `schema`はnon-null valueへ適用。
@@ -157,7 +184,7 @@ Output全体object、PayloadStore利用。
 
 ## 10. Priority / Concurrency
 
-Workflow Definition `priority`=signed64 integer、default0。
+Workflow Definition `priority`=signed64 integer、default0。bool/string coercion無し。
 
 Root Workflow Run初期priority:
 
@@ -166,9 +193,9 @@ wf_start.priority specified -> request value
 otherwise -> Workflow Definition priority
 ```
 
-Reusable Child RunはChild Definitionのtop-level priorityを使わず、**root Workflow Runのcurrent priorityを継承**する。Root `wf_priority_update` はroot自身と全non-terminal descendant Child Runへ同値を伝播し、future Childも更新後root priorityを継承する。Childへのdirect priority updateは`06/11`どおり禁止。
+Reusable Child RunはChild Definitionのtop-level priorityを使わずroot Workflow Runのcurrent priorityを継承する。Root `wf_priority_update` はroot自身と全non-terminal descendant Child Runへ同値を伝播し、future Childも更新後root priorityを継承する。Child direct update禁止。
 
-Job `priority` は各Job Definitionのsigned64 integer、default0。Workflow Run priorityとは別軸。
+Job `priority` はsigned64 integer、default0。
 
 Concurrency:
 
@@ -182,12 +209,12 @@ concurrency:
 - group non-empty string
 - no trim/lowercase/Unicode normalization
 - case-sensitive exact
-- max-runs 1..signed64 max
+- max-runs 1..signed64 max integer、bool/string coercion無し
 - on-limit queue|reject
 - scope key=`(workflow_id, resolved group)`
-- **別Workflow IDの同じgroup文字列は競合しない**
-- 同じWorkflow ID/groupのactive Runだけをmax-runs対象にする
-- Definition更新でactive Runとcandidateのmax-runsが異なる場合は`08`のconservative capacity規則を使う
+- 別Workflow IDの同じgroup文字列は競合しない
+- 同じWorkflow ID/groupのactive Runだけをmax-runs対象
+- active holder/candidateのmax-runs差は`08` conservative capacity規則
 
 ## 11. System Workflow Defaults / Workflow `settings`
 
@@ -227,7 +254,7 @@ settings:
 
 ### 11.1 Root Run system baseline snapshot
 
-Root Workflow Run開始時に、Workflow実行へ影響するSystem baselineを `system_workflow_defaults_json` としてsnapshotする。
+Root Workflow Run開始時にWorkflow実行へ影響するSystem baselineを `system_workflow_defaults_json` としてsnapshotする。
 
 Exact shape:
 
@@ -248,11 +275,11 @@ retention:
   managed_artifact_data_days
 ```
 
-`idempotency_ttl_hours` はService requestのTTLでRun execution semanticsではないため、このsnapshotには含めない。
+`idempotency_ttl_hours` はRun execution semanticsではないためsnapshot外。
 
-Root Run effective runtime settings/RetentionはこのSystem baseline snapshot + Workflow Definition settingsから算出する。
+Root effective settings/RetentionはSystem baseline snapshot + Workflow settingsから算出。
 
-Reusable Childはbinding時のcurrent System configを読み直さず、Parent Workflow Runの `system_workflow_defaults_json` を継承してChild settings/Retentionを算出する。Exact rules=`06`。
+Reusable Childはcurrent System configを読み直さずParent Run `system_workflow_defaults_json` を継承してChild settings/Retentionを算出する。
 
 ### 11.2 Effective runtime setting
 
@@ -262,22 +289,22 @@ Workflow specified value > Run system baseline snapshot > canonical default
 
 `default_runner_pool`はSystem-onlyでWorkflow YAMLから上書きしない。ただしRun effective settingsへcopyする。
 
-External Job lease/expiryは§18 Job overrideが最優先。
+External Job lease/expiryは§18 Job override最優先。
 
 Validation:
 
-- `default_runner_pool`: non-empty string、Run start時にregistered Pool存在を要求
-- `max-dynamic-jobs`: integer >=0 signed64
-- `external-lease-minutes`: finite positive number
+- `default_runner_pool`: non-empty string
+- `max-dynamic-jobs`: strict integer >=0 signed64
+- `external-lease-minutes`: finite positive number, bool/string不可
 - `external-on-lease-expiry`: requeue|fail
-- `output-inline-threshold-bytes`: positive signed64 integer
+- `output-inline-threshold-bytes`: strict positive signed64 integer
 - `execution-log-level`: normal|debug
 - `workflow-progress-mode`: auto|none
 - `job-progress-mode`: auto|explicit|none
 
 4MiBはinline/spill thresholdでmax Outputではない。
 
-`idempotency_ttl_hours`はSystem configのみ。Workflowから上書きしない。finite positive number。
+`idempotency_ttl_hours`はSystem configのみ、finite positive number。
 
 ### 11.3 Retention settings
 
@@ -285,20 +312,18 @@ Validation:
 
 ```text
 null = unlimited
-integer >=1 = 作成/完了基準の日数
+strict integer >=1 = 日数
 ```
 
-Effective policyは **Workflow setting（指定項目のみ） > Run system baseline retention > unlimited default**。Workflow Run開始時にeffective retention policyをsnapshotする。
+Effective policy=Workflow指定 > Run system baseline retention > unlimited default。
 
-- run-history-days: Workflow Run DB履歴と必須従属data
-- execution-logs-days: Execution Log file
-- event-days: 通常Event row
-- artifact-metadata-days: Artifact metadata/history
-- managed-artifact-data-days: Managed ArtifactStore data
+- run-history-days
+- execution-logs-days
+- event-days
+- artifact-metadata-days
+- managed-artifact-data-days
 
-External Reference Artifactの外部実体はretention対象外。
-
-Run history expiryは各owned componentの最終保持上限。
+External Reference Artifactの外部実体はretention対象外。Run history expiryはowned component最終上限。
 
 Unknown settings/retention key reject。
 
@@ -310,27 +335,24 @@ Static Job ID `^[A-Za-z_][A-Za-z0-9_-]*$`。`[]/`はDynamic用予約。
 
 ## 13. Action / Validator Registry identity
 
-YAMLはAction/Validator **IDだけ**を指定し、versionは親RegistryからRun start時に解決する。
+YAMLはAction/Validator IDだけを指定し、versionは親RegistryからRun start時に解決する。
 
-MVP Registryは各Processで:
+MVP Registry:
 
 ```text
 action_id -> exactly one current {version, callable, uses_runtime, metadata}
 validator_id -> exactly one current {version, callable}
 ```
 
-- ID/versionはnon-empty string
-- `uses_runtime` boolean、default false
-- 同一Processで同じIDの二重登録はreject
-- Coreは同一IDの複数historical callableを自動保持しない
-- Run start時にcurrent versionをsnapshot
-- Retry/Resume/Runner executionはsnapshot versionとcurrent Registry versionのexact一致を要求
-- `uses_runtime`や実装を同じversionのまま変更した場合は親責任
-- version不一致は`action_version_mismatch|validator_version_mismatch`
+- ID/version=non-empty string
+- `uses_runtime` strict boolean、default false
+- 同一ID二重登録reject
+- Multi-version Registry無し
+- Run start時current version snapshot
+- Retry/Resume/Runner executionはsnapshot versionとcurrent Registry version exact一致
+- `uses_runtime`や実装を同じversionのまま変えた場合は親責任
 
-Action invocation exact contract=`04`。CoreはsignatureからRuntime Handle要否を推測しない。
-
-同時に旧/new implementationを提供したい親は別Action/Validator IDを使う。Multi-version RegistryはMVP外。
+Action invocation=`04`。CoreはsignatureからRuntime Handle要否を推測しない。
 
 ValidatorはMVPでは同期・軽量 callable:
 
@@ -338,9 +360,7 @@ ValidatorはMVPでは同期・軽量 callable:
 def validate_result(value, input_data) -> ValidationResult: ...
 ```
 
-ValidationResult=`valid`, optional code/message/details, retryable defaultfalse。
-
-Read-only、Secret/Runtime Handle無し、heavy/async validationはnormal Job、exception=`validator_exception`。
+ValidationResult=`valid`, optional code/message/details, retryable defaultfalse。Heavy/async validationはnormal Job。
 
 ## 14. Job共通field
 
@@ -372,36 +392,28 @@ jobs:
     external: null
 ```
 
-Unknown Job field reject。
+Unknown Job field reject。全typed fieldは§3.1/field-specific strict type規則を適用し、文字列/boolean/numberの暗黙変換をしない。
 
 ### 14.1 `executor` resolution
 
-YAML `executor`で明示可能なのは:
+YAMLで明示可能=`internal|external_llm|human`。
 
-```text
-internal|external_llm|human
-```
-
-Resolution:
-
-1. `uses` present -> `executor` fieldは省略必須、resolved executor=`reusable`
-2. `uses` absent + `executor` omitted -> resolved executor=`internal`
-3. `uses` absent + explicit executor ->その値
+1. `uses` present -> executor省略必須、resolved=`reusable`
+2. `uses` absent + executor omitted -> `internal`
+3. explicit ->その値
 
 YAMLで`executor: reusable`は書かない。
 
 ### 14.2 `runs-on` resolution
 
-Internal Jobだけで使用。
+Internal Jobだけ。
 
-- explicit non-empty `runs-on` ->そのPool名
-- omitted -> Workflow Run `effective_settings.default_runner_pool`
-- resolved PoolはJob Run/Generated Job Run作成時に`runs_on`へsnapshot
-- 未登録PoolはRun startまたはDynamic expansion preflightでfail-closed
+- explicit non-empty string ->そのPool
+- omitted -> Run `effective_settings.default_runner_pool`
+- resolved PoolはJob Run/Generated Job作成時snapshot
+- 未登録PoolはRun start/Dynamic expansion preflightでfail-closed
 
 ### 14.3 Job `outputs`
-
-Job result schema設定:
 
 ```yaml
 outputs:
@@ -411,9 +423,7 @@ outputs:
 
 のみ。Omitted/`{}`=Schema無し。Unknown key reject。
 
-Schema=Draft2020-12。Job Output本体は任意JSON value。トップレベルWorkflow outputs name mappingとは別概念。
-
-Human JobはOutputが常に`null`でReview metadataは別APIにあるため、Humanでは`outputs.schema`を禁止する。Reusable Jobでは`outputs.schema`を許可し、Child Workflow Output objectをParent Job Outputとして受け取った後にSchema検証する。Exact semantics=`06/07`。
+Humanは`outputs.schema`禁止。Reusableはoptional、Child Workflow Output objectへ適用。
 
 ### 14.4 Job `progress`
 
@@ -422,7 +432,7 @@ progress:
   mode: auto|explicit|none
 ```
 
-Omitted -> Workflow `settings.job-progress-mode` -> Run system baseline/default auto。Exact semantics=`09`。
+Omitted -> Workflow `settings.job-progress-mode` -> Run baseline/default auto。Exact semantics=`09`。
 
 ## 15. Result validation order
 
@@ -438,13 +448,13 @@ Internal/External:
 
 Reusable:
 
-1. Child Workflow success + Child Workflow Output object取得
+1. Child success + Child Workflow Output object
 2. optional Parent Job `outputs.schema`
 3. SecretGuard
 4. Parent Attempt PayloadStore
-5. Parent Job success
+5. success
 
-Human: approve時Output=`null`をParent Attempt Outputとして保存し、Schema/Validator/success_ifは持たない。
+Human approve Output=`null`、Schema/Validator/success_if無し。
 
 ## 16. Executor constraints
 
@@ -470,27 +480,13 @@ Reusable:
 - action/validator/executor/runs-on/success_if/external/timeout forbidden
 - `outputs.schema` optional
 
-`with/if/continue-on-error/priority/retry/progress/foreach/key/order_by` は共通規則に従い利用可能。
+`with/if/continue-on-error/priority/retry/progress/foreach/key/order_by` は共通規則に従う。
 
 ## 17. Secret expression field restriction
 
 `${{ secrets.NAME }}` はinternal Job `with`だけ、かつ1 scalar全体のみ。
 
-Allowed:
-
-```yaml
-with:
-  token: ${{ secrets.API_TOKEN }}
-```
-
-Rejected:
-
-```yaml
-with:
-  auth: "Bearer ${{ secrets.API_TOKEN }}"
-```
-
-加工はAction内部。Persistent表現=`02/08/12`。
+Persistent表現/Result Reuse制約=`02/03/12`。
 
 ## 18. External Job override
 
@@ -502,30 +498,41 @@ external:
   on-lease-expiry: requeue
 ```
 
-Allowed keysはこの2つだけ。
+Allowed keys=この2つ。
 
-Effective:
+Effective=`Job external value > Workflow Run effective setting`。
 
-```text
-Job external value > Workflow Run effective setting
-```
-
-Workflow Run effective settingはWorkflow setting > Run system baseline > canonical defaultで既にsnapshot済み。
-
-- lease-minutes finite positive
+- lease-minutes finite positive number、bool/string coercion無し
 - on-lease-expiry requeue|fail
 
-## 19. Workflow reload
+## 19. Workflow Resolver / reload
 
 Workflow Definition sourceは親Process再起動なしでreload可能。
 
-Standard filesystem WorkflowResolver:
+### 19.1 Browse/info cache
 
-- `wf_definition_list/info` と `wf_start` でsource metadata (`mtime_ns + size`) を確認
-- metadata変化時file再read/parse/validateしてcache replace
-- metadata同一でも`WorkflowResolver.refresh(workflow_ref=None)`可
-- invalid new YAMLはold Definitionへsilent fallbackせずnew Run start拒否
-- existing Runは自身のsnapshot継続
+Standard filesystem Resolverは`wf_definition_list/info`向けに `mtime_ns + size` 等のmetadata cacheを使ってよい。
+
+- metadata変化時はfile再read/parse/validate/hashしてcache replace
+- `WorkflowResolver.refresh(workflow_ref=None)` で明示refresh可能
+- invalid sourceはそのread/info requestでvalidation errorにできる
+
+### 19.2 Execution-time source read
+
+**新しい実行を開始/新Reusable bindingを作るときはmetadata cacheだけをSource of Truthにしない。**
+
+以下では対象Workflow source bytesをその時点で必ず1回readし、そのbytesを直接parse/validate/hashする。
+
+```text
+wf_start
+Reusable binding first creation
+```
+
+- mtime/sizeがcacheと同じでもexecution pathではsource bytesを再readする
+- readした同一bytesからsource YAML snapshot + typed Definition + Definition hashを作る
+- validation失敗時はold cacheへsilent fallbackせず開始拒否
+- read途中のfile replacement対策としてResolverは1回のlogical readで一貫したbytesを取得する実装を使う（open/read/closeしたbytesがその開始処理のSource of Truth）
+- Existing Run/既存Reusable bindingは保存済みsnapshotを使用しsourceを再読込しない
 
 File watcher/background hot reload必須無し。Python Action/Validator code reloadは親development autoreloadへ任せる。
 
@@ -534,17 +541,17 @@ File watcher/background hot reload必須無し。Python Action/Validator code re
 Definition snapshot:
 
 - workflow id/version/name
-- source YAML
+- execution pathで実読込したsource YAML
 - typed Definition JSON/hash
 - Workflow Input
 - Action/Validator ID+version
 
-Root Run additionally snapshots:
+Root Run additionally:
 
 - `system_workflow_defaults_json`
-- effective runtime settings（default_runner_pool含む）
+- effective runtime settings
 - effective retention policy
-- initial Workflow Run priority
+- initial priority
 - optional source_identity
 
 Child Run snapshot rules=`06`。
@@ -553,19 +560,20 @@ Child Run snapshot rules=`06`。
 
 Load:
 
-- YAML1.2、安全性、Pydantic
+- YAML1.2、安全性、strict Pydantic/validators
 - JSON Schema draft
-- Input
+- Input/default strict types
 - needs/foreach cycle
 - numeric/expression
 - executor/field conflicts
 - settings/external/progress
-- Secret placement/full-scalar
+- Secret placement
 - Human/Reusable outputs.schema constraint
 
 Run start:
 
-- Input
+- fresh source bytes read + parse/validate/hash
+- Input strict validation
 - current Registry versions
 - System workflow defaults snapshot
 - default/explicit Runner Pool
@@ -580,24 +588,26 @@ FailureならRun row無し。
 ## 22. 受入条件
 
 1. YAML1.2 ambiguity
-2. canonical JSON golden
-3. Draft2020-12 only
-4. Input nullable
-5. executor default/internal + uses->reusable
-6. Root System baseline snapshot/restart stability
-7. Child uses Parent Run System baseline rather than current System config
-8. default_runner_pool snapshot/runs-on resolution
-9. root priority request override/definition default
-10. Child priority inheritance/root update propagation
-11. concurrency scope=(workflow_id,group)
-12. mixed max-runs delegates to `08` conservative admission
-13. Job outputs.schema exact shape + Human/Reusable boundary
-14. Registry one-current-version/uses_runtime metadata/version mismatch
-15. runtime setting inheritance
-16. External lease hierarchy
-17. progress/log setting validation
+2. strict/no-coercion Core model
+3. bool not integer/number
+4. string numeric not coerced
+5. Input/default strict validation
+6. canonical JSON golden
+7. Draft2020-12 only
+8. executor default/internal + uses->reusable
+9. Root System baseline snapshot/restart stability
+10. Child Parent baseline inheritance
+11. default_runner_pool/runs-on resolution
+12. root priority resolution/Child propagation
+13. concurrency scope=(workflow_id,group)
+14. mixed max-runs delegates to `08`
+15. Job outputs.schema Human/Reusable boundary
+16. Registry one-current-version/uses_runtime/version mismatch
+17. runtime setting/External lease/progress/log/Retention strict validation
 18. Secret full-scalar
-19. retention inheritance
-20. reload valid/invalid/refresh
-21. arbitrary Output/spill
-22. deterministic Definition hash
+19. browse cache refresh
+20. wf_start always reads source bytes even unchanged metadata
+21. Reusable first binding always reads child source bytes
+22. invalid execution-time source never falls back to old cache
+23. arbitrary Output/spill
+24. deterministic Definition hash
