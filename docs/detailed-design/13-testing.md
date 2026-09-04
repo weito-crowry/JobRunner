@@ -1,6 +1,6 @@
 # 13. Testing 詳細設計
 
-- Status: Draft v2.1
+- Status: Draft v2.2
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`〜`12`
@@ -65,28 +65,28 @@ Definition:
 
 System baseline:
 
-- Root start snapshots exact `system_workflow_defaults_json`
-- Includes default runner, dynamic/lease/output/log/progress + retention baseline
-- idempotency TTL is not part of Run baseline
+- Root start exact `system_workflow_defaults_json`
+- default runner, dynamic/lease/output/log/progress + retention baseline
+- idempotency TTLはRun baseline外
 - Workflow setting > Run System baseline > canonical default
-- Root restart uses stored baseline
-- Reusable Child inherits Parent Run baseline, not current System config
-- Nested Child continues same lineage baseline
-- Child effective settings/Retention exact binding snapshot
+- Root restart stored baseline
+- Reusable Child inherits Parent Run baseline, not current System
+- Nested Child same lineage baseline
+- Child effective settings/Retention binding snapshot
 
 Priority:
 
-- root `wf_start.priority` overrides Definition priority
-- omitted uses Definition priority
-- Child Run priority=current root priority
-- root priority update propagates all non-terminal descendants
-- future Child inherits updated root priority
-- Child direct priority update reject
-- running Job not preempted
+- root `wf_start.priority` override
+- omitted -> Definition priority
+- Child priority=current root
+- root update all non-terminal descendants
+- future Child updated priority
+- Child direct reject
+- no preemption
 
 Definition reload:
 
-- valid update without process restart
+- valid update without restart
 - explicit refresh
 - invalid new YAML no old-cache fallback
 - existing Run old snapshot
@@ -98,10 +98,10 @@ Context:
 - `workflow={id,name,version}` exact
 - `run={id}` exact
 - `job={template_id,key,executor}` exact
-- Dynamic template expression has `job.key=null`
-- unavailable field is error, not implicit null
+- Dynamic template `job.key=null`
+- unavailable field error
 - state missing != null
-- field-by-field allowed context matrix
+- field allow/deny matrix
 - success_if forbids needs/state/secrets/failure
 - retry.if failure context
 
@@ -111,44 +111,74 @@ Persistent Input:
 - final object only
 - missing/null strictness
 - RFC6901 Secret binding pointer
-- pointer sorting/duplicate reject
+- sort/duplicate reject
 - full-scalar Secret only
-- marker-like unbound literal remains literal
-- input digest golden=`{input,secret_bindings}`
+- marker-like unbound literal
+- input digest golden
 - Secret value excluded
 
 Activation:
 
-- internal initial pending before claim
+- internal pending before claim
 - external/human/reusable initial Attempt direct
-- Retry all executor pending snapshot
-- Runner/scheduler exact copy
-- Resume/restart never re-evaluates ready pending snapshot
+- Retry all executor pending
+- exact copy
+- Resume/restart no ready Input re-evaluation
 
-## 5. Integration Bootstrap / Process boundary
+## 5. Integration Bootstrap / Action / Validator invocation
+
+Bootstrap:
 
 - importable dotted entrypoint
 - role parent|runner|action_runner
 - Parent Registry/Auth/Secrets/Store
 - Runner Validator/Auth/Secrets/Store
 - Action Runner Action callable only
-- Windows spawn, no parent callable pickle dependency
+- Windows spawn/no parent callable pickle
 - no DB/provider/storage credential in Action Runner
-- current Attempt materialized Secret only
+- current Attempt Secret only
 - bootstrap version mismatch fail-closed
 - bootstrap exception prevents scheduling
+
+Action:
+
+- `uses_runtime=false` -> exactly one positional execution Input
+- `uses_runtime=true` -> Input + Runtime Handle
+- invalid arity registration reject
+- sync return JSON
+- async function
+- sync function returning awaitable
+- varargs still follows explicit `uses_runtime`
+- Action Runner owns await event loop
+
+Validator:
+
+- sync-only callable `(result,persistent_input)`
+- canonical ValidationResult defaults
+- invalid=false missing code -> domain_validation_failed
+- returned awaitable -> validator_contract_error
+- exception -> validator_exception
 
 ## 6. Authorization / Runtime Handle / SecretGuard
 
 Authorization:
 
 - all public read/write authorize
-- Runtime Handle `state_get` -> workflow_state.read
-- `state_set` -> workflow_state.write
+- state_get -> workflow_state.read
+- state_set -> workflow_state.write
 - Artifact put/register -> artifact.create
 - Artifact materialize -> artifact.read
-- denied Runtime operation no side effect
-- telemetry uses Attempt ownership fencing
+- denied no side effect
+- telemetry Attempt fencing
+
+State runtime:
+
+- state_set current+history same DB transaction
+- write visible immediately after response
+- later Attempt failure/cancel/timeout/runner_lost does not rollback
+- history records producer Job/Attempt/Step
+- state_get marks Attempt reuse ineligible
+- state_set marks Attempt reuse ineligible
 
 SecretGuard:
 
@@ -158,331 +188,291 @@ SecretGuard:
 - log redact
 - managed Artifact byte match/chunk boundary
 - transformed Secret guarantee外
-- Input read returns references only, never materialized values
+- Input read references only
 
-## 7. Custom Validator / Result validation
+## 7. Result validation
 
 Internal/External:
 
 - JSON -> Schema -> Validator -> success_if -> SecretGuard -> PayloadStore
 - valid/invalid/custom failure/exception
-- Validator gets persistent Input only
+- Validator persistent Input only
 
 Reusable:
 
-- Child success output -> optional Parent Job outputs.schema -> SecretGuard -> Parent PayloadStore
-- Schema fail -> Parent Attempt failure/output_validation_failed
+- Child output -> optional Parent Schema -> SecretGuard -> Parent PayloadStore
+- Schema fail -> Parent failure
 - Retry same binding
 
 Human:
 
 - outputs.schema forbidden
 - approve Output exactly null
-- reject has no current Output
+- reject no current Output
 
 ## 8. JSON Output / PayloadStore
 
-- null/boolean/number/string/array/object
+- all JSON types
 - Workflow Output object
-- threshold-1/threshold/threshold+1
-- multi-MiB success
-- downstream storage-transparent
-- Workflow Output spill
-- crash orphan cleanup
-- payload missing/digest mismatch
-- Attempt immutability
+- threshold boundaries
+- multi-MiB
+- downstream transparent
+- Workflow spill
+- crash orphan
+- payload integrity
+- Attempt immutable
 
 ## 9. Runner Pool / Scheduling / Priority
 
 Runner Pool:
 
 - registered only
-- default pool from Run snapshot
-- runner_count exact auto-start
-- invalid count
-- heartbeat/lost/stale relation
-- restart policy/suppression
-- no per-Pool Action allow-list
-- no Pool global pause
+- default from Run snapshot
+- runner_count exact
+- heartbeat/lost/stale
+- restart/suppression
+- no Action allow-list/Pool pause
 
 Scheduling:
 
-- Run start static non-dynamic Job only
-- Dynamic template no Job Run/Attempt
-- initial queued ready_at NULL not claimable
-- internal ready+pending claim
-- all-executor Retry queued pending
+- static non-dynamic rows only at start
+- Dynamic template no Job/Attempt
+- initial ready_at NULL
+- internal pending claim
+- all-executor Retry pending
 - noninternal due Retry no with re-eval
-- Workflow Run priority -> Job priority -> Dynamic order -> source -> ready -> ID
-- Child priority propagation affects future selection
-- one internal running/Run
-- multiple Runs parallel
-- internal/external claim races
-- concurrency case sensitivity
+- priority/order axes
+- Child priority propagation
+- one internal/Run
+- multiple Runs
+- claim races
+- concurrency case
 
 ## 10. Maintenance / Recovery
 
 - no busy loop
-- earlier deadline wakes
-- default max sleep5
-- retry due without traffic
-- Lease expiry without traffic
-- Pause Lease expiry continues / Retry activation stops
-- Resume due Retry
-- restart overdue Retry/Lease/Retention
-- repeated due idempotent
-- ready pending survives restart
-- running old Runtime -> runner_lost
+- earlier deadline wake
+- max sleep5
+- retry/Lease due without traffic
+- Pause lease continues/retry waits
+- restart overdue/Retention
+- pending survives restart
+- runner_lost
 - root/Child priority repair
-- completed Run no Recovery reopen
+- completed no reopen
+- orphan scanner does not delete unowned object younger than `orphan_cleanup_grace_seconds`
+- default grace300 / invalid non-positive reject
 
 ## 11. Runner / IPC
 
-- ready -> start -> terminal -> exit
-- malformed protocol/type
-- duplicate ready/start/terminal
-- terminal+exit matrix
-- persistent_input exact Attempt snapshot
-- Secret bindings/materialization exact
-- unbound marker literal
-- Secret missing/invalid pre-child
-- Runtime request correlation
-- cancel while waiting
-- state/artifact request-response + auth deny
-- log/progress/step validation
-- large result file path/size/digest
+- handshake/envelope/terminal matrix
+- exact Attempt persistent_input
+- Secret bindings/materialization
+- marker literal
+- pre-child Secret failure
+- Runtime request correlation/cancel
+- state/artifact auth request-response
+- state_set immediate/nonrollback
+- log/progress/step
+- large result file
 - Validator persistent Input only
 - stdout separate/redacted
-- old Runner/late message fencing
+- fencing
 
 ## 12. Execution Log / Event / Progress
 
 Execution Log:
 
-- all four executors one Attempt Log
-- normal/debug
-- no automatic full Input/Output dump
-- deleted file explicit unavailable
+- all four executors
+- Run-snapshotted normal/debug
+- System/source change after Run start no effect
+- no Input/Output auto dump
+- deleted explicit unavailable
 
 Event:
 
-- state transitions append-only
+- transitions append-only
+- `dynamic_index_key_fallback` exactly once per fallback expansion
+- explicit dynamic key emits no fallback Event
 - retention audit exclusion
-- `wf_event_list` filters/order/pagination/resource chain validation
+- wf_event_list
 
 Progress:
 
-- Job none/explicit/auto
-- terminal fraction1 independent conclusion
-- Reusable parent mirrors Child fraction
-- Workflow averages concrete Job Runs only
-- Dynamic template not denominator
-- generated Job can lower percentage
-- progress never affects conclusion
+- Job mode snapshot none/explicit/auto
+- terminal fraction1
+- Reusable mirrors Child
+- Workflow mode Run snapshot
+- Workflow concrete Job average
+- Dynamic template denominator外
+- generated growth may lower percent
+- no conclusion effect
 
 ## 13. Retry / Result Reuse
 
 Retry:
 
-- absent=max1/disabled
-- `retry:{}`=max2/retryable/zero backoff
+- absent/max1
+- empty block/max2
 - failed Attempt only
-- no new Attempt at request/schedule
-- exact pending snapshot copy
-- due executor-specific Attempt
-- pre-Attempt failure new Run
+- no new Attempt at schedule
+- exact pending copy
+- pre-Attempt new Run
 - run_attempt++
-- target with/item/version not re-evaluated
-- Secret binding fixed/value may rotate
+- target no with/item/version re-eval
+- Secret binding fixed/value rotate
 
-Descendant strict reuse:
+Strict reuse:
 
-- blocked/skipped normal reactivation
-- successful current if re-evaluation
-- expected Input re-resolution
-- Artifact/version/Payload check
-- executor-specific stored Output revalidation
+- blocked/skipped reactivation
+- successful current if/input/artifact/version/Payload validation
+- executor-specific output revalidation
+- **state_get successful Attempt is ineligible**
+- **state_set successful Attempt is ineligible**
+- non-input Artifact materialize ineligible
 - mismatch -> new Run
 
 ## 14. Dynamic Jobs
 
-- Template no Job Run/Attempt
+- no template Job/Attempt
 - Root/Nested/3+ depth
-- stable/index key
+- explicit stable key
+- omitted key -> 0-based index exact identity
+- one fallback warning Event/expansion
+- no warning with explicit key
 - no fixed job_key max
-- System/Workflow generated limit
+- generated limit from Run snapshot
+- System limit change after Run start no effect
 - 1000/1001 rollback
-- ordering schema/stable tie
-- if=false skipped vs foreach=[] success
-- zero-parent propagation
-- expansion_digest golden
-- changed source/key/item/order -> not reusable
-- expanded empty -> nonempty reject same Run
-- whole skipped zero-job group may re-evaluate
-- root/nested partial unique/recovery
+- ordering/stable tie
+- if=false vs empty
+- zero-parent
+- expansion digest
+- changed source/key/item/order -> new Run
+- whole skipped re-evaluate
+- root/nested unique/recovery
 
 ## 15. Reusable Workflow
 
-- registered/relative/path safety
-- Binding Definition+Action+Validator versions
-- Binding inherited System baseline
-- Child effective settings/Retention
-- current System change after Root start does not alter later Child
-- Nested Child same baseline
-- Child priority=root priority
-- root update propagation
-- source_identity/Actor/Scope inheritance
-- Parent/Child state isolation
-- ArtifactRef both directions/no mirror
+- reference/path safety
+- Binding Definition+versions+System baseline
+- Child settings/Retention
+- current System change no effect
+- nested baseline
+- Child priority=root
+- root update
+- source_identity/Actor/Scope
+- state isolation
+- ArtifactRef/no mirror
 - Parent outputs.schema
-- Parent auto progress
-- Child direct control reject
-- cycle/depth/Dynamic/restart duplicate
-- Parent run-history upper-bounds Child subtree
+- Parent progress
+- direct control reject
+- cycle/depth/Dynamic/restart
+- parent retention upper bound
 
 ## 16. ArtifactStore / ArtifactRef
 
-- managed put/generation/materialize/path safety
-- orphan cleanup
-- canonical ArtifactRef/DB re-resolve
-- same-run
-- cross-run requires persistent Input ref + Authorization
+- managed put/generation/materialize/path
+- SHA-256 public digest format
+- external digest format validation/no content verification
+- canonical ref/DB resolve
+- same/cross run auth
 - raw/forged reject
-- retained/deleted data reject
-- no source retention pin
-- Input ref changes digest
-- non-input materialize reuse ineligible
-- External no Core fetch/materialize/delete
+- no source pin
+- retained/deleted reject
+- Input digest/ineligible runtime materialize
+- External no Core data operation
+
+Retention:
+
+- managed data can expire before metadata
+- metadata expiry forces managed data delete first
+- metadata row deleted at metadata due
+- wf_artifact_info not_found after row deletion
+- external metadata deletion never deletes external data
 
 ## 17. External / Human
 
 External:
 
-- Job override > Run effective lease setting
-- Task config snapshot/requeue fixed
-- arbitrary result/spill
-- one Task/Attempt/active Lease
-- claim race/order
-- no heartbeat/renew/transfer
-- lease requeue/fail/Pause/Recovery
-- submit validation schedules Retry later
-- submit + claim_next + idempotency one transaction
-- replay no double next claim
+- Job override > Run effective lease
+- Task snapshot
+- arbitrary result
+- claim race
+- no renew
+- requeue/fail
+- submit Retry later
+- submit+claim_next one tx/replay
 
 Human:
 
-- approve/reject only
-- Output null on approve
-- reject Output unavailable
+- approve/reject/null Output
+- reject no output
 - first-wins
-- Retry new Review via scheduler
-- no timeout/Validator/Output Schema
-- no success override/manual skip/rewrite
+- Retry new Review
+- no timeout/Validator/Schema/override/skip/rewrite
 
 ## 18. Persistence schema
 
-Verify **all 18 tables** via SQLite PRAGMA/sqlite_master:
+Verify all18 tables:
 
 - exact columns/checks/indexes/FKs
-- `workflow_runs.system_workflow_defaults_json`
-- effective settings exact keys incl default_runner_pool
-- Child binding system baseline/settings/Retention columns
-- root/Child priority index/update support
-- Dynamic template no Job row
-- ready/pending all-executor invariant
-- Attempt Secret bindings/input digest
-- one-running internal
-- Dynamic partial unique/digest
-- state atomic
+- System baseline/effective settings
+- Child binding baseline/settings/Retention
+- priority support
+- Dynamic no Job row
+- pending invariant
+- Secret bindings/digest
+- one-running
+- Dynamic unique/digest
+- State current/history atomic
 - Artifact/log schema
-- Runner active slot/liveness
-- External Task lease finite/config snapshot/active Lease unique
-- Human Review immutable
-- Idempotency no reserved/request hash/scope/TTL
-- child-first retention
-- migration gap/future reject
+- Runner liveness
+- External Task config/Lease
+- Human immutable
+- Idempotency
+- Child-first Retention
+- migration gap/future
 
 ## 19. Service / MCP / HTTP
 
-Run info:
+- Run info jobs/Dynamic groups/attempts
+- Input info/read refs only
+- Output/Event/Log
+- priority start/update
+- namespaced MCP
+- exact HTTP incl Input/Event
+- status/no422/idempotency replay
+- forbidden APIs
 
-- concrete jobs + Dynamic groups exact shapes
-- attempts/steps/artifacts implication
-- events_summary exact shape
-- no large body embedding
+## 20. Idempotency / Concurrency
 
-Input:
-
-- `wf_input_info/read` all selectors
-- pending Job resolution wins over current Attempt
-- unactivated Job unavailable
-- JMESPath select
-- Secret refs only
-- MCP response-too-large no truncate
-
-Output/Event/Log:
-
-- selectors/read
-- `wf_event_list`
-- deleted Log error
-
-Priority:
-
-- start default/override
-- root update descendant count/propagation
-- Child direct reject
-
-MCP/HTTP:
-
-- namespaced collision
-- exact v1 routes incl Input routes/events
-- workflow_ref slash
-- Idempotency-Key
-- status 200/201/400/401/403/404/409/413/500
-- no422
-- original status/body replay
-
-Forbidden:
-
-- no lease renew
-- no manual Job skip/success override
-- no completed Review rewrite
-
-## 20. Idempotency / Concurrency races
-
-Idempotency:
-
-- request hash excludes request_id/transport only
-- Actor/AccessScope isolation
+- request hash
+- Actor/Scope isolation
 - fast read advisory
-- BEGIN IMMEDIATE commit recheck
-- same hash replay/different conflict
-- expired replacement
-- no reserved row
-- task_claim exactly one
-- submit claim_next exact replay
-
-Concurrency:
-
-- BINARY group race
-- queue/reject
-- holder release order
+- BEGIN IMMEDIATE recheck
+- replay/conflict/expiry
+- no reserved
+- claim exactly one
+- submit claim_next replay
+- concurrency race/order
 
 ## 21. Retention
 
-- System baseline retention snapshot
-- Workflow overrides
-- Child inherited System baseline + Child override
-- later System change no effect
-- completed/non-terminal cutoffs
+- Run System baseline retention snapshot
+- Workflow override
+- Child inherited baseline + Child override
+- later config no effect
+- completed/nonterminal cutoffs
 - all executor Logs
-- Event created_at/audit exclusion
-- Artifact owner guard/no cross-run pin
-- Payload follows Run history
-- Child subtree depth-first delete
-- audit survives deletion
-- orphan cleanup audit
-- retention loss makes materialize/reuse fail-closed
+- Events/audit
+- Artifact data/metadata precedence
+- cross-run no pin
+- Payload run history
+- Child depth-first
+- audit survives
+- orphan cleanup grace/audit
+- retention loss fail-closed
 
 ## 22. Platform / CI
 
@@ -500,22 +490,23 @@ platform-matrix
 
 ## 23. MVP completion gate
 
-1. `01`〜`12`全受入条件対応表
+1. `01`〜`12`全受入条件対応
 2. Dependencies/extras
 3. Definition/System baseline/Priority/Registry/reload
-4. Expression context + persistent Input/Secret binding
-5. Bootstrap/IPC/Runtime Handle Authorization
+4. Expression context/Input/Secret binding
+5. Bootstrap/Action invocation/IPC/Runtime Auth
 6. Runner Pool/Scheduling
-7. Exact 18-table schema/migrations
-8. PayloadStore/ArtifactStore
+7. Exact18-table schema/migrations
+8. Payload/Artifact + retention
 9. Validator/SecretGuard
-10. External/Human E2E
-11. Dynamic virtual group/1000/nested/order/reuse
-12. Reusable baseline/settings/priority/artifact/schema/progress
-13. Retry/Recovery strict reuse
-14. Service/MCP/HTTP/Input/Output/Event contracts
-15. Idempotency/concurrency/claim_next race tests
-16. Common Log/Progress
-17. Retention/audit/orphan cleanup
+10. State immediate/reuse rules
+11. External/Human
+12. Dynamic index/1000/nested/order/reuse
+13. Reusable baseline/priority/artifact/schema/progress
+14. Retry/Recovery strict reuse
+15. Service/MCP/HTTP/Input/Output/Event
+16. Idempotency/concurrency/claim_next
+17. Common Log/Progress
+18. Retention/orphan grace/audit
 
 WebUI E2Eは後続。
