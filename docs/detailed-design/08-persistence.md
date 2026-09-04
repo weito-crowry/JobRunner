@@ -1,6 +1,6 @@
 # 08. Persistence 詳細設計
 
-- Status: Draft v2.3
+- Status: Draft v2.4
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - Canonical JSON: `01` の `jobrunner.canonical-json.v1`
@@ -43,11 +43,26 @@ PRAGMA journal_mode=WAL
 - FK原則`ON DELETE NO ACTION`
 - implicit cascade無し
 - Text identity=BINARY semantics
-- Timestamp=UTC RFC3339 TEXT
 - ID=type prefix + UUID4 hex TEXT
 - INTEGER外部入力=signed64
 - JSON/digest=canonical-json-v1
 - boolean=INTEGER 0|1
+
+### 3.1 Canonical timestamp
+
+SQLiteへ永続化する時刻TEXTは全てUTCの固定形式:
+
+```text
+YYYY-MM-DDTHH:MM:SS.ffffffZ
+```
+
+- fractional secondは常に6桁
+- offset表記は使わず`Z`のみ
+- timezone-naive値禁止
+- lexical order = chronological orderとしてindex/range比較に使用可能
+- `now >= deadline/expires_at/retry_not_before` をdue/expired境界とする
+
+Public APIも同じ表現をcanonical serializationとする。
 
 RetentionはFKを無効化せず明示順序。
 
@@ -209,8 +224,9 @@ Indexes:
 CREATE INDEX ix_workflow_runs_list ON workflow_runs(created_at DESC,id ASC);
 CREATE INDEX ix_workflow_runs_by_workflow ON workflow_runs(workflow_id,created_at DESC,id ASC);
 CREATE INDEX ix_workflow_runs_status ON workflow_runs(status,priority DESC,created_at ASC,id ASC);
-CREATE INDEX ix_workflow_runs_concurrency ON workflow_runs(concurrency_group,status)
-  WHERE concurrency_group IS NOT NULL AND status!='completed';
+CREATE INDEX ix_workflow_runs_concurrency
+ON workflow_runs(workflow_id,concurrency_group,status)
+WHERE concurrency_group IS NOT NULL AND status!='completed';
 CREATE INDEX ix_workflow_runs_root_active ON workflow_runs(root_workflow_run_id,status,call_depth,id)
   WHERE status!='completed';
 CREATE UNIQUE INDEX uq_child_run_per_parent_attempt ON workflow_runs(parent_attempt_id)
@@ -492,7 +508,7 @@ created_at TEXT NOT NULL
 UNIQUE(workflow_run_id,name,revision)
 ```
 
-`state.set`=history insert + current upsert same transaction。Last-write-wins。
+`state.set`=history insert + current upsert same transaction。Last-write-wins。Attempt terminal結果とは独立して即時commitし、後続failure/cancelでrollbackしない。
 
 ## 14. `artifacts`
 
@@ -511,10 +527,11 @@ digest TEXT NULL
 metadata_json TEXT NULL
 created_at TEXT NOT NULL
 data_deleted_at TEXT NULL
-metadata_deleted_at TEXT NULL
 ```
 
 `storage_kind=managed|external`。Managed=store_key only、External=URI only。Same Attempt/name generation可。Current=`created_at DESC,id DESC`。Cross-run pin無し。
+
+Artifact metadata retentionでrow自体を削除するため`metadata_deleted_at` soft-delete columnはMVPに持たない。削除監査はEventで行う。
 
 ## 15. `events`
 
@@ -568,7 +585,7 @@ runner_instance_id TEXT PRIMARY KEY
 runtime_instance_id TEXT NOT NULL
 runner_id TEXT NOT NULL
 pool_name TEXT NOT NULL CHECK(length(pool_name)>0)
-pid INTEGER NOT NULL CHECK(pid>=0)
+pid INTEGER NOT NULL CHECK(pid>0)
 status TEXT NOT NULL
 current_job_run_id TEXT NULL REFERENCES job_runs(id) ON DELETE NO ACTION
 current_attempt_id TEXT NULL REFERENCES job_attempts(id) ON DELETE NO ACTION
@@ -673,7 +690,7 @@ ON external_leases(expires_at)
 WHERE status='active';
 ```
 
-Heartbeat/renew/transfer column無し。
+Heartbeat/renew/transfer column無し。`now >= expires_at`ならLeaseはsubmit不可でexpiry処理対象。
 
 ## 21. `human_reviews`
 
@@ -726,7 +743,7 @@ Scope=`namespace + operation_resource_key + actor_principal_key + access_scope`�
 
 Flow=optional fast read -> prepare -> `BEGIN IMMEDIATE` -> key/hash再確認 -> domain state再確認 -> side effect + result row commit。
 
-TTL=System `idempotency_ttl_hours`, default24h。
+TTL=System `idempotency_ttl_hours`, default24h。`now >= expires_at`でexpired扱いし同keyを新requestとしてreplace可能。
 
 ```sql
 CREATE INDEX ix_idempotency_expiry
@@ -735,11 +752,53 @@ ON idempotency_records(expires_at);
 
 ## 23. Concurrency / priority transaction
 
-Concurrency dedicated table無し。Workflow start/slot release=`BEGIN IMMEDIATE`でsame BINARY group active holderをrecount。
+Concurrency dedicated table無し。
 
-Active holder=`queued|running|paused`かつ`wait_reason != concurrency`。
+### 23.1 Scope
 
-Waiting release=`priority DESC,created_at ASC,id ASC`。
+Concurrency scope keyは:
+
+```text
+(workflow_id, concurrency_group)
+```
+
+であり、**Workflow Definition単位**。同じgroup文字列でも別`workflow_id`なら競合しない。
+
+GroupはBINARY exact comparison。
+
+Active holder=`status in (queued,running,paused)`かつ`wait_reason != concurrency`。
+
+Candidate Runがslot取得を試みるとき、同じscopeのactive holderだけをcountする。
+
+### 23.2 Capacity
+
+Candidateの`concurrency_max_runs`と既存active holderの`concurrency_max_runs`が異なり得るため、admission時のeffective capacityは:
+
+```text
+min(candidate.max_runs, all active holders' max_runs)
+```
+
+Active holderが0件ならcandidate.max_runs。
+
+`holder_count < effective_capacity`ならadmit。それ以外はcandidate自身の`on-limit=queue|reject`を適用。
+
+これによりDefinition更新でmax-runsが変わっても、既存holderの厳しい上限を破らない。
+
+### 23.3 Waiting order
+
+Waiting Run=`status=queued, wait_reason=concurrency`。
+
+Release時の順序:
+
+```text
+priority DESC
+created_at ASC
+id ASC
+```
+
+先頭から順に現在のholder集合でcapacityを再計算し、admitできない先頭waiterがあれば後続を追い越させない。
+
+Workflow start/slot release/Manual Retry reopenは`BEGIN IMMEDIATE`で判定する。
 
 Root `wf_priority_update` は1 transactionでroot + all non-terminal descendant Child Run (`root_workflow_run_id=root.id`) priorityを同値へ更新する。Preempt無し。
 
@@ -768,7 +827,7 @@ Policy=`workflow_runs.retention_policy_json`。
 - Run completed_at、non-terminal delete無し
 - Log close time、running delete無し
 - normal Event created_at、retention audit除外
-- Artifact created_at + owner non-terminal guard
+- Artifact data/metadataは`09`の期限優先規則
 - Output Payload run-historyと共にdelete
 - Cross-run ArtifactRef pin無し
 - External Artifact実体delete無し
@@ -781,7 +840,7 @@ Child subtreeは`call_depth DESC`で先に削除。Parent run-history expiryはC
 2. external_leases
 3. human_reviews
 4. execution log
-5. Artifact
+5. Artifact data -> Artifact metadata row
 6. state
 7. normal events
 8. job_steps
@@ -799,7 +858,7 @@ Runner current pointerはrepair後。FK無効化禁止。
 
 1 DB transaction:
 
-- Workflow Run start + System/effective snapshot + optional idempotency
+- Workflow Run start + System/effective snapshot + concurrency admission + optional idempotency
 - root priority update + descendant propagation + idempotency
 - internal claim + Attempt + pending copy + Runner ownership
 - Dynamic expansion
@@ -807,9 +866,11 @@ Runner current pointerはrepair後。FK無効化禁止。
 - External Lease claim + idempotency
 - External submit + optional claim_next Lease + full idempotency
 - Human review first-wins + idempotency
-- Reusable binding + initial Child Run
-- Manual Retry reopen + pending snapshot + idempotency
-- concurrency holder decision
+- Reusable binding + initial Child Run + Child concurrency admission
+- Manual Retry reopen + concurrency reacquire + Workflow Output clear + pending snapshot + idempotency
+- concurrency holder release/wake
+
+Completed failure Run Manual Retryで`on-limit=reject`かつslot不可の場合はtransactionを変更せずconflictとして終了する。Queueの場合はRunをnon-terminalへreopenし`wait_reason=concurrency`でpending Inputを保持する。
 
 Payload/Artifact filesystem=prepare/finalize + DB transaction + orphan cleanup。Distributed exactly-once無し。
 
@@ -824,23 +885,27 @@ Tests use`sqlite_master`/PRAGMA for exact table/column/index/FK/check。
 ## 28. 受入条件
 
 1. 全18 table exact schema
-2. Dynamic template no job_runs
-3. system_workflow_defaults/effective_settings exact shape
-4. Root System baseline snapshot / Child copy
-5. explicit/omitted runs_on stored resolved
-6. all-executor queued pending invariant
-7. Attempt Secret bindings/input digest
-8. Dynamic expansion digest/unique
-9. Reusable binding Child System baseline/settings/Retention
-10. Child priority=root priority + update propagation
-11. State/Artifact/Log schemas
-12. Runner invariants/indexes
-13. External Task lease finite/config snapshot
-14. Human immutable
-15. Idempotency request hash/scope/no-reserved/recheck
-16. submit+claim_next atomic
-17. concurrency transaction
-18. Result Reuse identities
-19. Child-first Retention
-20. migration verification
-21. Payload/Artifact crash consistency
+2. canonical timestamp fixed UTC format / lexical order
+3. Dynamic template no job_runs
+4. system_workflow_defaults/effective_settings exact shape
+5. Root System baseline snapshot / Child copy
+6. explicit/omitted runs_on stored resolved
+7. all-executor queued pending invariant
+8. Attempt Secret bindings/input digest
+9. Dynamic expansion digest/unique
+10. Reusable binding Child System baseline/settings/Retention
+11. Child priority=root priority + update propagation
+12. State immediate nonrollback
+13. Artifact schema has no metadata soft-delete column
+14. Runner invariants/indexes
+15. External Task lease finite/config snapshot + expiry boundary
+16. Human immutable
+17. Idempotency request hash/scope/no-reserved/recheck/expiry boundary
+18. concurrency scope=(workflow_id,group)
+19. mixed max-runs conservative capacity + waiter ordering
+20. Manual Retry concurrency reacquire/output clear atomicity
+21. submit+claim_next atomic
+22. Result Reuse identities
+23. Child-first Retention
+24. migration verification
+25. Payload/Artifact crash consistency
