@@ -1,6 +1,6 @@
 # 07. External / Human Executor 詳細設計
 
-- Status: Draft v1.2
+- Status: Draft v1.3
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `02`, `03`, `08`, `09`, `10`, `11`, `12`
@@ -76,12 +76,15 @@ Lease=`active|expired|released|invalidated`。
 3. `COALESCE(order_rank, 0)` ASC
 4. source/generated source order ASC
 5. **Task `available_at` ASC**
-6. Job Run ID ASC
-7. Task ID ASC
+6. **Job `job_key` ASC**
+7. Job Run ID ASC
+8. Task ID ASC
+
+Static Jobは`source_order=0`でよく、同条件ではstableな`job_key`がopaque UUIDより先にtie-breakする。Dynamic Jobは`order_rank/source_order`が先に効くため`order_by`/source array orderを維持する。
 
 Job `ready_at`はExternal Task claim順には使わない。External Job初回activation後はJob status=`waiting_external`であり、claim可能時刻のSource of Truthは`external_tasks.available_at`。
 
-Job/Task IDはopaque UUID系IDで、同一DB状態内の安定tie-breakとしてのみ使う。Cross-run再現順序を意味しない。
+Job/Task IDはopaque UUID系IDで、同一DB状態内の最終tie-breakとしてのみ使う。Cross-run再現順序を意味しない。
 
 Atomic exactly-one claim。
 
@@ -182,7 +185,7 @@ Pause:
 - 当該paused Runのnew claim禁止
 - existing Lease submit受理（expiry前のみ）
 - lease expiry継続
-- `claim_next`は他の非paused Runのeligible Taskをclaim可能だがpaused RunのTaskはcandidate外
+- `claim_next`は他の`status=running` Runのeligible Taskをclaim可能だがpaused/queued concurrency waiterのTaskはcandidate外
 
 Cancel:
 
@@ -307,8 +310,8 @@ All public read/write Authorization。
 6. External Artifact reference only
 7. concurrent claim exactly one
 8. claim order uses task available_at, not job ready_at
-9. claim/claim_next same ordering
-10. opaque stable ID final tie-break
+9. stable job_key before opaque ID tie-break
+10. claim/claim_next same ordering
 11. lease boundary `now >= expires_at`
 12. requeue updates available_at
 13. submit + next claim + idempotency one transaction
