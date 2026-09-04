@@ -1,53 +1,49 @@
 # 12. Security / Secrets 詳細設計
 
-- Status: Draft v0.1
+- Status: Draft v0.2
 - 対象: MVP
 - 上位仕様: `docs/design.md`
-- 関連:
-  - `docs/detailed-design/02-expression-and-inputs.md`
-  - `docs/detailed-design/04-runner-and-ipc.md`
-  - `docs/detailed-design/08-persistence.md`
-  - `docs/detailed-design/11-service-api-and-mcp.md`
+- 関連: `02-expression-and-inputs.md`, `04-runner-and-ipc.md`, `08-persistence.md`, `11-service-api-and-mcp.md`
 
 ## 1. 目的
 
-本書は JobRunner Core の認可境界、ActorContext、AccessScope、AuthorizationProvider、Secrets注入、ログ保護、Runner/Action Process間の機密情報の扱いを定義する。
+認証/認可境界、ActorContext/AccessScope、Runner trust boundary、Secrets注入/非永続化、Log/Artifact/Tempの安全境界を定義する。
 
 ## 2. 基本原則
 
-1. 認証そのものは親システムの責任。
-2. CoreはAuthorization hookを最初から持つ。
-3. MVP既定providerはAllowAll。
-4. AllowAllでもService operationはAuthorizationProviderを必ず通す。
-5. SecretsはWorkflow YAMLへ値を保存しない。
-6. SecretsはSQLite / Event Log / Execution Logへ平文保存しない。
-7. Action Runnerへ渡すSecretsは必要最小限にする。
-8. CoreはMVPで本格sandboxを提供しない。
-9. 任意コード実行の安全性は専用Action / 親システム責任。
+1. Authenticationは親システム責任。
+2. CoreはAuthorizationProviderを必須hookとして持つ。
+3. MVP defaultはAllowAll。
+4. **全public Service read/write operationがAuthorizationProviderを通る。**
+5. Secret valueをYAML/SQLite/Event/Execution Logへ平文保存しない。
+6. Secretはinternal Action Jobだけへ必要時materialize。
+7. Coreは本格sandbox/任意code executionを標準提供しない。
+8. Runner内部identityはexternal user authとは別のfencingで守る。
 
 ## 3. Trust boundary
 
-概念:
-
 ```text
-External client
-  ↓
-Parent authentication
-  ↓ ActorContext
-JobRunner Adapter
-  ↓
-AuthorizationProvider
-  ↓
-Runtime Service
-  ↓
-Persistence / Runner / Action
+External caller
+ -> Parent authentication
+ -> ActorContext/AccessScope
+ -> Adapter
+ -> AuthorizationProvider
+ -> Public Runtime Service
+ -> Persistence
+
+Parent Supervisor
+ -> Runner Process identity/fencing
+ -> Internal RunnerService
+ -> Persistence
+
+Runner
+ -> Common Action Runner child
+ -> registered Action
 ```
 
-JobRunner Coreは親システムが供給したidentityを信頼する。
+Action Runner childはDBへ直接接続しない。
 
 ## 4. ActorContext
-
-概念型:
 
 ```text
 actor_type
@@ -57,21 +53,11 @@ claims optional
 metadata optional
 ```
 
-例:
-
-```text
-user
-service
-agent
-system
-runner
-```
+例 `user/service/agent/system`。Coreが不要属性を自動収集しない。
 
 ## 5. AccessScope
 
-Coreが操作対象を絞り込める抽象scopeを持つ。
-
-概念例:
+抽象scope:
 
 ```text
 project_id optional
@@ -80,13 +66,9 @@ tenant_id optional
 resource_tags optional
 ```
 
-Core自体がproject/tenantの意味を固定しない。
-
-親システムがAccessScopeの意味を定義する。
+意味は親側が定義。CoreはscopeをResource query/filterへ渡す。
 
 ## 6. AuthorizationProvider
-
-概念interface:
 
 ```python
 class AuthorizationProvider:
@@ -94,7 +76,7 @@ class AuthorizationProvider:
         ...
 ```
 
-decision:
+Decision:
 
 ```text
 allowed
@@ -102,56 +84,50 @@ reason optional
 filtered_scope optional
 ```
 
-## 7. AllowAll
+AllowAllでも呼出経路を省略しない。
 
-MVP default:
+## 7. Authorization対象
 
-```text
-AllowAllAuthorizationProvider
-```
-
-ただしService codeでprovider呼び出しを省略しない。
-
-将来provider差し替えだけで制限を追加できる構造にする。
-
-## 8. Authorization対象
-
-少なくとも以下を通す。
+Read含む全public operation:
 
 ```text
-workflow start/read/list
-pause/resume/cancel/retry
-priority update
-external claim/submit
-human review submit
-artifact metadata read
-log read
-runner info read
-state read/write via service
+Workflow Definition list/info
+Workflow Run list/info/start
+pause/resume/cancel/retry/priority
+External task info/claim/submit
+Human review list/info/submit
+Artifact info/history
+Log read
+Runner info
+public state read/writeが追加された場合それも
 ```
 
-Action Runtime Handle経由のstate/artifact操作もcurrent Workflow Run scopeを引き継ぐ。
+Action Runtime Handleのstate/artifact操作はcurrent Workflow RunのActor/AccessScopeを引き継ぐ内部operation。
 
-## 9. Worker/Runner identity
+## 8. Child Workflow権限
 
-RunnerからCoreへの更新は外部ユーザー認証ではなく、runtime内部のidentityでfencingする。
+Child RunはParent ActorContext/AccessScopeを継承する。権限拡大禁止。Child側で狭めることは可能。
 
-最低限:
+Childのpublic readは通常Authorization。Public controlは`06/11`によりMVP拒否。
+
+## 9. Runner identity / fencing
+
+Runner internal update:
 
 ```text
 runtime_instance_id
 runner_id
 runner_instance_id
-attempt_id
+attempt_id where applicable
 ```
 
-current ownershipと一致しないlate updateを拒否する。
+をcurrent DB ownershipと照合する。旧Runtime/旧Runner instanceのlate update拒否。
 
-## 10. Secrets Provider
+Runner internal Serviceは外部へ公開しない。DB path/data rootはRunner起動configとして親Supervisorから渡せるが、Action Runner childへ渡さない。
 
-親システムがSecrets ProviderをRuntime初期化時に渡す。
+Parent lifecycle pipe EOFでもRunner終了を要求する。
 
-概念:
+## 10. SecretsProvider
 
 ```python
 class SecretsProvider:
@@ -159,32 +135,43 @@ class SecretsProvider:
         ...
 ```
 
-MVPではdict/env wrapperでもよい。
+親側dict/env/secret manager adapterでよい。
 
-## 11. YAML secrets参照
-
-値を直接書かず参照する。
+## 11. Secret reference policy
 
 ```yaml
-with:
-  token: ${{ secrets.API_TOKEN }}
+jobs:
+  call_api:
+    action: api.call
+    with:
+      token: ${{ secrets.API_TOKEN }}
 ```
 
-Workflow Run snapshotには参照式を保存し、解決後のsecret valueを保存しない。
+`${{ secrets.* }}`はinternal Action Job `with`だけで許可。
 
-## 12. Secret解決タイミング
+禁止:
 
-Job Inputの永続snapshotを作る際、Secret値を通常Input JSONへ埋め込まない。
+```text
+External LLM with
+Human with
+Reusable Workflow parent with
+if / retry if / continue-on-error / foreach / key / order_by
+Workflow outputs / concurrency
+```
 
-永続Inputとruntime-only secret injectionを分離する。
+Child Workflowは自分のinternal ActionからSecretを参照する。
 
-Action起動直前に必要secretを解決し、Action Runnerへ渡す。
+## 12. Materialization / Retry
 
-## 13. Secret allow/request set
+Persistent Job InputにはSecret reference markerだけ保存。値は各AttemptのAction起動直前にProviderから解決する。
 
-Actionが必要なSecret名をmetadataで宣言できる構造を推奨する。
+同じreferenceをRetryで維持するが、rotation後の新value使用を許容する。
 
-例:
+missing SecretはAction childを起動する前に`secret_not_found` validation/resolution failure。
+
+## 13. Secret allow set
+
+Action registration metadataで必要Secret名を宣言可能:
 
 ```python
 registry.register(
@@ -195,172 +182,132 @@ registry.register(
 )
 ```
 
-YAMLから任意secret名を自由列挙させる場合もAuthorization / parent policyで制限可能にする。
+MVPではallow-list必須ではないが、親policyが許可Secret名を制限できるhookを持つ。
 
-MVPでは厳密allow-listを必須としないが拡張点を持つ。
+YAMLが参照するSecret名syntaxは:
 
-## 14. IPCとSecrets
+```text
+^[A-Za-z_][A-Za-z0-9_]*$
+```
 
-Runner -> Action Runner IPCでSecretを渡す必要がある場合、専用start payloadのruntime-only fieldとして渡す。
+## 14. 非永続化
 
-以下へ書かない。
+Secret valueを以下に保存しない:
 
-- IPC debug dump
+- Definition resolved JSON
+- Workflow/Job Input JSON
+- Workflow/Job Output
 - Event payload
-- normal Execution Log
-- SQLite Input snapshot
+- Execution Log
+- Idempotency request hash/result
+- IPC debug dump
+- Runner metadata
 
-## 15. Secret redaction
+Action Runnerへのstart IPCにはruntime-only fieldとして渡せる。
 
-Execution Logへの漏洩低減として、既知Secret値をredactできるhookを持つ。
+## 15. Redaction
 
-ただし完全な漏洩防止を保証しない。
+Known Secret valueをExecution Log write pipeline入口でredactできるhookを持つ。
 
-Actionが意図的に変形・分割して出力したSecretをCoreが完全検出する責任は負わない。
+完全保証ではない。ActionがSecretを変形/分割して出した場合の完全検出はCore責任外。
 
-## 16. Environment variables
+Redaction前のlog lineを別debug sinkへ平文保存しない。
 
-親システムがSecretsをOS environment経由で供給するAdapterを作ってもよい。
+## 16. Process environment
 
-Coreは親Process全environmentを無条件にActionへ引き継がない。
+親Process全environmentをAction Runnerへ無条件継承しない。
 
-Action Runnerのenvironmentは必要最小限に構築することを推奨する。
+Action child environmentはProcess起動に必要な最小値 + 親が明示した非Secret環境を基本とし、SecretはIPC/専用注入で渡す。
 
-## 17. Execution Log
+## 17. Arbitrary code / Sandbox
 
-Log readはAuthorization対象。
-
-Log pathを外部APIへ直接filesystem pathとして公開する必要はない。
-
-Serviceはattempt_id経由でreadする。
-
-Path traversalを防ぐため、外部入力から任意pathをreadしない。
-
-## 18. Artifact URI
-
-Artifact `uri` は参照情報。
-
-Coreは任意URIを自動fetchしない。
-
-したがってSSRF等の外部fetch責務をCore Artifact subsystemに持ち込まない。
-
-Action / 親システムがURIを解釈する。
-
-## 19. Workflow YAML
-
-YAMLに任意Python/Shellコードを埋め込まない。
-
-Action IDから登録済みcallableのみ実行する。
-
-未登録Actionは開始前validationで拒否。
-
-## 20. Arbitrary code execution
-
-Core標準機能として以下を提供しない。
+Coreに:
 
 ```text
-shell: <arbitrary command>
-python: <arbitrary source>
+shell: arbitrary command
+python: arbitrary source
 ```
 
-必要な親は専用Actionを登録する。
+を設けない。
 
-Sandboxが必要なら専用Action内でDocker等を利用する。
+必要なら親が専用Actionを登録し、そのAction内でDocker等を使う。
 
-## 21. Temp directory
+Attempt temp directoryは整理目的でありsandboxではない。ActionはOS権限上他pathへアクセスできる可能性がある。
 
-Attempt専用directoryは整理目的でありsecurity sandboxではない。
+## 18. YAML security
 
-ActionはOS権限上アクセス可能な他pathへ到達できる可能性がある。
+Safe loaderを使用し:
 
-この制約をドキュメントで明記する。
+- custom/object tags拒否
+- duplicate mapping key拒否
+- merge key `<<`拒否
+- arbitrary include/fetch拒否
 
-## 22. SQLite
+Reusable `uses`もlocal root/registered IDだけでURL fetch無し。
 
-SQLite fileのOS file permissionは親システムdeployment責任。
+## 19. Execution Log
 
-CoreはDB暗号化をMVP標準要件にしない。
+Log readはAuthorization対象。External callerへfilesystem pathをread APIとして受け付けない。
 
-Secret値をDBへ保存しないことでriskを下げる。
+Serviceはattempt_idから内部relative pathを解決しdata root外へ出ないことを確認する。
 
-## 23. MCP exposure
+## 20. Artifact URI
 
-親システムは公開するMCP toolを選択可能。
+Artifact URIはopaque reference。Coreは自動fetchしないためCore Artifact subsystemがSSRF clientにならない。
 
-例えばread-only deploymentではstart/cancel/retryを登録しない運用を可能にする。
+URI interpretation/authorizationは実体を扱うAction/親側責任。
 
-Tool namespaceを必須化し、複数親システム間の誤操作を減らす。
+## 21. SQLite / filesystem
 
-## 24. Human / External actor
+SQLite/data rootのOS permission、disk encryption、backup encryptionはdeployment/親責任。CoreはMVP標準DB encryptionを提供しない。
 
-External task `claimed_by` / Human review actorをEventへ保存する。
+DBへSecretを入れないことを第一防御とする。
 
-個人情報等をどこまで保存するかは親側ActorContext設計に従う。
+## 22. MCP exposure
 
-Coreは不要なidentity属性を自動収集しない。
+親はtool subsetを選べる。Read-only用途ならstate-changing toolを登録しない。
 
-## 25. Child Workflow
+Namespace必須により複数親システムの同名操作混同を減らす。
 
-Child Workflow Runは親ActorContext / AccessScopeをsnapshotまたは参照可能な形で継承する。
+Tool非公開はAuthorizationの代替ではない。公開toolもAuthorizationを通る。
 
-権限拡大しない。
+## 23. Error information leakage
 
-Child側でより狭いscopeへ制限することは許可する。
+AuthorizationProviderは`forbidden`と`not_found`の使い分けをpolicyとして選べる。権限のないcallerへ他tenant/resourceの存在を必要以上に露出しない。
 
-## 26. Error response
+Error details/EventへSecret値を含めない。
 
-Authorization failureで内部存在情報を過剰に漏らさない。
+## 24. Audit
 
-Adapterは`forbidden` / `not_found`の使い分けをProvider policyに従える。
+State-changing operationはactor/source/request_idをEventへ記録可能。Read Eventを全件auditすることはMVP必須ではないがProvider/Adapter hookを追加可能。
 
-## 27. Audit Event
-
-state changeにはactor/sourceを記録する。
-
-代表:
+## 25. 将来拡張
 
 ```text
-workflow_started
-workflow_cancel_requested
-retry_requested
-external_task_claimed
-external_task_submitted
-human_review_submitted
-priority_updated
+RBAC/ABAC
+PostgreSQL RLS
+Secret Manager adapter
+Docker/OS sandbox Action
+signed external claim
+remote Runner authentication
 ```
 
-Secret値をpayloadへ含めない。
+MVP Coreを依存させない。
 
-## 28. Security拡張点
+## 26. 受入条件
 
-将来候補:
-
-```text
-RBAC provider
-ABAC provider
-PostgreSQL RLS adapter
-Secret manager adapter
-Docker sandbox Action
-OS-level runner isolation
-signed external task claims
-```
-
-MVP Coreをこれらに依存させない。
-
-## 29. 受入条件
-
-1. 全state-changing ServiceがAuthorizationProvider通過
-2. AllowAll default
-3. deny providerで操作拒否
-4. AccessScope filtering
-5. Secret YAML参照
-6. Workflow snapshotにSecret値なし
-7. DB InputにSecret値なし
-8. EventにSecret値なし
-9. Execution Log redaction hook
-10. late Runner fencing
-11. MCP tool選択公開
-12. arbitrary shell非搭載
-13. Artifact URI自動fetchなし
-14. log path traversal拒否
-15. Child権限非拡大
+1. 全public read/write Authorization
+2. AllowAll/Deny/filtered scope
+3. Child scope非拡大/control拒否
+4. Runner internal fencing
+5. Action child DB非接続
+6. Secret internal Action withのみ
+7. external/human/reusable/conditions Secret拒否
+8. reference persistence + per-Attempt materialize
+9. missing Secret child起動前failure
+10. Secret DB/Event/Log/Idempotency不在
+11. redaction hook
+12. safe YAML duplicate/tag/merge拒否
+13. Log path traversal拒否
+14. Artifact URI no fetch
+15. MCP subset + Authorization
