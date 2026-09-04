@@ -1,9 +1,9 @@
 # 03. Runtime / Scheduling 詳細設計
 
-- Status: Draft v1.2
+- Status: Draft v1.3
 - 対象: MVP
 - 上位仕様: `docs/design.md`
-- 関連: `01`, `02`, `04`, `05`, `08`, `09`, `10`
+- 関連: `01`, `02`, `04`, `05`, `06`, `08`, `09`, `10`
 
 ## 1. 基本原則
 
@@ -12,12 +12,12 @@
 3. 同一Workflow Run internal Job同時実行最大1。
 4. 別Workflow RunはRunner Pool空きまで並列。
 5. External/Human/Reusable待ちはRunner非占有。
-6. Dynamic templateは仮想groupでありRunner取得対象/Attempt対象ではない。
+6. Dynamic templateは仮想groupでRunner/Attempt対象ではない。
 7. DB永続状態がSource of Truth。
 8. claim/state transitionはconditional transaction。
 9. Priority変更はpreemptしない。
-10. Job result自動再利用は同一Workflow Run内だけ。別Run/global cache無し。
-11. External Lease/Retry backoff/Retention等の期限処理はRuntime Maintenance Loop。
+10. Job result自動再利用は同一Workflow Run内だけ。
+11. Lease/Retry/Retention等の期限処理はMaintenance Loop。
 
 ## 2. Runtime起動
 
@@ -38,32 +38,58 @@ Parent Process正規順:
 
 Bootstrap/Provider/Storage/Migration/Pool validation失敗時はScheduling開始しない。
 
-## 3. Workflow Run start
+## 3. Root Workflow Run start
 
 Start前にDefinition/Input/Registry version/Runner Pool/Expression/Reusable/Concurrency/Authorizationを検証。
 
+Root Run start時にcurrent System workflow defaultsを`01` shapeでsnapshotし、そこからeffective settings/Retentionを算出する。
+
+Initial Run priority:
+
+```text
+wf_start.priority specified -> request value
+otherwise -> Workflow Definition priority
+```
+
 Start transaction:
 
-- Run Definition/Input/effective settings/Retention snapshot
+- Run Definition/Input snapshot
+- `system_workflow_defaults_json`
+- effective settings/Retention
 - Action/Validator version snapshot
+- initial priority
 - concurrency snapshot
-- static non-dynamic Jobの`job_runs` rowだけ作成
+- static non-dynamic Job rows
 - Event
 - optional idempotency result
 
-Dynamic templateはDefinition snapshotに存在する仮想group。Run startで`job_runs` rowを作らず、Expansion時にgenerated concrete Jobだけを作る。Group stateは`05/08`から導出。
+Dynamic templateはDefinition snapshotに存在する仮想group。Run startでは`job_runs` row無し。
 
-Static Job rowは最初`status=queued, ready_at=NULL`。Runner取得可能ではない。
+Static Jobは最初`status=queued, ready_at=NULL`。
 
-Concurrency `queue|reject` は`08`。
+## 4. Child Workflow Run start
 
-## 4. Status / readiness
+Reusable Childは`06` bindingから:
+
+- Definition
+- Action/Validator versions
+- inherited System workflow defaults
+- Child effective settings/Retention
+- Actor/AccessScope/source_identity
+
+をcopyする。Current System configを読み直さない。
+
+Child Run priority=current root Workflow Run priority。
+
+Nested Childも同じbaseline inheritanceを繰り返す。
+
+## 5. Status / readiness
 
 Workflow=`queued|running|paused|completed`、Conclusion=`success|failure|cancelled`。
 
 Concrete Job=`queued|running|waiting_external|waiting_review|waiting_child|completed`、Conclusion=`success|failure|cancelled|skipped|blocked`。
 
-Dynamic template groupのstatus/conclusionは`05`で導出しJob rowへ保存しない。
+Dynamic group status/conclusionは`05`で導出。
 
 Queued concrete Job:
 
@@ -71,7 +97,7 @@ Queued concrete Job:
 - `ready_at!=NULL`: 次Attempt用persistent Input snapshot確定済み
 - `retry_not_before>now`: Retry backoff待ち
 
-## 5. Concrete Job初回activation
+## 6. Concrete Job初回activation
 
 前提:
 
@@ -117,37 +143,51 @@ Reusable:
 
 Pre-Attempt Input/condition failureはJob-level failure。Input snapshot無しならManual Retry不可。
 
-## 6. Dynamic template activation
+## 7. Dynamic template activation
 
-RuntimeはDefinition snapshotから未確定Dynamic templateを探索。
+Definition snapshotから未確定Dynamic templateを探索。
 
 - Root: template + Run
 - Nested: template + each parent generated Job
 
 Dependencies terminal後`05`のif/foreach/key/order/atomic expansion。
 
-Template自身のAttempt/Execution Log/Retry target無し。Expansion failureは`dynamic_expansions.failure_json` + Workflow failure。Generated concrete Jobは通常§5へ。
+Template自身のAttempt/Execution Log/Retry target無し。Expansion failureは`dynamic_expansions.failure_json` + Workflow failure。
 
-## 7. Selection order
+## 8. Selection order
 
 Internal/External共通:
 
-1. Workflow priority DESC
+1. Workflow Run priority DESC
 2. Job priority DESC
 3. Dynamic order rank ASC
 4. source/generated order ASC
 5. ready_at ASC
 6. Job Run ID
 
+Child Run priorityはroot priorityと同期されるためReusable subtreeもroot運用priorityで比較される。
+
 InternalはPool exact一致。External claimも同ordering。
 
-## 8. Atomic internal claim
+## 9. Root priority update
+
+`wf_priority_update` はroot non-terminal Runだけ許可。
+
+1 transactionで:
+
+- root priority更新
+- `root_workflow_run_id=root.id` の全non-terminal descendant Child Run priorityを同値へ更新
+- Event/idempotency result
+
+Current running Jobをpreemptしない。Future Childは更新後root priorityを継承。
+
+## 10. Atomic internal claim
 
 Candidate=`internal + queued + ready_at + due + pending snapshot + same Run running internal無し + Pool一致`。
 
 1 transactionでJob running + new Attempt snapshot copy + Runner ownership + Log/Event。Attempt後pending clear。
 
-## 9. Queued Retry activation for non-internal executor
+## 11. Queued Retry activation for non-internal executor
 
 External/Human/Reusable Retryは:
 
@@ -164,9 +204,9 @@ SchedulerはPause/Cancel gate後、`with`を再評価せずpending snapshot exac
 - human -> Review/waiting_review
 - reusable -> same binding Child/waiting_child
 
-Attempt後pending clear。Runner非消費。
+Attempt後pending clear。
 
-## 10. Maintenance Loop
+## 12. Maintenance Loop
 
 Workflow Scheduler/Cronではなく期限/housekeeping専用。
 
@@ -176,7 +216,7 @@ Nearest deadline + condition/event wait。Default max sleep5秒。
 
 Pause中Lease/Retention継続。Restart時overdue/cleanup/Retention先処理。
 
-## 11. Terminal後activation
+## 13. Terminal後activation
 
 Idempotentに:
 
@@ -188,7 +228,7 @@ Idempotentに:
 - concurrency release
 - Workflow progress再計算
 
-## 12. Stored Result Reuse Context
+## 14. Stored Result Reuse Context
 
 Successful Attempt terminal時:
 
@@ -214,20 +254,21 @@ Executor identity:
   - Child Definition hash
   - Child Action versions
   - Child Validator versions
+  - Child System workflow defaults JSON
   - Child effective settings JSON
-  - Child retention policy JSON
+  - Child Retention policy JSON
 
 Validator identity=none null or ID/version。
 
-Reusable bindingのSystem-derived settingsもidentityへ含めるため、同じChild Definitionでも実行条件が違うbindingを同一結果扱いしない。
+PriorityはScheduling metadataでresult semanticsではないためreuse identityへ含めない。
 
-## 13. Reuse eligibility
+## 15. Reuse eligibility
 
 原則eligible。ただしRuntime `state.get`、persistent Input/direct upstream以外Artifact materialize、executor extension falseでineligible。
 
 Expression stateがwithならInput digest、ifならcurrent再評価へ反映するのでそれだけでineligibleではない。
 
-## 14. Manual Retry後successful Job strict reuse
+## 16. Manual Retry後successful Job strict reuse
 
 Current dependenciesから副作用無しで:
 
@@ -240,19 +281,19 @@ Current dependenciesから副作用無しで:
 7. current Registry snapshot version exact
 8. Payload/required Artifact integrity
 9. eligible
-10. stored Output Schema -> Validator -> success_if -> SecretGuard再検証
+10. stored Outputをexecutor固有の現在有効なSchema/Validator/success_if契約で再検証
 
 Pass -> success維持 + `job_result_reused`。
 
-Fail -> `successful_job_result_not_reusable`, retryable=false, new Workflow Run要求。Same Runでsuccessful Jobをnew Input自動再実行しない。
+Fail -> `successful_job_result_not_reusable`, retryable=false, new Workflow Run要求。Same Runでnew Input自動再実行しない。
 
-## 15. Dynamic expansion reuse
+## 17. Dynamic expansion reuse
 
 Manual Retry後completed/success Dynamic groupはGenerated Job reuseより前に`05` expansion digest check。Exact matchのみ保持。Mismatch=`dynamic_expansion_not_reusable`。
 
 Whole skipped groupのみ未実行として再評価可能。
 
-## 16. Pause / Resume
+## 18. Pause / Resume
 
 Pause:
 
@@ -265,13 +306,13 @@ Resume:
 
 - ready_at NULL concrete Job/Dynamicをcurrent dependencyから再評価
 - ready_at non-NULL queued Jobは全executorでpending Input再評価無し
-- dueなら§8/§9
+- dueなら§10/§11
 
-## 17. Cancel
+## 19. Cancel
 
 queued/waiting cancel、Lease invalidate、running internal cancel、Child cancel、new activation禁止。Cancel後alwaysでもnew Job無し。
 
-## 18. Workflow conclusion
+## 20. Workflow conclusion
 
 Success=required concrete Jobs/groups success、intentional skip、allowed continue-on-error、reuse pending無し。
 
@@ -279,7 +320,7 @@ Failure=non-allowed failure/blocked、Dynamic failure/not-reusable、Child failu
 
 Cancel由来=cancelled。
 
-## 19. Concurrency / Recovery
+## 21. Concurrency / Recovery
 
 Concurrency=`08` BINARY group。
 
@@ -292,24 +333,27 @@ Restart:
 - running internal recovery
 - Lease/Review/Child
 - Dynamic/reuse pending
+- root/Child priority整合repair
 - Retention
 
 Completed RunはRecoveryだけでreopenしない。
 
-## 20. 受入条件
+## 22. 受入条件
 
-1. Dynamic template no Job/Attempt
-2. static ready_at NULL
-3. internal pending/claim copy
-4. all-executor Retry pending
-5. noninternal Retry no with re-eval
-6. Resume pending invariant
-7. one-running/ordering/Pool
-8. Maintenance
-9. strict current if/Input/Artifact/version validation
-10. Reusable identity includes Child settings/Retention
-11. stored Output revalidation
-12. no changed-input rerun
-13. Dynamic expansion reuse
-14. state.get/non-input Artifact ineligible
-15. concurrency/recovery idempotency
+1. Root system baseline/effective setting snapshot
+2. Child inherits Parent Run baseline, not current System
+3. root priority resolution/update/descendant propagation
+4. Dynamic template no Job/Attempt
+5. static ready_at NULL
+6. internal pending/claim copy
+7. all-executor Retry pending
+8. noninternal Retry no with re-eval
+9. one-running/ordering/Pool
+10. Maintenance
+11. strict current if/Input/Artifact/version validation
+12. Reusable identity includes Child baseline/settings/Retention
+13. stored Output revalidation
+14. no changed-input rerun
+15. Dynamic expansion reuse
+16. state.get/non-input Artifact ineligible
+17. concurrency/recovery idempotency
