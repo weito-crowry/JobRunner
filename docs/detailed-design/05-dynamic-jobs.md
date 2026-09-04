@@ -1,23 +1,23 @@
 # 05. Dynamic Jobs 詳細設計
 
-- Status: Draft v0.2
+- Status: Draft v0.3
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01-workflow-definition.md`, `02-expression-and-inputs.md`, `03-runtime-and-scheduling.md`
 
 ## 1. 目的
 
-`foreach`によるDynamic Jobの生成、任意深さの入れ子、stable key、full logical Job key、atomic expansion、ordering、dependency group、Recoveryを正規化する。
+`foreach` による Dynamic Job の生成、任意深さの入れ子、stable key、full logical `job_key`、atomic expansion、ordering、dependency group、Recovery を定義する。
 
 ## 2. 基本原則
 
-1. Actionから任意Jobを直接追加せずYAML templateをEngineが展開する。
-2. 生成Jobは通常Jobと同じJob Run/Attempt/Retry/Log/Artifactを持つ。
+1. Actionから任意Jobを直接追加しない。YAML templateをEngineが展開する。
+2. generated Job は通常Jobと同じ Job Run / Attempt / Retry / Log / Artifact を持つ。
 3. 入れ子深さに固定上限を置かない。
-4. Workflow Run全体の**生成Job数**で上限管理し既定1000。
+4. Workflow Run全体の generated Job数上限で暴走防止し、既定1000。
 5. 1 expansionはall-or-nothing。
-6. stable keyを優先し、識別にはparent pathを含むfull logical `job_key`を使う。
-7. 同一Workflow Run internal Job同時実行最大1はDynamic Jobにも適用する。
+6. logical identity は親pathを含む full `job_key`。
+7. 同一Workflow Run internal Job同時実行最大1はgenerated Jobにも適用。
 
 ## 3. Root Dynamic Job
 
@@ -28,15 +28,13 @@ jobs:
     foreach: ${{ needs.generate.outputs.candidates }}
     key: ${{ item.id }}
     action: evaluate_candidate
-    with:
-      candidate: ${{ item }}
 ```
 
-`evaluate`自体はActionを実行しないtemplate。配列要素ごとにgenerated Jobを作る。
+Template自身はActionを実行せず、generated Job群の論理親となる。
 
-## 4. Nested Dynamic Job の正規syntax
+## 4. Nested Dynamic Job
 
-Nested expansionは`foreach` object formを使う。
+正規syntax:
 
 ```yaml
 jobs:
@@ -46,38 +44,37 @@ jobs:
       items: ${{ iteration.parent.outputs.conditions }}
     key: ${{ item.id }}
     action: evaluate_condition
-    with:
-      candidate: ${{ iteration.parent.item }}
-      condition: ${{ item }}
 ```
 
 規則:
 
-- `parent`: 同じWorkflow内のDynamic Job template ID。literal stringのみ。
-- `items`: parent generated Jobごとに評価するCEL expression。
-- `parent`は明示的なDynamic parent edgeであり、同じtemplate IDを`needs`へ重複記載しない。
-- `needs`にはparent以外のglobal dependencyを追加できる。global dependencyは各nested expansion前にterminal/condition要件を満たす必要がある。
-- 1つのparent generated Jobにつき0または1 expansion instanceを作る。
-- parent generated Jobがeffective successでない場合、defaultではそのparentに対するnested expansionを作らない。nested templateに明示`if: ${{ always() }}`等がある場合でも、Workflow cancel後は新規展開しない。
+- `parent`: 同一Workflow内のDynamic template ID、literal string。
+- `parent`は依存edgeでありDAG cycle検証対象。
+- 同じparentを`needs`へ重複記載してはならない。
+- `needs`にはparent以外のglobal dependencyを追加可能。
+- condition dependency set は `{parent} ∪ needs`。
+- 1 parent generated Jobにつき0または1 expansion instance。
+- parent/needsがterminal後に`if`を評価する。
+- Workflow cancel後は`always()`でも新規expansionしない。
 
-Root formの`foreach: <expr>`とNested object form以外はrejectする。
+Root scalar formとNested object form以外はreject。
 
 ## 5. `foreach` result
 
-`items`/root `foreach`はJSON array必須。`null/object/scalar`は`dynamic_foreach_type_error`。
+JSON array必須。`null/object/scalar`は `dynamic_foreach_type_error`。
 
-空arrayは正常:
+空配列は正常:
 
 - generated count 0
-- expansion complete
-- dependency groupは空集合としてterminal
+- expansion terminal
+- groupは `completed/success`
 - 後続を永久待機させない
 
-Source arrayをexpansion時にsnapshotする。
+source arrayはexpansion時にsnapshot。
 
-## 6. `item` / iteration snapshot
+## 6. `item` / `iteration`
 
-各generated Jobは`02`のexact shapeを保存する。
+`02`のshapeを保存する。
 
 `iteration.current`:
 
@@ -89,30 +86,34 @@ job_key
 source_order
 ```
 
-Nestedでは`iteration.parent`に直近parent generated Jobの:
+Nested `iteration.parent`:
 
 ```text
-template_id/key/item/job_key/source_order/status/conclusion/outputs/artifacts
+template_id
+key
+item
+job_key
+source_order
+status
+conclusion
+continue_on_error
+outputs
+artifacts
 ```
 
-をsnapshotする。`iteration.ancestors`はoutermost -> direct parent順。
+`iteration.ancestors`は outermost -> direct parent。
 
-Retryではitem/iterationを再評価しない。
+Retryでは再評価しない。
 
-## 7. Stable raw key
+## 7. raw key
 
-`key`指定時の結果はstringまたはinteger。integerはbase-10 stringへcanonical conversion。空stringは禁止。
+`key`結果は string または integer。integerはbase-10 string化。空string禁止。
 
-制約:
+同一 expansion instance内duplicate raw keyはfailure。
 
-- raw key UTF-8 <= 256 bytes
-- duplicate raw keyは**同一 expansion instance内**でfailure
-
-`key`省略はsource indexをraw keyとして使用可能。index fallbackはsource order変更で識別も変わるためvalidation warningを出せる。
+`key`省略時はsource index fallbackを許可する。
 
 ## 8. Full logical `job_key`
-
-親の異なるgenerated Job同士が衝突しないよう、full pathをcanonical identityとする。
 
 Root:
 
@@ -133,23 +134,25 @@ evaluate[candidate_b]/condition[x]
 evaluate[candidate_a]/condition[x]/scenario[1]
 ```
 
-### 8.1 key encoding
+### 8.1 component encoding
 
-Path component内のraw keyはUTF-8 bytesをpercent-encodeする。
+raw keyはUTF-8 percent-encodeする。
 
-safe characters:
+safe:
 
 ```text
 A-Z a-z 0-9 . _ -
 ```
 
-その他は `%HH` uppercase hex。`%`, `[`, `]`, `/` は必ずencodeする。
+`%`, `[`, `]`, `/` 等は `%HH` uppercase hex。
 
-Template IDは`01`の静的Job ID制約によりpath delimiterを含まない。
+### 8.2 深さと長さ
 
-Full `job_key` UTF-8 <= 2048 bytes。超過は`dynamic_job_key_too_long`。
+**MVPでは full logical `job_key` に固定byte長上限を設けない。**
 
-DB primary IDはopaque `job_run_id`を別に持つ。
+入れ子段数を任意にする決定と衝突しないためである。DBでは `TEXT` と opaque `job_run_id` を使用し、filesystem pathには `job_key` を直接使わない。
+
+DoS/表示上の問題は generated Job数上限1000とAPI paginationで制御する。将来長さ上限を追加する場合は明示的なbreaking validation ruleとして扱う。
 
 ## 9. 生成数上限
 
@@ -159,15 +162,15 @@ System default:
 max_dynamic_jobs_per_workflow_run = 1000
 ```
 
-Workflow `settings.max-dynamic-jobs`でoverride可能。
+Workflow `settings.max-dynamic-jobs` でoverride。
 
-数える対象は生成されたJob Run総数。static Job/template metadata/Child Workflow内のgenerated Jobは**各Child Workflow Run自身の上限**で数える。
+数えるのは当該Workflow Runに生成されたJob Run。Child Workflow内はChild Run自身で別カウント。
 
-新expansionを加えるとlimit超過ならそのexpansionは0件登録しfailure。truncateしない。
+上限超過時はexpansion全体を0件登録でfailure。truncate禁止。
 
 ## 10. Expansion identity
 
-1 expansion instance:
+unique identity:
 
 ```text
 workflow_run_id
@@ -175,62 +178,36 @@ template_id
 parent_generated_job_run_id nullable
 ```
 
-にunique。
+Rootはparent null。Nestedはparent generated Jobごと。
 
-Rootはparent=null。Nestedはparent generated Jobごとに別instance。
-
-`dynamic_expansions` rowへ:
-
-```text
-id
-workflow_run_id
-template_id
-parent_job_run_id nullable
-source_snapshot_json
-source_digest
-generated_count
-status
-failure_json nullable
-created_at/completed_at
-```
-
-を保存する。Runtime crash後もcomplete expansionを再生成しない。
+`dynamic_expansions`にsource snapshot/digest/generated_count/status/failureを保存する。
 
 ## 11. Atomic expansion
 
-事前にmemory上で全candidateを構築し検証:
+memory上で全candidateを構築・検証:
 
-- source array JSON-compatible
-- key type/length/duplicate
-- full job_key collision/length
-- Input/if/order expression評価可能性
-- Action/version / Runner Pool / executor
-- Retry/timeout
-- total generated count limit
-- parent/ancestor整合
+- foreach結果
+- raw key type/duplicate
+- full job_key collision
+- parent/DAG整合
+- Input/if/order expression
+- Action/version/Runner Pool/executor
+- Retry/internal timeout
+- generated count limit
 
-その後1 SQLite transactionで:
+1 SQLite transactionで全generated Jobとexpansion metadataを保存する。
 
-1. expansion row create/update
-2. all generated Job rows insert
-3. item/iteration/order snapshot
-4. expansion status complete
-5. Event
-
-1件でも失敗ならrollbackしgenerated Jobを0件に保つ。Failure後のexpansion rowを残す場合は、rollback後に別transactionでfailure記録してよいがgenerated Jobは作らない。
+1件でも失敗ならrollbackし generated Jobを残さない。
 
 ## 12. `if`
 
-Root template `if`はroot expansion前に1回評価。
+Root template: declared needs terminal後に1回評価。
 
-Nested template `if`はparent generated Jobごとにiteration context付きで評価。
+Nested template: parent generated Job + declared needs terminal後、iteration付きでparentごとに評価。
 
-false:
+helper意味は`02`。
 
-- そのexpansion instanceは0件の正常skipped expansionとして記録
-- generated Jobを作らない
-
-Expression errorはexpansion failure。
+falseはそのexpansion instanceを0件 `skipped` として確定。expression errorはexpansion failure。
 
 ## 13. `order_by`
 
@@ -238,55 +215,47 @@ Expression errorはexpansion failure。
 order_by:
   - expr: ${{ item.priority }}
     direction: desc
-  - expr: ${{ item.id }}
-    direction: asc
 ```
 
-または:
+または `source_order`。
 
-```yaml
-order_by: source_order
-```
+型規則は`02`。sort key/rankはexpansion時snapshot。
 
-各criterionの型/混在禁止は`02`に従う。Expansion時にsort key/rankをsnapshotし再計算しない。
-
-Runner選択順:
+Runner選択:
 
 1. Workflow priority
 2. Job priority
-3. order rank
+3. Dynamic order rank
 4. source order
 5. ready_at
 6. job_run_id
 
-## 14. Template group `needs`
+## 14. Template group
 
-後段で:
+`needs: [evaluate]` は `evaluate` templateから当該Runに生成された全該当Jobをgroupとして指す。
 
-```yaml
-aggregate:
-  needs: [evaluate]
-```
+Nested templateは全parent expansionから生成された全Job。
 
-とした場合、`evaluate` templateから**Workflow Run内に生成された全Root generated Job**をgroupとして扱う。
+### 14.1 status
 
-Nested template `condition`をneedsに指定した場合、そのtemplateの全parent expansionから生成された全Jobをgroupとして扱う。
+- activation/expansionが未確定、またはgenerated Jobにnon-terminalあり: `running`
+- 全expansion確定 + generated Job全terminal: `completed`
 
-Groupは全該当expansionがactivation可能性を失い、全generated Jobがterminalになった時点でterminal。
+0件groupもexpansion確定後 `completed`。
 
-### 14.1 group conclusion
+### 14.2 conclusion
+
+terminal時:
 
 - 0件: `success`
-- 全Jobがeffective success/skipped: `success`
+- 全Job effective success/skipped: `success`
 - non-allowed failureあり: `failure`
 - required blockedあり: `blocked`
 - cancel由来あり: `cancelled`
 
-実際の各Job conclusionは`needs.<template>.jobs`で保持する。
+個別Jobの実conclusionはgroup mapに保持。
 
 ## 15. Output / Artifact aggregation
-
-`02`の正規shape:
 
 ```text
 needs.evaluate.jobs[full_job_key]
@@ -294,95 +263,64 @@ needs.evaluate.outputs[full_job_key]
 needs.evaluate.artifacts[full_job_key]
 ```
 
-例:
+raw keyのみでindexしない。
 
-```yaml
-with:
-  result: ${{ needs.evaluate.jobs["evaluate[candidate_a]"].outputs }}
-```
+## 16. Retry / Recovery
 
-Nested:
-
-```yaml
-with:
-  result: ${{ needs.condition.jobs["evaluate[candidate_a]/condition[x]"].outputs }}
-```
-
-Map keyはfull logical `job_key`。raw keyだけではない。
-
-## 16. Retry
-
-Generated Job Retryは同じJob Runに新Attemptを追加する。
+Generated Job Retryは同じJob Runにnew Attempt。
 
 固定:
 
 - full job_key
 - raw key
-- item
-- iteration
+- item/iteration
 - input
 - order rank
 
-Source `foreach`を再評価しない。
+foreachは再評価しない。
 
-## 17. Runtime Recovery
+Recovery:
 
-- committed expansion: そのまま利用
-- transaction未commit: generated Job無しとして再評価可能
-- generated success: success維持
-- running: Runner recovery
-- queued: queued維持
-- expansion二重生成禁止
+- committed expansionは再生成しない
+- uncommittedは0件として再評価可能
+- success generated Jobは保持
+- runningはRunner recovery
+- queuedは維持
 
-Recoveryだけで既存success generated Jobを再実行しない。
+## 17. Reusable / External / Human
 
-## 18. Reusable Workflow / External / Human
+Dynamic templateに `uses`, `executor: external_llm`, `executor: human` を置ける。field制約は`01`。
 
-Dynamic templateに通常Jobと同様に以下を置ける。
+## 18. Pause / Cancel
 
-- `uses` -> generated JobごとにChild Workflow Run
-- `executor: external_llm` -> generated Jobごとにexternal task
-- `executor: human` -> generated Jobごとにreview
+Pause中は新expansion開始禁止。commit済みJobは保持。
 
-field constraintは`01`。生成数上限はJob数に適用し、Child内Job数はChild Run側で別管理。
+Cancel後は新expansion禁止。未実行generated Jobは通常Cancel規則。
 
-## 19. Cancel / Pause
-
-Pause中は新expansionを開始しない。既にcommit済みgenerated Jobは保持。
-
-Cancel後は新expansion禁止。未実行generated Jobは通常Cancel規則へ。
-
-## 20. Failure code
+## 19. Failure code
 
 ```text
 dynamic_foreach_type_error
 dynamic_key_invalid
 dynamic_duplicate_key
-dynamic_job_key_too_long
 dynamic_job_collision
 dynamic_limit_exceeded
 dynamic_order_type_error
 dynamic_parent_invalid
+dynamic_cycle_detected
 dynamic_expansion_validation_failed
 dynamic_expansion_storage_failed
 ```
 
-## 21. 受入条件
+## 20. 受入条件
 
-1. Root 0/1/N件
-2. stable key/index fallback
-3. special chars percent encoding
-4. duplicate key
-5. parent別同raw keyが衝突しない
-6. 2048 byte key limit
-7. Nested `foreach.parent/items`
-8. 3段以上nested / arbitrary-depth representative
-9. iteration exact snapshot
-10. 1000 allowed /1001 rollback
-11. atomic expansion crash/restart
-12. order_by型/順序
-13. group status/conclusion
-14. full key output/artifact lookup
-15. Retry snapshot固定
-16. Dynamic + Reusable/External/Human
-17. Pause/Cancel no-new-expansion
+1. Root/Nested/3段以上
+2. parent edge cycle検出
+3. parent+needs helper評価
+4. parent別同raw key非衝突
+5. fixed job_key length limit無し
+6. 1000許可/1001 rollback
+7. atomic expansion recovery
+8. group status/conclusion
+9. full key output/artifact lookup
+10. Retry snapshot固定
