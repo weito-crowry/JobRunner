@@ -1,6 +1,6 @@
 # 05. Dynamic Jobs 詳細設計
 
-- Status: Draft v1.1
+- Status: Draft v1.2
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `02`, `03`, `08`, `10`
@@ -21,6 +21,7 @@
 8. 同一Run internal Job同時最大1。
 9. `foreach=[]`正常0件と`if=false` skipを区別。
 10. 一度`expanded`としてcommitしたgenerated Job集合は同一Run内で変更しない。
+11. Dynamic expansionに使うSystem由来設定はcurrent System configではなくWorkflow Run開始時にsnapshot済み`effective_settings`を使う。
 
 ## 3. Root Dynamic Job
 
@@ -144,11 +145,15 @@ Full `job_key` fixed byte limit無し。DB TEXT、filesystem pathはopaque ID。
 
 ## 10. 生成数上限
 
-Effective max:
+Effective maxは当該Workflow Runのsnapshot済み:
 
 ```text
-Workflow settings.max-dynamic-jobs > System max_dynamic_jobs > 1000
+workflow_run.effective_settings.max_dynamic_jobs
 ```
+
+を使う。Root Runでは`01`のSystem baseline + Workflow override、Child Runでは`06`のinherited baseline + Child Workflow overrideからRun作成時に確定済み。
+
+Canonical default=1000。
 
 Count=当該Workflow Run generated **concrete Job**総数。Dynamic template group自体はcountしない。Child Runは別count。
 
@@ -174,12 +179,12 @@ Root parent=null、Nestedはparent generated Job。
 - parent/DAG
 - Input/if/order expression validity
 - executor field constraints
-- Runner Pool
+- **generated internal Jobのみ** resolved Runner Poolが登録済みか
 - Action current ID/version == Run snapshot
 - Validator current ID/version == Run snapshot
 - Reusable prerequisites
 - Retry/internal timeout
-- generated count limit
+- Run snapshot `max_dynamic_jobs` limit
 
 1件でも失敗ならgenerated Jobを残さない。
 
@@ -314,7 +319,7 @@ Current dependency contextから副作用無し再計算:
 4. raw/full key
 5. item
 6. source/order rank
-7. preflight
+7. preflight（Run snapshot settingsを使用）
 8. expansion digest
 
 Exact matchのみexisting expansion保持。各successful generated Jobは`03` strict Result Reuseへ。
@@ -340,6 +345,7 @@ Group全体completed/skipped + generated0は未実行扱い。Manual Retry desce
 - expansion digest復元
 - zero-parent idempotent
 - generated concrete Jobのrunning/queued recovery
+- current System configを再参照せずRun snapshot settingsを継続
 - `reuse_check_pending`時§19再開
 
 ## 21. Reusable / External / Human
@@ -374,17 +380,19 @@ dynamic_expansion_not_reusable
 2. Root/Nested/3+ depth
 3. parent cycle/zero-parent
 4. parent別same raw key/full key
-5. generated max excludes template groups
-6. 1000/1001 rollback
-7. Action/Validator preflight
-8. atomic expansion/recovery
-9. order schema/stable tie
-10. if=false skipped vs foreach=[] success
-11. group precedence
-12. expansion_digest golden
-13. Manual Retry exact expansion reuse
-14. changed source/key/order/item -> new Run
-15. whole skipped group re-evaluate only
-16. mixed group no partial re-expansion
-17. full-key aggregation
-18. Generated Retry snapshot fixed
+5. generated max from Run snapshot, template groups excluded
+6. System setting change after Run start does not change limit
+7. 1000/1001 rollback
+8. internal-only Runner Pool preflight
+9. Action/Validator preflight
+10. atomic expansion/recovery
+11. order schema/stable tie
+12. if=false skipped vs foreach=[] success
+13. group precedence
+14. expansion_digest golden
+15. Manual Retry exact expansion reuse
+16. changed source/key/order/item -> new Run
+17. whole skipped group re-evaluate only
+18. mixed group no partial re-expansion
+19. full-key aggregation
+20. Generated Retry snapshot fixed
