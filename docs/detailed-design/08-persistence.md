@@ -1,12 +1,12 @@
 # 08. Persistence 詳細設計
 
-- Status: Draft v0.7
+- Status: Draft v0.8
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 
 ## 1. 目的
 
-SQLite schema、PayloadStore / ArtifactStore metadata、Action/Validator snapshot、Result Reuse metadata、transaction、Migration、Recovery、Idempotencyを定義する。
+SQLite schema、PayloadStore / ArtifactStore metadata、Action/Validator snapshot、Result Reuse、deadline、Migration、Recovery、Idempotencyを定義する。
 
 ## 2. Storage構成
 
@@ -16,7 +16,7 @@ SQLite
 ├─ Payload metadata
 ├─ Artifact metadata
 ├─ Action/Validator identity
-└─ Reuse metadata
+└─ Reuse/idempotency metadata
 
 PayloadStore
 └─ large JSON Output blob
@@ -41,7 +41,7 @@ PRAGMA journal_mode=WAL
 
 競合writeは必要に応じ`BEGIN IMMEDIATE`。長transaction禁止。
 
-Text identity比較で明示しない限りSQLite `BINARY` semantics。Concurrency groupはcase-sensitive完全一致。
+Text identity比較はSQLite `BINARY` semanticsを基本とし、Concurrency groupはcase-sensitive完全一致。
 
 ## 4. ID / time / JSON / numeric
 
@@ -49,7 +49,7 @@ IDはtype prefix + UUID4 hex。UTC RFC3339。
 
 Canonical JSONはUTF-8、NaN/Infinity禁止、deterministic object serialization。
 
-SQLite INTEGERへ保存する外部入力整数はsigned 64-bit範囲。Priority/version/count等はDB到達前にvalidation。
+SQLite INTEGERへ保存する外部入力整数はsigned 64-bit範囲。Priority/version/count等はDB到達前validation。
 
 Action/Validator ID+version、Runner Pool、Concurrency group等の必須identityはnon-empty TEXT。
 
@@ -151,6 +151,7 @@ completed <=> conclusion non-NULL
 concurrency_group NULL or length>0
 concurrency_max_runs NULL or >=1
 concurrency_on_limit NULL|queue|reject
+source_identity NULL or length>0
 ```
 
 ## 10. `job_runs`
@@ -245,22 +246,19 @@ Output commit + reuse metadata + Job successを同logical terminal operationで�
 
 ## 13. Manual Retry reopen
 
-Transaction:
-
 1. latest failed Attempt + input_json存在
 2. 無ければ `retry_input_unavailable`, no state change
-3. run_attempt++
-4. Run reopen
-5. target retry waiting
-6. blocked/skipped descendants reset
-7. successful descendants reuse_check_pending=1
-8. Event/idempotency
+3. current Action/Validator/Reusable binding version availability確認
+4. run_attempt++
+5. Run reopen
+6. target retry waiting
+7. blocked/skipped descendants reset
+8. successful descendants reuse_check_pending=1
+9. Event/idempotency
 
-Reuse matchはsuccess維持。Mismatch/version unavailable/validator changed/ineligible/payload missingは `successful_job_result_not_reusable`。
+Reuse mismatch/version unavailable/ineligible/payload missingは `successful_job_result_not_reusable` または明示version mismatch。
 
 ## 14. Deadline indexes / Maintenance
-
-Maintenance Loopが期限を安価に検索できるindex:
 
 ```sql
 CREATE INDEX ix_job_retry_due
@@ -272,13 +270,13 @@ ON external_leases(expires_at)
 WHERE status='active';
 ```
 
-Deadline処理はcurrent stateをWHERE条件にしたconditional transaction。二重expiry/retry wakeを副作用化しない。
+Deadline処理はconditional transaction。二重expiry/retry wakeを副作用化しない。
 
 ## 15. Dynamic / Reusable uniqueness
 
 Dynamic expansion root/nested partial unique。Full `job_key` TEXT固定長CHECK無し。
 
-Reusable binding one / parent_job_run_id。BindingにはChild action versionsに加えChild validator versionsもsnapshotする。
+Reusable binding one / parent_job_run_id。BindingはChild Action+Validator version snapshotを持つ。
 
 Child Run one / parent_attempt_id partial unique。
 
@@ -312,16 +310,41 @@ Runner fencingにruntime/runner instance + heartbeat/main_loop_tick。
 - one active Lease / Task
 - one Review / Attempt
 
-## 20. Idempotency
+## 20. Idempotency records
+
+Canonical schema:
 
 ```text
-scope/operation/request_key PK
-request_hash/result_json/status/created_at/expires_at
+scope TEXT NOT NULL
+operation TEXT NOT NULL
+request_key TEXT NOT NULL
+request_hash TEXT NOT NULL
+result_json TEXT NOT NULL
+adapter_meta_json TEXT NULL
+status TEXT NOT NULL
+created_at TEXT NOT NULL
+expires_at TEXT NOT NULL
+PRIMARY KEY(scope, operation, request_key)
 ```
 
-Default TTL24h。Scope includes namespace + resource + AccessScope + Actor/client principal。
+Default TTL=24h。
 
-TTL内replay/conflict。Expiry後row残存でもtransactional replace可。
+Scope includes namespace + resource + AccessScope + Actor/client principal。
+
+TTL内:
+
+- same hash -> first Service result replay
+- different hash -> idempotency_conflict
+
+TTL後:
+
+- expired rowが残っていても同transactionでreplaceしてnew requestを受理可能
+
+`adapter_meta_json` はService意味を変えないtransport replay補助metadata。HTTP Adapterは初回successful status code (`200|201`等)を保存でき、replayでoriginal statusを復元する。MCP/Python固有transport object本体をDBへ保存しない。
+
+`result_json` / `adapter_meta_json` はSecretGuard対象。
+
+Side effect + Service result + idempotency rowは同transaction。Filesystem blob prepareを伴う場合はPayloadStore crash consistencyに従う。
 
 ## 21. Concurrency
 
@@ -349,11 +372,13 @@ Reuse対象Payload/Artifact欠落はsilent reuseしない。
 1. inline/blob constraints/crash consistency
 2. Action/Validator snapshot columns
 3. validator identity reuse key
-4. signed64/string identity boundaries
+4. signed64/string/source_identity boundaries
 5. concurrency BINARY
 6. FK NO ACTION / retention ordering
-7. deadline partial indexes / idempotent due processing
+7. deadline indexes / idempotent due processing
 8. managed/external Artifact
-9. Manual Retry Input existence
+9. Manual Retry Input/version existence
 10. one-running/Dynamic/Reusable/External/Human unique
-11. migration future version reject
+11. idempotency adapter_meta original HTTP status replay
+12. expired idempotency replace
+13. migration future version reject
