@@ -1,6 +1,6 @@
 # 09. Artifact / Log / Workflow State 詳細設計
 
-- Status: Draft v0.2
+- Status: Draft v0.3
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `02-expression-and-inputs.md`, `04-runner-and-ipc.md`, `08-persistence.md`
@@ -14,8 +14,8 @@ Artifact参照管理、Execution/Event Log、Workflow state、Progress/Step、Ru
 1. Artifact実体の保存はAction/親システム責任。
 2. Coreはmetadata/生成元/history/referenceを管理。
 3. Artifactは論理immutable。
-4. CoreがURIをfetch/uploadしない。
-5. 小さいJob Output JSONはCore保存。大きいデータはArtifactへ逃がす。
+4. CoreはURIをfetch/uploadしない。
+5. 小さいJob Output JSONはCore保存。大きいデータはArtifactへ。
 
 ## 3. Artifact model
 
@@ -34,54 +34,36 @@ created_at
 deleted_at optional
 ```
 
-`name`は1文字以上。Artifact metadataはJSON-compatible。`size_bytes>=0`。
-
 ## 4. 登録
 
-Internal ActionはRuntime Handle、Externalは`task_submit.artifacts`から登録する。
+Internal ActionはRuntime Handle、Externalは`task_submit.artifacts`から登録。
 
-```python
-runtime.artifact(
-    name="report",
-    uri="project://reports/123.json",
-    media_type="application/json",
-    size_bytes=1234,
-    digest="sha256:...",
-)
-```
+CoreはURI実体を必須検査しない。実体保存成功後に登録する責任はAction/親側。
 
-CoreはURI実体の存在/内容を必須検証しない。実体保存成功後に登録する責任はAction/親側。
-
-## 5. Current Artifact解決
-
-同名ArtifactはRetry/再実行で複数世代を持てる。Alias tableはMVPでは使わない。
+## 5. Current Artifact
 
 `needs.<job>.artifacts.<name>`:
 
-1. Jobのcurrent successful Attemptを解決
-2. そのAttempt内の非deleted同名Artifactを`created_at, artifact_id`の最新順で1件
+1. Jobのcurrent successful Attempt
+2. そのAttemptの非deleted同名Artifactから `created_at, artifact_id` 最新
 
-failed/cancelled AttemptのArtifactをcurrentとして公開しない。履歴APIでは全世代を読める。
+failed/cancelled AttemptのArtifactはcurrentにしない。履歴APIでは全世代参照可能。
 
 ## 6. Dynamic Artifact
 
-Dynamic groupは`02/05`のfull logical job_key mapを使う。
+full logical `job_key` mapを使う。
 
 ```text
 needs.evaluate.artifacts["evaluate[candidate_a]"]["report"]
 ```
 
-Nestedもfull path。
-
-## 7. Artifact deletion / retention
+## 7. Artifact retention
 
 Core retention対象はmetadata。Artifact実体削除は親責任。
 
-metadata削除前に`retention_deleted` Eventを残す。必要なら先に`deleted_at`をセットして参照対象外にし、後続maintenanceで物理row削除できる。
+metadata削除前に `retention_deleted` Event。必要なら `deleted_at` で論理削除後に物理row削除。
 
-## 8. Workflow Run directory
-
-Core data root:
+## 8. Run directory
 
 ```text
 jobrunner-data/
@@ -92,178 +74,143 @@ jobrunner-data/
 
 Actionの永続共有領域ではない。
 
-## 9. Execution Log path
+## 9. Log / temp path
 
-YAML Job ID/full Dynamic keyをfilesystem pathに使わない。内部IDを使う。
+YAML Job ID/full Dynamic keyをfilesystem pathへ使わず内部IDを使う。
 
 ```text
 runs/<workflow_run_id>/logs/<job_run_id>/<attempt_no>.log
-```
-
-Temp:
-
-```text
 runs/<workflow_run_id>/tmp/<job_run_id>/<attempt_no>/
 ```
 
-DBにはdata rootからのrelative pathのみ保存。PathはCoreが生成し外部入力を連結しない。
+DBにはdata rootからのrelative path。外部入力pathを連結しない。
 
-## 10. Execution Log write
+## 10. Execution Log
 
-Runnerが以下を同Attempt logへ追記:
+Runnerが:
 
-- Action structured `log`
-- captured stdout
-- captured stderr
-- Runnerの必要最小限execution diagnostic
+- structured log
+- stdout
+- stderr
+- 必要最小限execution diagnostic
 
-記録形式は人間可読textを基本とし、各行にtimestamp/stream-or-level/step optionalを持てる。
+をAttempt logへ追記。
 
-長時間Job用にperiodic/size-based flushし、全量memory bufferは禁止。
+長時間Job向けにperiodic/size-based flushし、全量memory保持禁止。
 
 ## 11. Log read
 
-Serviceはattempt IDで:
+Service `wf_log_read` はattempt IDで:
 
 ```text
 metadata
 full read
-byte offset read
-tail lines
+offset read
+tail read
 ```
 
-を提供。`wf_run_info`へ本文を埋め込まない。
+を提供。
 
-外部からfilesystem path指定readは不可。
+**`wf_info`へExecution Log本文を埋め込まない。** 外部filesystem path指定readは不可。
 
 ## 12. Event Log
 
-Append-only structured audit。
+append-only structured audit。
 
 代表:
 
 ```text
-workflow_started/completed/paused/resumed/cancel_requested
-job_ready/started/completed
-attempt_started/completed
-step_started/completed
+workflow_started
+workflow_completed
+workflow_paused
+workflow_resumed
+workflow_cancel_requested
+job_ready
+job_started
+job_completed
+attempt_started
+attempt_completed
+step_started
+step_completed
 artifact_registered
 state_changed
-runner_lost/restarted
-external_task_created/claimed/submitted
-human_review_requested/submitted
-reusable_binding_created/child_workflow_started/completed
-retry_scheduled/manual_retry_requested
+runner_lost
+runner_restarted
+external_task_created
+external_task_claimed
+external_task_submitted
+human_review_requested
+human_review_submitted
+reusable_binding_created
+child_workflow_started
+child_workflow_completed
+retry_scheduled
+manual_retry_requested
 retention_deleted
-```
-
-Common fields:
-
-```text
-event_id/type/version/created_at
-workflow_run_id/job_run_id/attempt_id/runner_id optional
-actor_type/actor_id/source optional
-payload
 ```
 
 Progress/全log lineをEvent tableへ複製しない。
 
 ## 13. Step
 
-Stepは観測単位。
+Stepは観測単位。`needs` / Runner割当 / independent Retry/timeout / Artifact ownershipを持たない。
 
-```text
-step_start(name)
-step_end(conclusion)
-```
-
-持たないもの:
-
-- `needs`
-- Runner割当
-- independent Retry/timeout
-- Artifact ownership
-
-Actionがopen Step中にcrashしたらAttempt終端時/Recovery時にfailure/incompleteとして閉じる。
+open Step中にcrashした場合、Attempt終端/Recovery時にfailure/incompleteとして閉じる。
 
 ## 14. Progress
 
 ```text
-current >=0
+current >= 0
 total optional
 message/unit optional
 ```
 
-`total`ありなら`total>0`かつ`current<=total`。indeterminateを許可。
+`total`ありなら `total>0 && current<=total`。
 
-Workflow Progress既定はterminal Job数/既知Job数から表示用に算出可能。Dynamic展開で分母が増えるため割合が下がることを許容する。Conclusion判定には使用しない。
+Workflow Progressは表示用。Dynamic展開で分母増加により割合が下がることを許容。Conclusionには使わない。
 
-Child Workflow progressをParent waiting_child Jobの表示へ集約可能。
+## 15. Workflow static/mutable values
 
-## 15. Workflow static values
+`env` はRun start snapshot、immutable、Secret参照禁止。
 
-YAML `env`はRun start snapshot、immutable。Secret valueは含めない。
-
-## 16. Workflow mutable state
-
-Runtime Handle:
+Mutable state:
 
 ```text
 state.get(name)
 state.set(name, value)
 ```
 
-値はJSON-compatible。
-
 Core保証:
 
-- persistence/restart resume
+- persistence/restart
 - get/set
 - last-write-wins
-- revision単調増加
+- revision
 - append-only history
 
-保証しない:
+保証しない: CAS / atomic increment / distributed lock / read-modify-write race防止。
 
-- CAS
-- atomic increment
-- distributed lock
-- read-modify-write race防止
+## 16. State history
 
-1 Workflow Run internal同時1Jobなので通常競合は少ないが、External/管理操作等を含めlast-write-wins規則を維持する。
+`set` 1transactionでcurrent update + history insert。
 
-## 17. State history
+Expression `state.*`はread-only。Job Inputへ解決した値はsnapshot。
 
-`set` 1transactionでcurrent更新 + history追加。
+Child Workflowは独立state namespace。
 
-```text
-name
-old/new
-revision
-job_run_id/attempt_id/step_id optional
-actor optional
-created_at
-```
+## 17. Temp lifecycle
 
-Expression `state.*`はread-only。Job Inputへ解決した値はそのInput snapshotへ固定。
+Attempt execution開始時mkdir、終了後success/failure/cancel問わず削除。
 
-## 18. Child Workflow
-
-Childは独立state namespace。親state直接read/write不可。Input/Outputで渡す。
-
-## 19. Temp lifecycle
-
-Attempt execution開始時にmkdir。終了後success/failure/cancel問わず削除。
-
-Temp cleanup failure:
+削除失敗:
 
 - Job conclusion変更なし
 - warning/Event
 - maintenance cleanup候補
 
-Tempはsecurity sandboxではない。
+Tempはsandboxではない。
 
-## 20. Retention
+## 18. Retention
 
 既定無期限。
 
@@ -278,29 +225,24 @@ Idempotency expired records
 orphan temp/log metadata
 ```
 
-Schedulerを新設せず、Runtime起動/親maintenance hook/明示Serviceからretention処理を呼べる。
+独立Schedulerを必須にせずRuntime起動/maintenance hook/明示Serviceから実行。
 
-親側Artifact実体の削除方法はCoreが推測しない。
+## 19. Secret / security
 
-## 21. Log/Secret security
-
-Known Secret redaction hookをwrite pipeline入口で適用する。ただし変形/分割されたSecretを完全検出する保証はしない。
+Known Secret redaction hookをwrite pipeline入口で適用。ただし変形Secretの完全検出は保証しない。
 
 Execution Log readはAuthorization対象。Definition/Input/EventへSecret平文を書かない。
 
-## 22. 受入条件
+## 20. 受入条件
 
-1. Artifact register/current/history
+1. Artifact current/history
 2. failed Attempt Artifact非current
-3. Dynamic full-key Artifact lookup
-4. internal/external Artifact登録
-5. safe internal-ID log/temp path
-6. stdout/stderr/log flush/read tail
-7. path traversal不可
-8. Step crash close
-9. progress indeterminate/dynamic denominator
-10. state get/set/history/restart
-11. Child state isolation
-12. temp cleanup/failure warning
-13. retention Event
-14. Secret redaction hook
+3. Dynamic full-key lookup
+4. safe internal-ID path
+5. `wf_info`にLog本文無し
+6. stdout/stderr/flush/tail
+7. Step crash close
+8. state get/set/history/restart
+9. env Secret拒否
+10. temp cleanup
+11. retention Event
