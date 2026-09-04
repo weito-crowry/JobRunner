@@ -1,9 +1,9 @@
 # 02. Expression / Inputs / Outputs 詳細設計
 
-- Status: Draft v0.7
+- Status: Draft v0.8
 - 対象: MVP
 - 上位仕様: `docs/design.md`
-- 関連: `01-workflow-definition.md`
+- 関連: `01-workflow-definition.md`, `09-artifacts-logs-state.md`
 
 ## 1. 目的
 
@@ -169,6 +169,8 @@ jobs.<job>.status/conclusion/outputs/artifacts
 
 Retryはpersistent Input snapshotを再利用。
 
+ArtifactRefを`with`/Workflow Input等から含めることを許可する。ArtifactRefは通常JSON値としてpersistent Inputへsnapshotされるが、Coreは`09`のcanonical ArtifactRef shapeとして認識する。
+
 ## 15. Job Output
 
 Action/External Job resultは任意JSON-compatible value:
@@ -227,7 +229,7 @@ outputs:
   report: ${{ jobs.report.artifacts.report }}
 ```
 
-各field値は任意JSON-compatible value。
+各field値は任意JSON-compatible value。ArtifactRefもJSON-compatible field値として明示公開可能。
 
 Workflow Output object自体もPayloadStoreのinline/spill規則を使う。
 
@@ -235,9 +237,49 @@ Reusable WorkflowではこのWorkflow Output objectがParent Job Outputになる
 
 `outputs: {}` または未指定ならWorkflow Outputは `{}`。
 
-## 17. Artifact reference
+## 17. ArtifactRef / explicit data flow
 
 ArtifactはOutputとは別のimmutable成果物。Managed ArtifactはArtifactStore、External ReferenceはURI metadata。
+
+Canonical ArtifactRef shapeは`09`をSource of Truthとする。
+
+### 17.1 同一Workflow Run
+
+`needs.<job>.artifacts.*` から得たArtifactRefを後段Job Inputへmapping可能。同じRun内での明示Artifact参照は通常の依存data flow。
+
+### 17.2 別Workflow Run / Reusable Child
+
+CoreはArtifactを別Runへ暗黙探索・自動reuseしない。
+
+別Workflow RunのArtifactを使うには、呼出側がArtifactRefをWorkflow/Job InputまたはWorkflow Outputへ**明示的に含める**必要がある。
+
+例:
+
+```yaml
+jobs:
+  child:
+    uses: ./child.yml
+    with:
+      source_artifact: ${{ needs.export.artifacts.dataset }}
+```
+
+Child側は`inputs.source_artifact`としてArtifactRefを受け取る。
+
+Managed Artifactのcross-run materializeは:
+
+1. ArtifactRefがcurrent persistent Job Input内に存在
+2. Artifact metadataが存在しdata未削除
+3. current ActorContext/AccessScopeでsource Artifact readがAuthorizationProviderにより許可
+
+を全て満たす場合のみ許可する。
+
+External ReferenceはCore materialize対象外で、URIを解釈するかはAction/親側責任。
+
+### 17.3 Result Reuse
+
+Persistent Input内のArtifactRefはInput digestに含まれるため、明示cross-run ArtifactRefはreuse keyへ間接的に固定される。
+
+Runtime中にpersistent Inputへ含まれないArtifactをmaterializeした場合は`03`の`reuse_eligible=false`。
 
 ## 18. `continue-on-error`
 
@@ -320,3 +362,7 @@ bool/object/array/null/NaN/Infinity/混在型
 11. Input nullable/missing/null strictness
 12. success_if non-boolean reject
 13. order_by NaN/Infinity reject
+14. same-run ArtifactRef mapping
+15. explicit cross-run/Reusable ArtifactRef mapping
+16. cross-run Artifact materialize Authorization
+17. implicit cross-run Artifact lookup無し
