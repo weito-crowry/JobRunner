@@ -1,6 +1,6 @@
 # 13. Testing 詳細設計
 
-- Status: Draft v0.7
+- Status: Draft v0.8
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`〜`12`
@@ -211,6 +211,9 @@ External Artifact:
 - auto retry default off
 - max-attempts / condition / backoff
 - Retry target Input fixed
+- failed Job with prior Attempt/Input Snapshot -> manual retry allowed
+- activation前failure with no Attempt/Input Snapshot -> `retry_input_unavailable`
+- `retry_input_unavailable` はsame Run retryせずnew Workflow Run要求
 - manual retry completed/failure Run reopen
 - run_attempt++
 - success/cancelled Run retry reject
@@ -308,7 +311,8 @@ platform-matrix
 11. Reusable binding/cycle
 12. SecretGuard
 13. same-run Result Reuse
-14. idempotency scope/TTL
-15. adapter contract
+14. Retry Input availability boundary
+15. idempotency scope/TTL
+16. adapter contract
 
 WebUI E2Eは後続。
