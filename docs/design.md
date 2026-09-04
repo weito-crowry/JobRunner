@@ -1,6 +1,6 @@
 # JobRunner 基本設計
 
-- Status: Draft v1.7
+- Status: Draft v1.8
 - 対象: MVP
 - WebUI: 画面構成のみ後続
 - 用語: GitHub Actions に対応概念がある場合は可能な限り合わせる
@@ -136,7 +136,14 @@ System baselineにはRunner default、Dynamic上限、External lease、Output th
 
 Reusable ChildはParent RunのSystem baselineを継承し、Child settings/Retentionをbindingへ固定する。
 
-Workflow YAMLはparent restart無しでreload可能。`wf_start`は実行開始時にsource bytesを必ず再取得・validateし、mtime/size cacheだけをSource of Truthにしない。Reusable first bindingもcurrent Child source bytesを同様に読む。Invalid/unavailable sourceはold cacheへsilent fallbackしない。Existing Run/既存bindingは元snapshot継続。
+Workflow YAMLはparent restart無しでreload可能。`wf_start`は実行開始時にsource bytesを必ず再取得・validateし、mtime/size cacheだけをSource of Truthにしない。Invalid/unavailable sourceはold cacheへsilent fallbackしない。Existing Run/既存bindingは元snapshot継続。
+
+Reusableは2段階:
+
+1. **Root `wf_start`時**: current reusable graphを再帰的に事前検証する。Reference/source/cycle/Definition/Action/Validator/Runner Poolを検査するが、bindingやChild Runは作らない。
+2. **Parent reusable Jobのfirst activation時**: Child source bytesをもう一度fresh readし、その時点のChild Definitionをbindingとして固定する。
+
+したがってRoot Run start後にChild YAMLが変更されることは許容し、first binding時のsourceが実際に使うChild Definitionとなる。Preflightがpass済みでもbinding時にinvalidならfail-closed。Retryは既存bindingを使いChild sourceを再読込しない。
 
 ## 7. Priority / Concurrency / Run status
 
@@ -226,6 +233,28 @@ Runner管理ProcessとAction Runner子Process分離。
 
 Default=`heartbeat 5s / runner_lost 20s / main_loop_stale 15s`。
 
+Runnerが一度もheartbeatを出さず起動途中で固まった場合も`started_at`からlost判定する。Heartbeat後はlast heartbeat、main loop stale時はheartbeat更新を止めてlostへ収束する。
+
+Runner restart default:
+
+```text
+mode=on_failure
+max_restarts=5
+window=300s
+backoff=1..30s x2
+```
+
+- planned Parent shutdown/stoppingではrestartしない
+- unexpected exit/liveness lostはfailure
+- `never`はfailure後automatic restart無し
+- `on_failure`はfailureのみrestart候補
+- budgetは同一Parent Runtime内のPool/論理Runner slotごとのrolling window
+- `max_restarts=0`なら最初のfailureからsuppressed
+- window外へ古いrestartが出ればbudget自然回復
+- backoffはoverflow-safeにmaxへ飽和
+- crash loopでは`restart_suppressed`を可視化
+- Parent Runtime再起動では新`runtime_instance_id`となりrestart budgetも新規
+
 IPC=JSON Lines v1。Handshake=`ready -> start -> result|error -> exit`。stdout/stderrはExecution Log。
 
 `timeout-minutes`はinternal Jobのみでhidden default無し。指定時は**Attempt claim直後からterminal DB commitまで**を対象にし、Action Runner spawn/bootstrap/handshake、Action本体、result validation/PayloadStoreまで含む。Deadline後のgraceはcleanup猶予であり成功猶予ではない。
@@ -310,13 +339,7 @@ Root=`foreach`、Nested=`foreach.parent/items`。
 
 全実行可能Workflow参照はResolverからYAML source bytesを取得可能であることが前提。
 
-Parent Job first activationでcurrent Child source bytesを再取得・validateしbinding固定:
-
-- Child Definition
-- Child Action/Validator versions
-- inherited System baseline
-- Child effective settings
-- Child Retention policy
+Root `wf_start`でcurrent reusable graphを再帰preflightするがbindingは作らない。Parent reusable Job first activationでcurrent Child source bytesを再取得・validateし、その時点のChild Definition/versions/settings/Retentionをbinding固定する。
 
 Retryはsame bindingでChild sourceを再読込しない。
 
@@ -416,6 +439,8 @@ Standard SQLite。MVP table=18。
 - canonical UTC timestamp=`YYYY-MM-DDTHH:MM:SS.ffffffZ`
 
 External Lease `claimant_key`とIdempotency actor isolationは同じcanonical `actor_principal_key`を使う。Principal keyにはAccessScopeを含め、Idempotency scopeへ同じAccessScopeを二重追加しない。
+
+Runner restart履歴はlogical runner slot・restart ordinal・scheduled time・suppression reasonを保持し、04のrolling window/backoff規則を再現可能にする。
 
 Idempotency=completed resultのみ保存、reserved row無し。Commit transaction内でkey/hash再確認。Replayは初回result/HTTP status。
 
