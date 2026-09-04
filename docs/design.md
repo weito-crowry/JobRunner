@@ -1,6 +1,6 @@
 # JobRunner 基本設計
 
-- Status: Draft v0.5
+- Status: Draft v0.6
 - 対象: MVP
 - WebUI: 画面設計のみ後続
 - 用語: GitHub Actions に対応概念がある場合は可能な限り合わせる
@@ -216,13 +216,15 @@ Workflow cancel後は`always()`でもnew activationしない。
 
 ## 12. JSON Output / PayloadStore
 
-Action/External resultは任意のJSON-compatible value:
+Action/External Job resultは任意のJSON-compatible value:
 
 ```text
 null / boolean / number / string / array / object
 ```
 
 Optional JSON Schema / `success_if`を利用可能。
+
+Workflowトップレベル`outputs`は名前付きmappingなのでWorkflow Output全体はJSON object。各field値は任意JSON-compatible value。
 
 Default `output-inline-threshold-bytes = 4 MiB`。
 
@@ -317,23 +319,21 @@ Recoveryだけでcompleted Runをreopenしない。
 
 自動result reuseは**同一Workflow Run内だけ**。Cross-Run/global cache無し。
 
-Reuse判定キーに:
+Reuse判定キー:
 
 - final persistent Job Input
 - direct upstream Artifact identities
 - entire Workflow Definition hash
 - executor/action identity + version
 
-を含める。
-
-ActionがRuntime `state.get`やfrozen dependency外Artifactをdynamic materializeした場合はautomatic reuse不適格とする。
+ActionがRuntime `state.get`やfrozen dependency外Artifactをdynamic materializeした場合はautomatic reuse不適格。
 
 Manual Retry後:
 
 - blocked/skipped descendantsはdependency/conditionを再評価
 - successful descendantsはreuse keyを再検証
-- matchなら既存successを維持
-- mismatch/ineligible/Payload欠落なら`successful_job_result_not_reusable`でfail-closedし、新Workflow Runを要求
+- matchなら既存success維持
+- mismatch/ineligible/Payload欠落なら`successful_job_result_not_reusable`でfail-closedし新Workflow Runを要求
 
 MVPではsuccess Jobをchanged Inputで自動再実行しない。
 
@@ -396,12 +396,15 @@ MCP public name:
 
 ```text
 wf_start/list/info/pause/resume/cancel/retry/priority_update
+wf_output_info/read
 wf_task_info/claim/submit
 wf_review_list/info/submit
 wf_artifact_info
 wf_log_read
 wf_runner_info
 ```
+
+`wf_info`はOutput本文/Execution Log本文を含めない。Output本文は`wf_output_read`で取得し、optional JMESPath `select`で巨大JSONの一部だけを読める。MCP response上限超過時はsilent truncateせずerror。
 
 ## 23. Retention / Scheduler / CLI / WebUI
 
