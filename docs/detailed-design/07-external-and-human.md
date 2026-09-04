@@ -1,6 +1,6 @@
 # 07. External / Human Executor 詳細設計
 
-- Status: Draft v1.1
+- Status: Draft v1.2
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `02`, `03`, `08`, `09`, `10`, `11`, `12`
@@ -56,7 +56,7 @@ Effective lease/expiryはAttempt/Task activation時にTask rowへsnapshotし、r
 2. Validator ID/version確認
 3. effective lease config
 4. new Attempt
-5. External Task
+5. External Task `available_at=activation time`
 6. Job=`waiting_external`
 7. Attempt Execution Log
 8. Event
@@ -73,10 +73,15 @@ Lease=`active|expired|released|invalidated`。
 
 1. Workflow Run priority DESC
 2. Job priority DESC
-3. Dynamic order rank ASC
-4. source order ASC
-5. ready_at ASC
-6. Job Run ID
+3. `COALESCE(order_rank, 0)` ASC
+4. source/generated source order ASC
+5. **Task `available_at` ASC**
+6. Job Run ID ASC
+7. Task ID ASC
+
+Job `ready_at`はExternal Task claim順には使わない。External Job初回activation後はJob status=`waiting_external`であり、claim可能時刻のSource of Truthは`external_tasks.available_at`。
+
+Job/Task IDはopaque UUID系IDで、同一DB状態内の安定tie-breakとしてのみ使う。Cross-run再現順序を意味しない。
 
 Atomic exactly-one claim。
 
@@ -86,11 +91,20 @@ MVPにLease heartbeat/renew/extend/transfer無し。
 
 ## 5. Lease expiry
 
+Canonical expiry boundary:
+
+```text
+now >= expires_at
+```
+
+この時点でLeaseはsubmit不可。Maintenance Loopがまだstatusを`expired`へ書き換えていなくても、`task_submit` transactionの再確認でexpiredとしてreject/expiry処理対象にする。
+
 `requeue`:
 
 - same Attempt
 - Lease -> expired
 - Task -> available
+- `available_at = expiry processing time`
 - new Attempt無し
 
 `fail`:
@@ -144,16 +158,18 @@ Long validation/filesystem prepareはtransaction前。
 2. validation + PayloadStore prepare
 3. `BEGIN IMMEDIATE`
 4. idempotency key/hash再確認
-5. Task/Lease owner/expiry再確認
+5. Task/Lease owner + `now < expires_at` を再確認
 6. Artifact metadata
 7. Attempt/Job terminal or Retry schedule
 8. Lease release / Task completed
 9. 必要なdownstream DB bookkeeping
-10. `claim_next=true`なら同じAuthorization + orderingでavailable Task検索
+10. `claim_next=true`なら同じAuthorization + §4 orderingでavailable Task検索
 11. candidateあり -> 同transactionでLease/Task leased
 12. candidate無し -> `next_task=null`
 13. full submit responseをidempotency rowへ保存
 14. commit
+
+Step 5で`now >= expires_at`ならresultを採用せず`lease_expired` conflict。Expiry policy適用は同transactionまたはMaintenanceのidempotent pathで一度だけ行う。
 
 Transaction未commitならsubmitも未commit。Prepared orphanはcleanup対象。
 
@@ -163,9 +179,10 @@ Replayは保存responseを返し追加claimしない。
 
 Pause:
 
-- new claim禁止
-- existing Lease submit受理
+- 当該paused Runのnew claim禁止
+- existing Lease submit受理（expiry前のみ）
 - lease expiry継続
+- `claim_next`は他の非paused Runのeligible Taskをclaim可能だがpaused RunのTaskはcandidate外
 
 Cancel:
 
@@ -176,8 +193,8 @@ Cancel:
 
 Recovery:
 
-- active unexpired Lease維持
-- expired -> snapshotted policy
+- active `now < expires_at` Lease維持
+- `now >= expires_at` -> snapshotted policy
 - terminal Attemptへnew Lease不可
 
 ## 9. Human Review
@@ -289,16 +306,20 @@ All public read/write Authorization。
 5. Validator failure schedules Retry but no inline new Attempt
 6. External Artifact reference only
 7. concurrent claim exactly one
-8. claim/claim_next same ordering
-9. submit + next claim + idempotency one transaction
-10. submit crash/replay no double claim
-11. no lease heartbeat/renew
-12. lease requeue/fail/Pause/Recovery
-13. stale/cancel submit reject
-14. Human outputs.schema forbidden
-15. Human approve Output exactly null
-16. Human reject Output unavailable
-17. Human first-wins/retry
-18. Human override/skip/rewrite無し
-19. common Execution Log
-20. idempotency/authorization
+8. claim order uses task available_at, not job ready_at
+9. claim/claim_next same ordering
+10. opaque stable ID final tie-break
+11. lease boundary `now >= expires_at`
+12. requeue updates available_at
+13. submit + next claim + idempotency one transaction
+14. submit crash/replay no double claim
+15. no lease heartbeat/renew
+16. lease requeue/fail/Pause/Recovery
+17. stale/cancel submit reject
+18. Human outputs.schema forbidden
+19. Human approve Output exactly null
+20. Human reject Output unavailable
+21. Human first-wins/retry
+22. Human override/skip/rewrite無し
+23. common Execution Log
+24. idempotency/authorization
