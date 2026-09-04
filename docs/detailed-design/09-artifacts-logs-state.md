@@ -1,6 +1,6 @@
 # 09. Artifact / Log / Workflow State 詳細設計
 
-- Status: Draft v1.3
+- Status: Draft v1.4
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `02`, `03`, `04`, `08`, `11`, `12`
@@ -9,15 +9,19 @@
 
 ArtifactStore、ArtifactRef、全executor共通Execution Log、Event Log、Workflow state、Progress/Step、Run directory、Retentionを定義する。
 
-## 2. Artifactの2種類
+## 2. Artifactの2種類 / immutability
 
 ### Managed Artifact
 
-ActionがJobRunnerへ明示保存を依頼した成果物。Core `ArtifactStore`が実体管理。
+ActionがJobRunnerへ明示保存を依頼した成果物。Core `ArtifactStore`が実体管理するimmutable data。
 
 ### External Reference Artifact
 
-親システム等が既に保存した成果物へのURI参照。Coreはmetadataのみ管理しfetch/delete無し。
+親システム等が既に保存した成果物へのURI参照。Coreはmetadataのみ管理しfetch/deleteしない。
+
+**External ReferenceもJobRunner上は論理的にimmutableなArtifact identityとして扱う。** Coreは外部実体の不変性を検証できないため、親は同じArtifact ID/URIの実体内容を後から差し替えない。内容が変わる場合は新しいArtifact ID/generationを登録する。Digestを付けられる場合は付与を推奨するが、External実体をCoreがfetchしないためdigest値の正当性は親責任。
+
+この契約によりResult Reuse/ArtifactRef identityで`artifact_id + optional digest`を利用できる。可変外部URIを同じArtifactとして使い続けた場合の不整合は親責任。
 
 Attempt temp fileを自動Artifact化しない。残す場合は`put_file`またはexternal reference登録。
 
@@ -46,7 +50,7 @@ runtime.artifact.materialize(artifact_ref) -> local_path
 
 `put_file`: work_dir内path限定、Secret scan、Store copy、size/digest、metadata/Event。
 
-`register_external`: Core fetch無し。
+`register_external`: Core fetch無し。登録時点で親が§2のlogical immutabilityを受け持つ。
 
 `materialize`: Managedのみ、§6。
 
@@ -99,6 +103,8 @@ Artifact immutable。Same Attempt/name複数generation可。Current successful A
 
 Persistent Input内ArtifactRefはinput digestへ固定。Persistent Input外materializeはAttempt reuse ineligible。
 
+External Referenceを利用するActionも、親が§2 immutability契約を守ることを前提にArtifact identityを比較する。
+
 ## 8. Output Payloadとの違い
 
 Job/Workflow JSON OutputはPayloadStore auto inline/spill。ArtifactはActionが明示作成する別概念。ArtifactRef JSONはInput/Outputへ含められるがArtifact実体は埋め込まない。
@@ -135,7 +141,7 @@ Attempt terminalでclose。Recoveryでopen Logを閉じる場合もclose metadat
 
 ### 10.1 Log verbosity
 
-Effective `execution_log_level` は**当該Workflow Runの `effective_settings.execution_log_level` snapshot**を使う。Current System/Workflow source settingsをLog書込時に再参照しない。
+Effective `execution_log_level` は当該Workflow Runの `effective_settings.execution_log_level` snapshotを使う。Current System/Workflow source settingsをLog書込時に再参照しない。
 
 `normal`:
 
@@ -190,7 +196,11 @@ Step=Job内部の観測単位。
 
 無し=`needs`, Runner allocation, independent Retry, timeout, Artifact ownership。
 
-Open Step crash -> `incomplete`。
+MVPでは1 Attemptにつき同時open Step最大1。Step nesting/parallel Stepは持たない。Exact IPC/metadata semantics=`04`、DB invariant=`08`。
+
+Open Step crash/timeout/cancel -> `incomplete`。
+
+`state.set`呼出時にopen StepがあればState history producer `step_id`へそのStepを記録し、open Step無しならNULL。
 
 ## 13. Job Progress
 
@@ -274,6 +284,7 @@ Persistence:
 - Attempt成功時まで保留しない
 - Attemptが後でfailure/cancelled/timeout/runner_lostでもrollbackしない
 - Historyはrevision + producer Job/Attempt/Step + actor/timeを保持
+- producer Stepは§12のcurrent open StepまたはNULL
 - `state.get` / `state.set` をRuntime Handleで使ったAttemptは`03`どおりResult Reuse不適格
 - CAS/atomic increment/distributed lock無し
 - Child Workflowは独立namespace
@@ -347,11 +358,13 @@ created_at + artifact_metadata_days
 
 Owner metadata無しtemp/payload/artifact objectはconsistency cleanup可能。System audit Eventを残す。
 
-Orphan scannerは現在進行中のprepare/finalizeと競合しないよう、Core system config `orphan_cleanup_grace_seconds`（default300、**finite > 0**）より新しいunowned filesystem objectを削除しない。これはhousekeeping設定でありWorkflow Run semanticsではないためRun snapshot対象外。
+Orphan scannerは現在進行中のprepare/finalizeと競合しないよう、Core system config `orphan_cleanup_grace_seconds`（default300、finite > 0）より新しいunowned filesystem objectを削除しない。これはhousekeeping設定でありWorkflow Run semanticsではないためRun snapshot対象外。
 
 ## 18. RetentionとReuse
 
 Reuse対象Payload/Managed Artifactが削除済みならsilent reuse禁止。Cross-run ArtifactRefもsource retentionで失効し得る。`03/10` reuse validationでfail-closed。
+
+External ReferenceはCore retentionで外部実体が消えることはないが、親が§2 immutability契約を破って外部内容を変更した場合はCoreのstrict reuse保証外。
 
 ## 19. Security
 
@@ -365,26 +378,28 @@ Reuse対象Payload/Managed Artifactが削除済みならsilent reuse禁止。Cro
 
 ## 20. 受入条件
 
-1. Artifact generations/scope/Authorization
-2. Managed/external Artifact digest format
-3. cross-run no retention pin
-4. common Execution Log all four executor types
-5. execution log level uses Run snapshot and survives System/source config change
-6. no automatic Input/Output body dump
-7. Log retention deleted-state read behavior
-8. Event Log + dynamic index fallback/public event read
-9. Step observation-only
-10. Job progress resolution snapshot
-11. Job progress none/explicit/auto
-12. Reusable Child progress aggregation
-13. External/Human auto 0->1
-14. Workflow progress mode uses Run snapshot
-15. Workflow auto concrete-job aggregation
-16. Dynamic denominator growth/decrease allowed
-17. Progress no effect on conclusion
-18. state.set immediate durable/nonrollback
-19. state.get/state.set reuse ineligible
-20. Artifact data vs metadata retention precedence
-21. metadata row deletion semantics
-22. orphan cleanup grace >0 / race protection
-23. temp/retention/orphan cleanup
+1. Managed/external Artifact logical immutability contract
+2. Artifact generations/scope/Authorization
+3. Managed/external Artifact digest format
+4. cross-run no retention pin
+5. common Execution Log all four executor types
+6. execution log level uses Run snapshot and survives System/source config change
+7. no automatic Input/Output body dump
+8. Log retention deleted-state read behavior
+9. Event Log + dynamic index fallback/public event read
+10. Step observation-only + one open Step/Attempt
+11. State history current Step association
+12. Job progress resolution snapshot
+13. Job progress none/explicit/auto
+14. Reusable Child progress aggregation
+15. External/Human auto 0->1
+16. Workflow progress mode uses Run snapshot
+17. Workflow auto concrete-job aggregation
+18. Dynamic denominator growth/decrease allowed
+19. Progress no effect on conclusion
+20. state.set immediate durable/nonrollback
+21. state.get/state.set reuse ineligible
+22. Artifact data vs metadata retention precedence
+23. metadata row deletion semantics
+24. orphan cleanup grace >0 / race protection
+25. temp/retention/orphan cleanup
