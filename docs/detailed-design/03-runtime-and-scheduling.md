@@ -1,6 +1,6 @@
 # 03. Runtime / Scheduling 詳細設計
 
-- Status: Draft v0.4
+- Status: Draft v0.5
 - 対象: MVP
 - 上位仕様: `docs/design.md`
 - 関連: `01`, `02`, `05`, `08`, `10`
@@ -16,28 +16,31 @@
 7. claim/state transitionはconditional transaction。
 8. Priority変更はpreemptしない。
 9. Job result自動再利用は同一Workflow Run内だけ。別Run/global cache無し。
+10. External Lease/Retry backoff等の期限処理はRuntime内部Maintenance Loopが担当する。
 
 ## 2. Runtime起動
 
 1. Config/data root/Storage解決
 2. Migration
-3. Action Registry bootstrap
+3. Action Registry / Validator Registry bootstrap
 4. Workflow Resolver
 5. Runner Pool validation
 6. runtime_instance_id発行
 7. non-terminal Recovery
 8. Runner Supervisor
-9. Scheduling開始
+9. Maintenance Loop
+10. Scheduling開始
 
 ## 3. Workflow Run start
 
-Start前にDefinition/Input/Action version/Runner Pool/Expression/Reusable/Concurrency/Authorizationを検証。
+Start前にDefinition/Input/Action+Validator version/Runner Pool/Expression/Reusable/Concurrency/Authorizationを検証。
 
-Concurrency groupは`01`に従い、最終値がnon-empty stringであることを確認する。暗黙trim/lowercaseはせず、同一group判定はcase-sensitive完全一致。
+Concurrency groupは`01`に従いnon-empty string。暗黙trim/lowercase無し、case-sensitive完全一致。
 
 Start transaction:
 
 - Run snapshot
+- Action/Validator version snapshot
 - concurrency snapshot
 - static Job/Dynamic template metadata
 - Event
@@ -122,7 +125,52 @@ Priorityは`01`のsigned 64-bit integer。InternalはPool適合も条件。Exter
 
 DB partial uniqueでもone-runningを保証。
 
-## 8. Terminal後 activation
+## 8. Maintenance Loop
+
+Maintenance LoopはWorkflow Scheduler/Cronではなく、既存Runtime状態の**期限到来処理専用**の親Process内thread/task。
+
+対象:
+
+```text
+retry_not_before
+external lease expires_at
+concurrency wait再確認 wake-up
+```
+
+Runner heartbeat/livenessはRunner Supervisorが担当し、Job timeoutはRunner自身が担当する。
+
+### 8.1 wait方式
+
+Busy loopしない。
+
+1. DB/Memory状態から最も近いdeadlineを求める
+2. condition/eventで待つ
+3. 新deadline追加時はnotify
+4. deadline到達または最大sleep到達でdue itemを再query
+
+System default:
+
+```text
+maintenance_max_sleep_seconds = 5
+```
+
+finite positiveで設定変更可。
+
+### 8.2 retry deadline
+
+`retry_not_before <= now` のJobを新Attempt作成せずRunner/activation対象としてwakeする。
+
+Pause中はdeadline到来を記録してもnew activationしない。Resumeで進める。
+
+### 8.3 external lease deadline
+
+`expires_at <= now` のactive Leaseを`07`のexpiry policyでconditional transaction処理する。
+
+Pause中もLease clockは止めず、expiry policyは実行する。
+
+Runtime restart時は起動Recoveryで既に期限超過の項目を先に処理し、その後Maintenance Loopへ移行する。
+
+## 9. Terminal後 activation
 
 Terminal transition後idempotentに:
 
@@ -133,15 +181,15 @@ Terminal transition後idempotentに:
 - Workflow Output/conclusion
 - concurrency release
 
-を再評価。
+を再評価し、Maintenance Loopへ必要なdeadline/wake eventをnotifyする。
 
-## 9. Result Reuseの目的
+## 10. Result Reuseの目的
 
 Parent restart/Resume/Manual Retry後に、既に成功したJobを再実行せず使ってよいかを厳格に判定するための機能。Global cacheではない。
 
 別Workflow Runの結果は自動reuseしない。過去Artifactを親が明示Inputとして渡すことは別扱い。
 
-## 10. Reuse Context / Key
+## 11. Reuse Context / Key
 
 Job execution開始時にnon-secret `reuse_context` を作る。
 
@@ -154,6 +202,7 @@ definition_hash
 persistent_job_input_digest
 direct_upstream_artifacts
 executor_identity
+validator_identity
 ```
 
 `direct_upstream_artifacts`:
@@ -164,82 +213,81 @@ executor_identity
 
 `executor_identity`:
 
-- internal: `action_id + action_version`。両方non-empty string
+- internal: `action_id + action_version`
 - external: `jobrunner.external_llm.v1`
 - human: `jobrunner.human.v1`
-- reusable: `reusable_binding.child_definition_hash + child_action_versions`
+- reusable: `reusable_binding.child_definition_hash + child_action_versions + child_validator_versions`
+
+`validator_identity`:
+
+- validator無し: null
+- validator有り: `validator_id + validator_version`
 
 Canonical JSONをSHA-256し `reuse_key` とする。用語として「fingerprint」は使わない。
 
-## 11. Reuse eligibility
+## 12. Reuse eligibility
 
-Successful Attemptは原則reuse eligible。ただし以下の場合はautomatic reuse checkで証明不能として`reuse_eligible=false`:
+Successful Attemptは原則reuse eligible。ただし:
 
-- ActionがRuntime Handle `state.get` を実行した
-- ActionがJob Input/direct upstream Artifact以外のArtifactをdynamicにmaterializeした
+- ActionがRuntime Handle `state.get` を実行
+- ActionがJob Input/direct upstream Artifact以外のArtifactをdynamic materialize
 - 親Adapterが明示 `reuse_eligible=false` としたexecutor extension
 
-通常Recoveryで成功済みJobを単に履歴として保持すること自体は可能だが、Manual Retryによるdependency変更後にそのsuccessを再利用する場合はeligibility/key検証必須。
+ならfalse。
 
-## 12. Reuse判定条件
+ValidatorはJob定義とversion snapshotへ含まれるため、Validator使用だけではreuse不適格にしない。
 
-同一Workflow Run内でのみ、以下がすべて同一なら成功結果をreuse可能:
+## 13. Reuse判定条件
+
+同一Workflow Run内でのみ:
 
 1. final persistent Job Input
 2. direct upstream Artifact identities
 3. entire Workflow Definition hash
 4. executor identity
-5. stored result Payloadが存在しintegrity検証可能
-6. current Registryがinternal Actionのsnapshot versionを提供可能
-7. `reuse_eligible=true`
+5. validator identity
+6. stored result Payload integrity
+7. current Registryがsnapshot Action/Validator versionを提供可能
+8. `reuse_eligible=true`
 
-Secret materialized valueは保存/比較しない。Secret rotationが結果互換性へ影響する場合は親側Action version/Workflow version管理責任とする。
+が全て一致する場合のみreuse。
 
-## 13. Manual Retry後のdescendant処理
+Secret materialized valueは比較しない。Secret rotation互換性は親側Action/Validator/Workflow version管理責任。
 
-`wf_retry(target_failed_job)` でRunをreopenするとき:
+## 14. Manual Retry後のdescendant処理
 
 ### blocked / skipped descendants
 
-Targetのdependency closureに属する `blocked` / `skipped` Jobはterminal stateを解除してactivation再評価対象へ戻す。Explicit conditionも再評価する。
+Target dependency closureのblocked/skippedをactivation再評価。
 
 ### successful descendants
 
-削除/再実行しない。`reuse_check_pending=true`を付ける。
+`reuse_check_pending=true`。
 
-Dependenciesが再びterminalになった時点で現在contextからreuse keyを再計算:
+Dependencies terminal後:
 
-- match -> successを保持、`job_result_reused` Event、pending clear
-- mismatch / ineligible / payload missing -> その成功結果を自動使用しない
+- match -> success維持、`job_result_reused`
+- mismatch/ineligible/payload missing/version unavailable -> `successful_job_result_not_reusable`
 
-MVPでは成功済みJobを新Inputで同じJob Run内に自動再実行しない。これは「Retry Input固定」と衝突するため。
-
-代わりにWorkflow Runをfailureへ確定し:
-
-```text
-code = successful_job_result_not_reusable
-retryable = false
-details = affected job(s), changed component summary
-```
-
-新しいWorkflow Run開始を要求する。
+MVPではsuccess Jobをnew Inputで同じJob Run内に自動再実行せずnew Workflow Runを要求。
 
 ### failed descendants
 
-Target以外の既存failed Jobは勝手にRetryしない。必要なら個別manual retry。RetryはそのJob元Inputを固定使用する。
+Target以外を勝手にRetryしない。
 
-## 14. Pause / Resume
+## 15. Pause / Resume
 
 Pause:
 
 - Run paused
 - running internal継続
 - new internal/External claim/Dynamic expansion禁止
-- existing External submit/Human review/started Child進行は許可
+- existing External submit/Human review/started Child進行可
+- Maintenance LoopのLease expiryは継続
 
 Resumeでactivation再評価。new Attemptは作らない。
 
-## 15. Cancel
+## 16. Cancel
 
 - cancel_requested
 - queued/waitingをcancel
@@ -250,7 +298,7 @@ Resumeでactivation再評価。new Attemptは作らない。
 
 `always()`でもcancel後new Job開始無し。
 
-## 16. Workflow conclusion
+## 17. Workflow conclusion
 
 Success:
 
@@ -265,39 +313,39 @@ Failure:
 - Dynamic expansion failure
 - Child failure
 - Workflow Output failure
-- `successful_job_result_not_reusable`
+- successful_job_result_not_reusable
 - engine fatal
 
 Cancel request由来はcancelled。
 
-## 17. Concurrency / Recovery
+## 18. Concurrency / Recovery
 
-Concurrency holder/releaseは`08`。Group比較はcase-sensitive BINARY semanticsで統一する。
+Concurrency holder/releaseは`08`。Group比較case-sensitive BINARY semantics。
 
 Runtime restart:
 
 - queued activation再評価
-- External Lease/Review/Child関係復元
+- due retry/external Leaseを即時処理
+- Review/Child関係復元
 - running internal -> `10` Runner recovery
 - paused維持
-- completed success Jobは保持
-- pending reuse checksがあれば再開
+- completed success Job保持
+- pending reuse check再開
 
 Recoveryだけでcompleted Runをreopenしない。
 
-## 18. 受入条件
+## 19. 受入条件
 
 1. internal one-running
 2. deterministic ordering
-3. priority signed64 boundaries
-4. concurrency group string/case-sensitive identity
-5. pause/cancel/concurrency
-6. same-run reuse only
-7. reuse key Input/Artifact/definition/action version
-8. large/spilled Payload存在check
-9. state.get使用Job ineligible
-10. dynamic artifact access ineligible
-11. Manual Retry blocked/skipped再評価
-12. successful descendant match reuse
-13. successful descendant mismatch -> new Run required
-14. no cross-Run reuse
+3. concurrency group identity
+4. Maintenance Loop no-busy-loop
+5. retry deadline wake <= max sleep lag
+6. external Lease expiry without external traffic
+7. paused Lease expiry processing
+8. restart overdue timer processing
+9. same-run reuse only
+10. reuse key includes Action+Validator version
+11. state.get/dynamic artifact ineligible
+12. Manual Retry descendant reuse
+13. no cross-Run reuse
