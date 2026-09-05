@@ -1,6 +1,6 @@
 # JobRunner 基本設計
 
-- Status: Draft v1.8
+- Status: Draft v1.9
 - 対象: MVP
 - WebUI: 画面構成のみ後続
 - 用語: GitHub Actions に対応概念がある場合は可能な限り合わせる
@@ -167,6 +167,8 @@ paused    = pause済み。wait_reason=concurrencyならwaiterでslot無し、そ
 completed = conclusion確定
 ```
 
+Workflow Run時刻は `created_at=Run row作成時刻`、`started_at=最初にConcurrency admissionされrunningになった時刻`、`completed_at=terminal確定時刻`。Concurrency待ちでまだ一度もadmitされていないRunは`started_at=NULL`で、待ち中にCancelされてもNULLのまま。Manual Retryで同じRunをreopenしても最初の`started_at`は保持する。
+
 Concurrency待ち順にはRunの古い`created_at`ではなく、**実際に待ち行列へ入った`concurrency_queued_at`**を使う。順序は `priority DESC -> concurrency_queued_at ASC -> ID ASC`。Pause/Resumeではwaiterの元queue時刻を保持し、completed RunのManual Retryで新たにqueueへ入る場合はRetry時刻を新しいqueue時刻にする。
 
 Internal scheduling軸:
@@ -253,6 +255,7 @@ backoff=1..30s x2
 - window外へ古いrestartが出ればbudget自然回復
 - backoffはoverflow-safeにmaxへ飽和
 - crash loopでは`restart_suppressed`を可視化
+- 1 failureにつきrestart decision履歴は1件。restart抑止時も「次に試すはずだった`restart_ordinal`」を保存し、`scheduled_for/started_runner_instance_id`はNULLにする
 - Parent Runtime再起動では新`runtime_instance_id`となりrestart budgetも新規
 
 IPC=JSON Lines v1。Handshake=`ready -> start -> result|error -> exit`。stdout/stderrはExecution Log。
