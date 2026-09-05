@@ -704,7 +704,7 @@ Semantics=`04 §22`。
 - `restart_ordinal`は許可/抑止に関係なく、そのfailure時点の`next_restart_ordinal`を保存
 - `suppressed=1` -> `scheduled_for=NULL`, `started_runner_instance_id=NULL`
 - allowed decision (`suppressed=0`) -> `scheduled_for` non-NULL。Spawn開始成功後`started_runner_instance_id`設定
-- rolling budgetのlaunch countは同じ`runtime_instance_id/pool_name/runner_id`かつwindow内`supressed=0` decision row数
+- rolling budgetのlaunch countは同じ`runtime_instance_id/pool_name/runner_id`かつwindow内`suppressed=0` decision row数
 - `reason`はfailure/restart decision診断用non-empty code。抑止理由は少なくとも`policy_never|restart_limit_exceeded`
 - Parent Runtimeが変わればbudget scopeも変わる
 
